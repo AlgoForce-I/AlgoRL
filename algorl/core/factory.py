@@ -1,8 +1,7 @@
 """Backend and component factories.
 
-These functions are the single public entry point for constructing backend implementations.
-Backends register a ``ComponentFactory`` in ``algorl.backends.registry``; no ``if backend``
-branches should be added here.
+Single public entry point for constructing backend implementations. Routing is handled
+entirely through registries registered in ``algorl.backends.registry``.
 """
 
 from __future__ import annotations
@@ -10,9 +9,6 @@ from __future__ import annotations
 from typing import Any
 
 from algorl.core.backend import Backend
-from algorl.core.learner import Learner
-from algorl.core.planner import Planner
-from algorl.core.world_model import WorldModel
 
 
 def get_backend(name: str = "jax") -> Backend:
@@ -29,7 +25,7 @@ def get_backend(name: str = "jax") -> Backend:
     return backend_cls()
 
 
-def _get_component_factory(backend: Backend):
+def get_component_factory(backend: Backend):
     from algorl.backends.registry import COMPONENT_FACTORIES
 
     try:
@@ -40,16 +36,11 @@ def _get_component_factory(backend: Backend):
     return factory_cls()
 
 
-def create_world_model(kind: str, backend: Backend, **kwargs: Any) -> WorldModel:
-    """Construct a world model implementation for ``backend``."""
-    return _get_component_factory(backend).create_world_model(kind, backend, **kwargs)
-
-
-def create_planner(kind: str, backend: Backend, **kwargs: Any) -> Planner:
-    """Construct a planner implementation for ``backend``."""
-    return _get_component_factory(backend).create_planner(kind, backend, **kwargs)
-
-
-def create_learner(kind: str, backend: Backend, **kwargs: Any) -> Learner:
-    """Construct a learner implementation for ``backend``."""
-    return _get_component_factory(backend).create_learner(kind, backend, **kwargs)
+def create_component(
+    component_type: str,
+    kind: str,
+    backend: Backend,
+    **kwargs: Any,
+) -> Any:
+    """Construct one backend component from registry entries."""
+    return get_component_factory(backend).create(component_type, kind, backend, **kwargs)

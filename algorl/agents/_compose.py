@@ -1,40 +1,36 @@
 """Shared agent composition helpers.
 
-Agents call ``compose_agent()`` to build backend-specific components via
-``core/factory.py``. Implementations are registered in each backend's
-``KindRegistry`` rather than selected with ``if`` chains.
+Agents declare a composition name registered in ``agents/compositions.py``. Component
+construction is delegated to backend registries without conditional routing.
 """
 
 from __future__ import annotations
 
 from typing import Any
 
-from algorl.core.backend import Backend
-from algorl.core.factory import create_learner, create_planner, create_world_model, get_backend
-from algorl.core.learner import Learner
-from algorl.core.planner import Planner
-from algorl.core.world_model import WorldModel
+from algorl.agents import compositions
+from algorl.core.agent_components import AgentComponents
+from algorl.core.factory import create_component, get_backend, get_component_factory
 
 
-def compose_agent(
-    *,
-    backend: str,
-    world_model_kind: str | None = None,
-    planner_kind: str | None = None,
-    learner_kind: str,
-    **kwargs: Any,
-) -> tuple[Backend, WorldModel | None, Planner | None, Learner]:
-    """Wire backend-specific components for an agent."""
+def compose_agent(composition_name: str, *, backend: str, **kwargs: Any) -> AgentComponents:
+    """Build all components declared by a registered agent composition."""
+    agent_composition = compositions.registry.create(composition_name)
     resolved_backend = get_backend(backend)
-    world_model = (
-        create_world_model(world_model_kind, resolved_backend, **kwargs)
-        if world_model_kind is not None
-        else None
+    component_factory = get_component_factory(resolved_backend)
+
+    built_components: dict[str, object] = {}
+    for component_type, kind in agent_composition.components:
+        built_components[component_type] = component_factory.create(
+            component_type,
+            kind,
+            resolved_backend,
+            **kwargs,
+        )
+
+    return AgentComponents(
+        backend=resolved_backend,
+        world_model=built_components[compositions.COMPONENT_WORLD_MODEL],
+        planner=built_components[compositions.COMPONENT_PLANNER],
+        learner=built_components[compositions.COMPONENT_LEARNER],
     )
-    planner = (
-        create_planner(planner_kind, resolved_backend, **kwargs)
-        if planner_kind is not None
-        else None
-    )
-    learner = create_learner(learner_kind, resolved_backend, **kwargs)
-    return resolved_backend, world_model, planner, learner

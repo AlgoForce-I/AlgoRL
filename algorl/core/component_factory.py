@@ -2,26 +2,24 @@
 
 from __future__ import annotations
 
-from abc import ABC, abstractmethod
-from typing import Any
+from typing import Any, ClassVar
 
 from algorl.core.backend import Backend
-from algorl.core.learner import Learner
-from algorl.core.planner import Planner
-from algorl.core.world_model import WorldModel
+from algorl.core.registry import KindRegistry
 
 
-class ComponentFactory(ABC):
+class ComponentFactory:
     """Creates algorithm components for one backend implementation."""
 
-    @abstractmethod
-    def create_world_model(self, kind: str, backend: Backend, **kwargs: Any) -> WorldModel:
-        """Return a world model implementation for ``kind``."""
+    component_registries: ClassVar[dict[str, KindRegistry[Any]]] = {}
 
-    @abstractmethod
-    def create_planner(self, kind: str, backend: Backend, **kwargs: Any) -> Planner:
-        """Return a planner implementation for ``kind``."""
+    def create(self, component_type: str, kind: str, backend: Backend, **kwargs: Any) -> Any:
+        try:
+            component_registry = self.component_registries[component_type]
+        except KeyError as error:
+            available = ", ".join(sorted(self.component_registries))
+            raise ValueError(
+                f"Unknown component type {component_type!r}. Available: {available}"
+            ) from error
 
-    @abstractmethod
-    def create_learner(self, kind: str, backend: Backend, **kwargs: Any) -> Learner:
-        """Return a learner implementation for ``kind``."""
+        return component_registry.create(kind, backend, **kwargs)
