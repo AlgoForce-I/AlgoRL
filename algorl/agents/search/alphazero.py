@@ -4,16 +4,18 @@ from __future__ import annotations
 
 from typing import Any
 
+import gymnasium as gym
+
+from algorl.agents._base import GymnasiumAgent
 from algorl.agents._compose import compose_agent
-from algorl.core.agent import BaseAgent
 from algorl.core.types import Action, Observation
 
 
-class AlphaZero(BaseAgent):
+class AlphaZero(GymnasiumAgent):
     """AlphaZero search-based agent."""
 
-    def __init__(self, env: Any, backend: str = "jax", **kwargs: Any) -> None:
-        self.env = env
+    def __init__(self, env: gym.Env, backend: str = "jax", **kwargs: Any) -> None:
+        super().__init__(env)
         self.backend, self.world_model, self.planner, self.learner = compose_agent(
             backend=backend,
             planner_kind="mcts",

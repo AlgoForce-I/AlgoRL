@@ -1,27 +1,18 @@
-"""Gymnasium environment adapter."""
+"""Gymnasium environment utilities."""
 
 from __future__ import annotations
 
-from typing import Any, Protocol, runtime_checkable
+import gymnasium as gym
+from gymnasium import Env
+
+__all__ = ["Env", "check_gymnasium_env", "gym"]
 
 
-@runtime_checkable
-class EnvLike(Protocol):
-    """Minimal environment interface used by agents."""
-
-    def reset(self, **kwargs: Any) -> tuple[Any, dict[str, Any]]: ...
-
-    def step(self, action: Any) -> tuple[Any, float, bool, bool, dict[str, Any]]: ...
-
-
-class EnvAdapter:
-    """Thin wrapper around a Gymnasium-compatible environment."""
-
-    def __init__(self, env: EnvLike) -> None:
-        self.env = env
-
-    def reset(self, **kwargs: Any) -> tuple[Any, dict[str, Any]]:
-        return self.env.reset(**kwargs)
-
-    def step(self, action: Any) -> tuple[Any, float, bool, bool, dict[str, Any]]:
-        return self.env.step(action)
+def check_gymnasium_env(env: object) -> Env:
+    """Validate that ``env`` is a Gymnasium environment."""
+    if not isinstance(env, gym.Env):
+        raise TypeError(
+            f"Expected a gymnasium.Env instance, got {type(env)!r}. "
+            "Create environments with gymnasium.make() or subclass gymnasium.Env."
+        )
+    return env

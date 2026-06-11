@@ -4,16 +4,18 @@ from __future__ import annotations
 
 from typing import Any
 
+import gymnasium as gym
+
+from algorl.agents._base import GymnasiumAgent
 from algorl.agents._compose import compose_agent
-from algorl.core.agent import BaseAgent
 from algorl.core.types import Action, Observation
 
 
-class TDMPC(BaseAgent):
+class TDMPC(GymnasiumAgent):
     """TD-MPC / TD-MPC2 world-model agent."""
 
-    def __init__(self, env: Any, backend: str = "jax", **kwargs: Any) -> None:
-        self.env = env
+    def __init__(self, env: gym.Env, backend: str = "jax", **kwargs: Any) -> None:
+        super().__init__(env)
         self.backend, self.world_model, self.planner, self.learner = compose_agent(
             backend=backend,
             world_model_kind="td_mpc",

@@ -5,11 +5,19 @@ from __future__ import annotations
 from abc import ABC, abstractmethod
 from typing import Any
 
+import gymnasium as gym
+
 from algorl.core.types import Action, Observation
 
 
 class BaseAgent(ABC):
-    """Common interface for all AlgoRL agents."""
+    """Common interface for all AlgoRL agents.
+
+    Every agent expects a standard ``gymnasium.Env`` created via
+    ``gymnasium.make()`` or a ``gymnasium.Env`` subclass.
+    """
+
+    env: gym.Env
 
     @abstractmethod
     def learn(self, total_timesteps: int, **kwargs: Any) -> None:
