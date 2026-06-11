@@ -1,4 +1,8 @@
-"""Replay buffer protocol."""
+"""Replay buffer protocol.
+
+Generic buffers live in ``algorl/buffers/``. Algorithm-specific buffers may add
+fields such as MCTS policy targets and value prefixes.
+"""
 
 from __future__ import annotations
 

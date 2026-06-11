@@ -25,6 +25,11 @@ class PlaNet(GymnasiumAgent):
         )
 
     def learn(self, total_timesteps: int, **kwargs: Any) -> None:
+        # Implement:
+        # 1. Collect trajectories from ``self.env``.
+        # 2. Train the RSSM with an ELBO-style objective in the learner.
+        # 3. Use CEM planning via ``self.planner.search(obs)`` for control.
+        # 4. Call ``self.learner.train_step(buffer)`` on sequence batches.
         raise NotImplementedError("PlaNet training is not implemented yet.")
 
     def predict(

@@ -9,7 +9,10 @@ from algorl.core.types import Action, Observation
 
 @runtime_checkable
 class Planner(Protocol):
-    """Reasoning mechanism used at decision time."""
+    """Reasoning mechanism used at decision time.
+
+    Implementations live in ``backends/<backend>/planners/``.
+    """
 
     def search(self, observation: Observation, **kwargs: Any) -> Action:
-        """Return an action after planning from ``observation``."""
+        """Return an action for ``observation`` after planning or imagination."""

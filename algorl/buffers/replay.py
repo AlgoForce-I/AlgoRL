@@ -1,4 +1,13 @@
-"""Simple NumPy replay buffer."""
+"""Simple NumPy replay buffer.
+
+This generic buffer is enough for early experiments. Search-based agents such as
+MuZero and EfficientZero will likely need a dedicated buffer that also stores:
+- MCTS policy targets
+- n-step or model-based value targets
+- optional search metadata for reanalyze
+
+Implement algorithm-specific buffers in this package, e.g. ``efficient_zero.py``.
+"""
 
 from __future__ import annotations
 

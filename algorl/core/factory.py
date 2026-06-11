@@ -1,4 +1,8 @@
-"""Backend and component factories."""
+"""Backend and component factories.
+
+These functions are the single entry point for constructing backend implementations.
+Implement new component kinds in the matching ``backends/<backend>/.../create()`` factory.
+"""
 
 from __future__ import annotations
 

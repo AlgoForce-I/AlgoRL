@@ -25,6 +25,11 @@ class TDMPC(GymnasiumAgent):
         )
 
     def learn(self, total_timesteps: int, **kwargs: Any) -> None:
+        # Implement:
+        # 1. Collect transitions from ``self.env``.
+        # 2. Train the latent TD-MPC model in the learner.
+        # 3. Use MPC planning via ``self.planner.search(obs)`` for action selection.
+        # 4. Call ``self.learner.train_step(buffer)`` on sampled latent transitions.
         raise NotImplementedError("TDMPC training is not implemented yet.")
 
     def predict(

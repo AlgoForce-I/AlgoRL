@@ -24,6 +24,10 @@ class AlphaZero(GymnasiumAgent):
         )
 
     def learn(self, total_timesteps: int, **kwargs: Any) -> None:
+        # Implement:
+        # 1. Self-play loop on ``self.env`` using MCTS with the current policy/value network.
+        # 2. Store MCTS visit counts as policy targets and game outcomes as value targets.
+        # 3. Train with ``self.learner.train_step(buffer)``; no learned dynamics are required.
         raise NotImplementedError("AlphaZero training is not implemented yet.")
 
     def predict(

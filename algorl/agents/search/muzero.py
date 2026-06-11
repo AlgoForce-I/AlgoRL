@@ -25,6 +25,13 @@ class MuZero(GymnasiumAgent):
         )
 
     def learn(self, total_timesteps: int, **kwargs: Any) -> None:
+        # Implement:
+        # 1. Create a replay buffer for MCTS targets and environment transitions.
+        # 2. Loop for ``total_timesteps`` using ``self.env.reset()`` / ``self.env.step()``.
+        # 3. Select actions with ``self.planner.search(obs)``.
+        # 4. Store obs, action, reward, MCTS policy, value targets, and done flags.
+        # 5. Call ``self.learner.train_step(buffer)`` once enough data is collected.
+        # 6. Optionally log metrics and save checkpoints.
         raise NotImplementedError("MuZero training is not implemented yet.")
 
     def predict(

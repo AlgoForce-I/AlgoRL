@@ -25,6 +25,11 @@ class EfficientZero(GymnasiumAgent):
         )
 
     def learn(self, total_timesteps: int, **kwargs: Any) -> None:
+        # Implement: same training loop as MuZero, plus EfficientZero-specific pieces:
+        # - self-supervised representation loss in the learner
+        # - reanalyze old buffer entries with the latest model
+        # - model-based value targets / value prefix if following the paper closely
+        # Keep env interaction and orchestration here; put loss math in backends/jax/learners/.
         raise NotImplementedError("EfficientZero training is not implemented yet.")
 
     def predict(

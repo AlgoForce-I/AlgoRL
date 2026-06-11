@@ -1,4 +1,9 @@
-"""Example training entrypoint placeholder."""
+"""Example training entrypoint.
+
+Once EfficientZero is implemented, replace the print statement with::
+
+    agent.learn(total_timesteps=10_000)
+"""
 
 from __future__ import annotations
 
