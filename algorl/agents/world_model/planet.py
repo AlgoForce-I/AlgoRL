@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from typing import Any
+from typing import Any, ClassVar
 
 import gymnasium as gym
 
@@ -14,15 +14,15 @@ from algorl.core.types import Action, Observation
 class PlaNet(GymnasiumAgent):
     """PlaNet world-model agent."""
 
+    composition_name: ClassVar[str] = "planet"
+
     def __init__(self, env: gym.Env, backend: str = "jax", **kwargs: Any) -> None:
         super().__init__(env)
-        self.backend, self.world_model, self.planner, self.learner = compose_agent(
-            backend=backend,
-            world_model_kind="rssm",
-            planner_kind="cem",
-            learner_kind="planet",
-            **kwargs,
-        )
+        components = compose_agent(self.composition_name, backend=backend, **kwargs)
+        self.backend = components.backend
+        self.world_model = components.world_model
+        self.planner = components.planner
+        self.learner = components.learner
 
     def learn(self, total_timesteps: int, **kwargs: Any) -> None:
         # Implement:
@@ -37,6 +37,4 @@ class PlaNet(GymnasiumAgent):
         observation: Observation,
         deterministic: bool = True,
     ) -> Action:
-        if self.planner is None:
-            raise RuntimeError("PlaNet planner is not configured.")
         return self.planner.search(observation, deterministic=deterministic)

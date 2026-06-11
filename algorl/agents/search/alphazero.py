@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from typing import Any
+from typing import Any, ClassVar
 
 import gymnasium as gym
 
@@ -14,14 +14,15 @@ from algorl.core.types import Action, Observation
 class AlphaZero(GymnasiumAgent):
     """AlphaZero search-based agent."""
 
+    composition_name: ClassVar[str] = "alphazero"
+
     def __init__(self, env: gym.Env, backend: str = "jax", **kwargs: Any) -> None:
         super().__init__(env)
-        self.backend, self.world_model, self.planner, self.learner = compose_agent(
-            backend=backend,
-            planner_kind="mcts",
-            learner_kind="alphazero",
-            **kwargs,
-        )
+        components = compose_agent(self.composition_name, backend=backend, **kwargs)
+        self.backend = components.backend
+        self.world_model = components.world_model
+        self.planner = components.planner
+        self.learner = components.learner
 
     def learn(self, total_timesteps: int, **kwargs: Any) -> None:
         # Implement:
@@ -35,6 +36,4 @@ class AlphaZero(GymnasiumAgent):
         observation: Observation,
         deterministic: bool = True,
     ) -> Action:
-        if self.planner is None:
-            raise RuntimeError("AlphaZero planner is not configured.")
         return self.planner.search(observation, deterministic=deterministic)

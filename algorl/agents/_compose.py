@@ -10,7 +10,7 @@ from typing import Any
 
 from algorl.agents import compositions
 from algorl.core.agent_components import AgentComponents
-from algorl.core.factory import create_component, get_backend, get_component_factory
+from algorl.core.factory import get_backend, get_component_factory
 
 
 def compose_agent(composition_name: str, *, backend: str, **kwargs: Any) -> AgentComponents:
