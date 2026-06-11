@@ -1,1 +1,2 @@
-mctx~=0.0.6
+gymnasium>=0.29.0
+numpy>=1.24.0
