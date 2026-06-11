@@ -1,8 +1,8 @@
 """Shared agent composition helpers.
 
-Agents call ``compose_agent()`` to build backend-specific components.
-When adding a new algorithm, usually only the agent file changes; new component kinds
-are registered in ``backends/<backend>/world_models|planners|learners/__init__.py``.
+Agents call ``compose_agent()`` to build backend-specific components via
+``core/factory.py``. Implementations are registered in each backend's
+``KindRegistry`` rather than selected with ``if`` chains.
 """
 
 from __future__ import annotations

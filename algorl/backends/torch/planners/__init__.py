@@ -1,19 +1,13 @@
-"""PyTorch planner factory (stub).
+"""PyTorch planner registry (stub).
 
-When the PyTorch backend is added, mirror ``backends/jax/planners/``:
-- ``mcts.py``, ``imagination.py``, ``cem.py``, ``mpc.py``
+Register torch planners here once the PyTorch backend is implemented.
 """
 
 from __future__ import annotations
 
-from typing import Any
-
-from algorl.core.backend import Backend
 from algorl.core.planner import Planner
+from algorl.core.registry import KindRegistry
 
+registry: KindRegistry[Planner] = KindRegistry("PyTorch planner")
 
-def create(kind: str, backend: Backend, **kwargs: Any) -> Planner:
-    # Implement: PyTorch versions of the planners in backends/jax/planners/.
-    raise NotImplementedError(
-        "PyTorch planners are not implemented yet. Use backend='jax'."
-    )
+# Register torch implementations with @registry.register("kind") when ready.

@@ -1,4 +1,4 @@
-"""JAX learner factory.
+"""JAX learner registry.
 
 Implement concrete learners in this package, e.g.:
 - ``efficient_zero.py`` for EfficientZero losses and parameter updates
@@ -8,7 +8,7 @@ Implement concrete learners in this package, e.g.:
 - ``planet.py`` for PlaNet losses
 - ``td_mpc.py`` for TD-MPC losses
 
-Register each kind in ``create()`` below.
+Register implementations with ``@registry.register("kind")`` instead of ``if`` chains.
 """
 
 from __future__ import annotations
@@ -17,21 +17,14 @@ from typing import Any
 
 from algorl.core.backend import Backend
 from algorl.core.learner import Learner
+from algorl.core.registry import KindRegistry
 from algorl.core.replay_buffer import ReplayBuffer
 
-# Maps factory ``kind`` strings to the training behaviour that must be implemented.
-LEARNER_KINDS = {
-    "efficient_zero": "Policy, value, reward, and self-supervised losses; optional reanalyze.",
-    "muzero": "Policy, value, and reward losses from MCTS targets.",
-    "alphazero": "Policy and value losses from MCTS targets (no learned dynamics).",
-    "dreamer": "World model, actor, and critic losses from imagined trajectories.",
-    "planet": "ELBO-style world model loss and CEM-related training.",
-    "td_mpc": "TD-MPC latent consistency, reward, and value losses.",
-}
+registry: KindRegistry[Learner] = KindRegistry("JAX learner")
 
 
-class _StubLearner:
-    """Temporary stand-in until a real learner is registered in ``create()``."""
+class _StubLearner(Learner):
+    """Temporary stand-in until a real learner is registered."""
 
     def __init__(self, kind: str, backend: Backend) -> None:
         self.kind = kind
@@ -46,17 +39,19 @@ class _StubLearner:
         raise NotImplementedError(f"JAX learner {self.kind!r} is not implemented yet.")
 
 
-def create(kind: str, backend: Backend, **kwargs: Any) -> Learner:
-    """Return a backend learner for ``kind``.
+def _register_stub(kind: str) -> None:
+    def build(backend: Backend, **kwargs: Any) -> Learner:
+        return _StubLearner(kind, backend)
 
-    Implement: replace the stub branch with imports from concrete modules, e.g.::
+    registry.register(kind, build)
 
-        if kind == "efficient_zero":
-            from algorl.backends.jax.learners.efficient_zero import EfficientZeroLearner
-            return EfficientZeroLearner(backend, **kwargs)
-    """
-    if kind not in LEARNER_KINDS:
-        available = ", ".join(sorted(LEARNER_KINDS))
-        raise ValueError(f"Unknown learner kind {kind!r}. Available: {available}")
 
-    return _StubLearner(kind, backend)
+for _kind in ("efficient_zero", "muzero", "alphazero", "dreamer", "planet", "td_mpc"):
+    _register_stub(_kind)
+
+# When implementing::
+#
+# @registry.register("efficient_zero")
+# class EfficientZeroLearner(Learner):
+#     def __init__(self, backend: Backend, **kwargs: Any) -> None:
+#         ...

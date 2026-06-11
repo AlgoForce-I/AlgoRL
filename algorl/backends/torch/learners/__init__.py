@@ -1,19 +1,13 @@
-"""PyTorch learner factory (stub).
+"""PyTorch learner registry (stub).
 
-When the PyTorch backend is added, mirror ``backends/jax/learners/``:
-- ``efficient_zero.py``, ``muzero.py``, ``dreamer.py``, etc.
+Register torch learners here once the PyTorch backend is implemented.
 """
 
 from __future__ import annotations
 
-from typing import Any
-
-from algorl.core.backend import Backend
 from algorl.core.learner import Learner
+from algorl.core.registry import KindRegistry
 
+registry: KindRegistry[Learner] = KindRegistry("PyTorch learner")
 
-def create(kind: str, backend: Backend, **kwargs: Any) -> Learner:
-    # Implement: PyTorch versions of the learners in backends/jax/learners/.
-    raise NotImplementedError(
-        "PyTorch learners are not implemented yet. Use backend='jax'."
-    )
+# Register torch implementations with @registry.register("kind") when ready.

@@ -14,10 +14,11 @@ from __future__ import annotations
 from collections import deque
 from typing import Deque
 
+from algorl.core.replay_buffer import ReplayBuffer as BaseReplayBuffer
 from algorl.core.types import Batch, Transition
 
 
-class ReplayBuffer:
+class ReplayBuffer(BaseReplayBuffer):
     """Fixed-size FIFO replay buffer."""
 
     def __init__(self, capacity: int) -> None:

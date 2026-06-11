@@ -7,8 +7,10 @@ from typing import Any, Callable
 import jax
 import jax.numpy as jnp
 
+from algorl.core.backend import Backend
 
-class JAXBackend:
+
+class JAXBackend(Backend):
     """JAX/Flax backend."""
 
     name = "jax"

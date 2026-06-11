@@ -8,8 +8,10 @@ from __future__ import annotations
 
 from typing import Any, Callable
 
+from algorl.core.backend import Backend
 
-class TorchBackend:
+
+class TorchBackend(Backend):
     """PyTorch backend placeholder."""
 
     name = "torch"

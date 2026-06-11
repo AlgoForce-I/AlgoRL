@@ -1,18 +1,19 @@
-"""Planner protocol."""
+"""Planner abstract base class."""
 
 from __future__ import annotations
 
-from typing import Any, Protocol, runtime_checkable
+from abc import ABC, abstractmethod
+from typing import Any
 
 from algorl.core.types import Action, Observation
 
 
-@runtime_checkable
-class Planner(Protocol):
+class Planner(ABC):
     """Reasoning mechanism used at decision time.
 
-    Implementations live in ``backends/<backend>/planners/``.
+    Implementations must subclass this class in ``backends/<backend>/planners/``.
     """
 
+    @abstractmethod
     def search(self, observation: Observation, **kwargs: Any) -> Action:
         """Return an action for ``observation`` after planning or imagination."""
