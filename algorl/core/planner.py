@@ -19,3 +19,11 @@ class Planner(ABC):
     @abstractmethod
     def search(self, observation: Observation, **kwargs: Any) -> Action:
         """Return an action for ``observation`` after planning or imagination."""
+
+
+class BatchedPlanner(Planner):
+    """Planner that supports high-throughput batched search."""
+
+    @abstractmethod
+    def search_batch(self, observations: Any, **kwargs: Any) -> Any:
+        """Plan for a batch of observations in parallel."""

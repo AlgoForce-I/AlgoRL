@@ -29,20 +29,31 @@ class BaseAgentConfig:
 
 
 @dataclass(frozen=True)
-class EfficientZeroConfig(BaseAgentConfig):
+class SearchAgentConfig(BaseAgentConfig):
+    """Shared MCTS settings for search-based agents."""
+
     mcts_simulations: int = 50
+    search_batch_size: int = 1
+    mcts_temperature: float = 1.0
+    dirichlet_fraction: float = 0.0
+    dirichlet_alpha: float = 0.3
+    gumbel_scale: float = 1.0
+    max_num_considered_actions: int | None = None
+
+
+@dataclass(frozen=True)
+class EfficientZeroConfig(SearchAgentConfig):
     reanalyze_ratio: float = 0.5
     unroll_steps: int = 5
 
 
 @dataclass(frozen=True)
-class MuZeroConfig(BaseAgentConfig):
-    mcts_simulations: int = 50
+class MuZeroConfig(SearchAgentConfig):
     unroll_steps: int = 5
 
 
 @dataclass(frozen=True)
-class AlphaZeroConfig(BaseAgentConfig):
+class AlphaZeroConfig(SearchAgentConfig):
     mcts_simulations: int = 100
     self_play_games: int = 1
 
