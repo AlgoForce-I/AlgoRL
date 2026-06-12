@@ -7,9 +7,20 @@ from typing import Any, Callable
 
 
 class Backend(ABC):
-    """Minimal interface that every ML backend must implement explicitly."""
+    """Minimal array and execution helpers for one ML framework.
+
+    Backends intentionally do **not** own neural-network modules, optimizers, or
+    checkpoint formats. Those live in backend-specific component implementations
+    under ``backends/<name>/``. This class only exposes the small set of primitives
+    that core code may need without leaking framework types through public APIs.
+    """
 
     name: str
+
+    @property
+    def supports_jit(self) -> bool:
+        """Whether ``jit`` provides real compilation for this backend."""
+        return True
 
     @abstractmethod
     def array(self, value: Any) -> Any:

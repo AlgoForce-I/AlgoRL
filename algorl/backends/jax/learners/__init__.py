@@ -13,12 +13,12 @@ Register implementations with ``@registry.register("kind")`` instead of ``if`` c
 
 from __future__ import annotations
 
-from typing import Any
-
-from algorl.core.backend import Backend
+from algorl.core.component_context import ComponentContext
 from algorl.core.learner import Learner
+from algorl.core.planner import Planner
 from algorl.core.registry import KindRegistry
 from algorl.core.replay_buffer import ReplayBuffer
+from algorl.core.world_model import WorldModel
 
 registry: KindRegistry[Learner] = KindRegistry("JAX learner")
 
@@ -26,32 +26,27 @@ registry: KindRegistry[Learner] = KindRegistry("JAX learner")
 class _StubLearner(Learner):
     """Temporary stand-in until a real learner is registered."""
 
-    def __init__(self, kind: str, backend: Backend) -> None:
+    def __init__(self, kind: str, context: ComponentContext) -> None:
         self.kind = kind
-        self.backend = backend
+        self.backend = context.backend
+        self.config = context.config
+        self.world_model: WorldModel | None = context.world_model
+        self.planner: Planner | None = context.planner
 
     def train_step(self, replay_buffer: ReplayBuffer) -> dict[str, float]:
-        # Implement:
-        # 1. Sample a batch from the replay buffer.
-        # 2. Compute losses against stored targets (MCTS policy, n-step value, etc.).
-        # 3. Apply an Optax optimizer step to the world model / policy parameters.
-        # 4. Return scalar metrics such as total loss and individual loss terms.
         raise NotImplementedError(f"JAX learner {self.kind!r} is not implemented yet.")
 
 
 def _register_stub(kind: str) -> None:
-    def build(backend: Backend, **kwargs: Any) -> Learner:
-        return _StubLearner(kind, backend)
+    def build(context: ComponentContext) -> Learner:
+        if kind != "alphazero" and context.world_model is None:
+            raise RuntimeError(f"Learner {kind!r} requires a world model in the build context.")
+        if context.planner is None:
+            raise RuntimeError(f"Learner {kind!r} requires a planner in the build context.")
+        return _StubLearner(kind, context)
 
-    registry.register(kind, build)
+    registry.register(kind, build, stub=True)
 
 
 for _kind in ("efficient_zero", "muzero", "alphazero", "dreamer", "planet", "td_mpc"):
     _register_stub(_kind)
-
-# When implementing::
-#
-# @registry.register("efficient_zero")
-# class EfficientZeroLearner(Learner):
-#     def __init__(self, backend: Backend, **kwargs: Any) -> None:
-#         ...

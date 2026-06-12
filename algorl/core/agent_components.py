@@ -7,6 +7,7 @@ from dataclasses import dataclass
 from algorl.core.backend import Backend
 from algorl.core.learner import Learner
 from algorl.core.planner import Planner
+from algorl.core.replay_buffer import ReplayBuffer
 from algorl.core.world_model import WorldModel
 
 
@@ -18,3 +19,4 @@ class AgentComponents:
     world_model: WorldModel
     planner: Planner
     learner: Learner
+    replay_buffer: ReplayBuffer

@@ -11,7 +11,9 @@ from algorl.core.types import Action, Observation
 class Planner(ABC):
     """Reasoning mechanism used at decision time.
 
-    Implementations must subclass this class in ``backends/<backend>/planners/``.
+    Implementations must subclass this class in ``backends/<backend>/planners/`` and
+    receive their ``world_model`` dependency through
+    :class:`~algorl.core.component_context.ComponentContext` at build time.
     """
 
     @abstractmethod

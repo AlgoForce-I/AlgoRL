@@ -4,6 +4,7 @@ import gymnasium as gym
 import pytest
 
 import algorl as arl
+from algorl.agents.configs import EfficientZeroConfig
 
 
 def test_public_exports() -> None:
@@ -13,13 +14,22 @@ def test_public_exports() -> None:
 
 
 def test_efficient_zero_construction(cartpole_env: gym.Env) -> None:
-    agent = arl.EfficientZero(cartpole_env, backend="jax")
+    config = EfficientZeroConfig(require_implemented=False)
+    agent = arl.EfficientZero(cartpole_env, config=config)
     assert agent.backend.name == "jax"
     assert agent.world_model is not None
     assert agent.planner is not None
+    assert agent.planner.world_model is agent.world_model
     assert agent.learner is not None
+    assert agent.learner.world_model is agent.world_model
+    assert agent.replay_buffer is not None
     assert agent.observation_space is cartpole_env.observation_space
     assert agent.action_space is cartpole_env.action_space
+
+
+def test_efficient_zero_rejects_stubs_by_default(cartpole_env: gym.Env) -> None:
+    with pytest.raises(NotImplementedError, match="Stub component"):
+        arl.EfficientZero(cartpole_env)
 
 
 def test_agent_rejects_non_gymnasium_env() -> None:

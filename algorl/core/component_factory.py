@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from typing import Any, ClassVar
 
-from algorl.core.backend import Backend
+from algorl.core.component_context import ComponentContext
 from algorl.core.registry import KindRegistry
 
 
@@ -13,7 +13,7 @@ class ComponentFactory:
 
     component_registries: ClassVar[dict[str, KindRegistry[Any]]] = {}
 
-    def create(self, component_type: str, kind: str, backend: Backend, **kwargs: Any) -> Any:
+    def create(self, component_type: str, kind: str, context: ComponentContext) -> Any:
         try:
             component_registry = self.component_registries[component_type]
         except KeyError as error:
@@ -22,4 +22,14 @@ class ComponentFactory:
                 f"Unknown component type {component_type!r}. Available: {available}"
             ) from error
 
-        return component_registry.create(kind, backend, **kwargs)
+        return component_registry.create(kind, context)
+
+    def is_stub(self, component_type: str, kind: str) -> bool:
+        try:
+            component_registry = self.component_registries[component_type]
+        except KeyError as error:
+            available = ", ".join(sorted(self.component_registries))
+            raise ValueError(
+                f"Unknown component type {component_type!r}. Available: {available}"
+            ) from error
+        return component_registry.is_stub(kind)

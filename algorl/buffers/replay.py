@@ -1,24 +1,15 @@
-"""Simple NumPy replay buffer.
-
-This generic buffer is enough for early experiments. Search-based agents such as
-MuZero and EfficientZero will likely need a dedicated buffer that also stores:
-- MCTS policy targets
-- n-step or model-based value targets
-- optional search metadata for reanalyze
-
-Implement algorithm-specific buffers in this package, e.g. ``efficient_zero.py``.
-"""
+"""Uniform FIFO replay buffer backed by NumPy-friendly Python types."""
 
 from __future__ import annotations
 
 from collections import deque
 from typing import Deque
 
-from algorl.core.replay_buffer import ReplayBuffer as BaseReplayBuffer
+from algorl.core.replay_buffer import ReplayBuffer
 from algorl.core.types import Batch, Transition
 
 
-class ReplayBuffer(BaseReplayBuffer):
+class UniformReplayBuffer(ReplayBuffer):
     """Fixed-size FIFO replay buffer."""
 
     def __init__(self, capacity: int) -> None:
