@@ -29,7 +29,12 @@ def _default_evaluate(params: Any, observations: jnp.ndarray) -> tuple[jnp.ndarr
     )
 
 
-def _mask_invalid_logits(logits: jnp.ndarray, invalid_actions: jnp.ndarray) -> jnp.ndarray:
+def _mask_invalid_logits(
+    logits: jnp.ndarray,
+    invalid_actions: jnp.ndarray | None,
+) -> jnp.ndarray:
+    if invalid_actions is None:
+        return logits
     return jnp.where(invalid_actions, -jnp.inf, logits)
 
 
@@ -167,7 +172,9 @@ class AlphaZeroPlanner(BaseMCTSPlanner):
             self._ensure_params_initialized()
             normalized = normalize_observation_batch(observations)
             states = _observations_to_states(self.search_env, normalized)
-            kwargs["invalid_actions"] = self.search_env.invalid_actions(states)
+            invalid_actions = self.search_env.invalid_actions(states)
+            if invalid_actions is not None:
+                kwargs["invalid_actions"] = invalid_actions
         return super().search_batch(observations, deterministic=deterministic, **kwargs)
 
 
