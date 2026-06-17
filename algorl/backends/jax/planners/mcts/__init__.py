@@ -1,11 +1,17 @@
 """Batched MCTS planners built on MCTX."""
 
+from algorl.backends.jax.planners.mcts.alphazero import (
+    AlphaZeroPlanner,
+    AlphaZeroRecurrentFn,
+    build_alphazero_planner,
+)
 from algorl.backends.jax.planners.mcts.core import (
     BaseMCTSPlanner,
     MCTSBatchedResult,
     MCTSConfig,
     MCTSResult,
     NormalizedObservationBatch,
+    RecurrentFn,
     chunk_observation_batch,
     infer_batch_size,
     mcts_config_from_agent,
@@ -17,7 +23,11 @@ from algorl.backends.jax.planners.mcts.core import (
 )
 
 __all__ = [
+    "AlphaZeroPlanner",
+    "AlphaZeroRecurrentFn",
     "BaseMCTSPlanner",
+    "build_alphazero_planner",
+    "RecurrentFn",
     "MCTSBatchedResult",
     "MCTSConfig",
     "MCTSResult",

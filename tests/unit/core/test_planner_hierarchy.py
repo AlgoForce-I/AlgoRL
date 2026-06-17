@@ -7,7 +7,7 @@ from typing import Any
 import mctx
 import pytest
 
-from algorl.backends.jax.planners.mcts.core import BaseMCTSPlanner, NormalizedObservationBatch
+from algorl.backends.jax.planners.mcts.core import BaseMCTSPlanner, NormalizedObservationBatch, RecurrentFn
 from algorl.core.component_context import ComponentContext
 from algorl.core.planner import BatchedPlanner, Planner
 
@@ -16,7 +16,7 @@ class _ConcreteMCTSPlanner(BaseMCTSPlanner):
     def build_root(self, observations: NormalizedObservationBatch) -> mctx.RootFnOutput:
         raise NotImplementedError
 
-    def make_recurrent_fn(self, observations: NormalizedObservationBatch) -> mctx.RecurrentFn:
+    def make_recurrent_fn(self, observations: NormalizedObservationBatch) -> RecurrentFn:
         raise NotImplementedError
 
 

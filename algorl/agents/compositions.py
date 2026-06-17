@@ -73,7 +73,7 @@ _register(
 _register(
     "alphazero",
     world_model_kind="none",
-    planner_kind="mcts",
+    planner_kind="alphazero",
     learner_kind="alphazero",
     buffer_kind="search",
 )

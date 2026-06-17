@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from abc import abstractmethod
+from abc import ABC, abstractmethod
 from dataclasses import dataclass, replace
 from typing import Any, Iterator
 
@@ -17,6 +17,43 @@ from algorl.core.types import Action, Observation, PolicyTarget, ValueTarget
 
 ObservationBatch = Observation | jnp.ndarray | list[Observation]
 InvalidActionsMask = jnp.ndarray | None
+
+
+# ---------------------------------------------------------------------------
+# Recurrent dynamics (MCTX)
+# ---------------------------------------------------------------------------
+
+
+class RecurrentFn(ABC):
+    """Object-oriented dynamics object for MCTX tree expansion.
+
+    MCTX types this contract as ``mctx.RecurrentFn`` (a callable alias).
+    Subclasses implement :meth:`apply`; :meth:`__call__` and :meth:`as_mctx``
+    satisfy the MCTX ``(params, rng_key, action, embedding)`` interface.
+    """
+
+    def __call__(
+        self,
+        params: Any,
+        rng_key: Any,
+        action: jnp.ndarray,
+        embedding: Any,
+    ) -> tuple[mctx.RecurrentFnOutput, Any]:
+        return self.apply(params, rng_key, action, embedding)
+
+    def as_mctx(self) -> mctx.RecurrentFn:
+        """Return this object for MCTX APIs expecting ``mctx.RecurrentFn``."""
+        return self  # type: ignore[return-value]
+
+    @abstractmethod
+    def apply(
+        self,
+        params: Any,
+        rng_key: Any,
+        action: jnp.ndarray,
+        embedding: Any,
+    ) -> tuple[mctx.RecurrentFnOutput, Any]:
+        """Run one batched expansion step used inside MCTS."""
 
 
 # ---------------------------------------------------------------------------
@@ -195,7 +232,7 @@ def run_muzero_search(
     params: Any,
     rng_key: Any,
     root: mctx.RootFnOutput,
-    recurrent_fn: mctx.RecurrentFn,
+    recurrent_fn: RecurrentFn,
     config: MCTSConfig,
     invalid_actions: InvalidActionsMask = None,
     max_depth: int | None = None,
@@ -226,7 +263,7 @@ def run_muzero_search_single(
     params: Any,
     rng_key: Any,
     root: mctx.RootFnOutput,
-    recurrent_fn: mctx.RecurrentFn,
+    recurrent_fn: RecurrentFn,
     config: MCTSConfig,
     invalid_actions: InvalidActionsMask = None,
     max_depth: int | None = None,
@@ -277,8 +314,8 @@ class BaseMCTSPlanner(BatchedPlanner):
         """Build a batched MCTX root from normalized observations."""
 
     @abstractmethod
-    def make_recurrent_fn(self, observations: NormalizedObservationBatch) -> mctx.RecurrentFn:
-        """Build the recurrent function used during tree expansion."""
+    def make_recurrent_fn(self, observations: NormalizedObservationBatch) -> RecurrentFn:
+        """Build the recurrent dynamics object used during tree expansion."""
 
     def iter_search_chunks(self, observations: list[Observation]) -> Iterator[list[Observation]]:
         """Yield observation chunks sized for ``search_batch_size``."""
@@ -351,17 +388,18 @@ def _run_mctx_policy(
     params: Any,
     rng_key: Any,
     root: mctx.RootFnOutput,
-    recurrent_fn: mctx.RecurrentFn,
+    recurrent_fn: RecurrentFn,
     config: MCTSConfig,
     invalid_actions: InvalidActionsMask,
     max_depth: int | None,
 ) -> mctx.PolicyOutput[Any]:
+    mctx_recurrent_fn = recurrent_fn.as_mctx()
     if config.use_gumbel:
         return mctx.gumbel_muzero_policy(
             params,
             rng_key,
             root,
-            recurrent_fn,
+            mctx_recurrent_fn,
             config.num_simulations,
             invalid_actions=invalid_actions,
             max_depth=max_depth,
@@ -373,7 +411,7 @@ def _run_mctx_policy(
         params,
         rng_key,
         root,
-        recurrent_fn,
+        mctx_recurrent_fn,
         config.num_simulations,
         invalid_actions=invalid_actions,
         max_depth=max_depth,

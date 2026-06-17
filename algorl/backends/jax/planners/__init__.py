@@ -38,12 +38,20 @@ class _StubPlanner(Planner):
 
 def _register_stub(kind: str) -> None:
     def build(context: ComponentContext) -> Planner:
-        if context.world_model is None and kind != "mcts":
+        if context.world_model is None and kind not in {"mcts", "alphazero"}:
             raise RuntimeError(f"Planner {kind!r} requires a world model in the build context.")
         return _StubPlanner(kind, context)
 
     registry.register(kind, build, stub=True)
 
+
+def _build_alphazero_planner(context: ComponentContext) -> Planner:
+    from algorl.backends.jax.planners.mcts.alphazero import build_alphazero_planner
+
+    return build_alphazero_planner(context)
+
+
+registry.register("alphazero", _build_alphazero_planner, stub=False)
 
 for _kind in ("mcts", "imagination", "cem", "mpc"):
     _register_stub(_kind)
