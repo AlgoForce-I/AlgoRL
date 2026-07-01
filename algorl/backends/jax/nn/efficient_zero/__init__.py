@@ -1,24 +1,21 @@
-"""Flax network modules for the JAX backend.
+"""EfficientZero Flax networks and model construction."""
 
-Each algorithm family lives in its own subpackage under ``nn/``.
-"""
-
-from algorl.backends.jax.nn.efficient_zero import (
-    EfficientZero,
+from algorl.backends.jax.nn.efficient_zero.build import (
     build_efficient_zero_model,
     build_efficient_zero_model_from_env,
+    infer_model_type,
     init_efficient_zero_params,
     init_efficient_zero_params_from_env,
     init_efficient_zero_params_from_model,
-    infer_model_type,
 )
+from algorl.backends.jax.nn.efficient_zero.model import EfficientZero
 
 __all__ = [
     "EfficientZero",
     "build_efficient_zero_model",
     "build_efficient_zero_model_from_env",
+    "infer_model_type",
     "init_efficient_zero_params",
     "init_efficient_zero_params_from_env",
     "init_efficient_zero_params_from_model",
-    "infer_model_type",
 ]

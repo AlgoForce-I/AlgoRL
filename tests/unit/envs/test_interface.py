@@ -10,6 +10,9 @@ def test_check_env_accepts_gymnasium_env() -> None:
     env = gym.make("CartPole-v1")
     training_env = check_env(env)
     assert training_env.observation_space == env.observation_space
+    assert training_env.observation_shape == 4
+    assert training_env.num_actions == 2
+    assert training_env.action_dim == 1
     env.close()
 
 

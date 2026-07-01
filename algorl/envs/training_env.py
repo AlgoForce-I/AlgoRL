@@ -21,6 +21,34 @@ def _box_space(shape: tuple[int, ...], *, low: float, high: float) -> gym.spaces
     )
 
 
+def _observation_shape_from_space(space: gym.Space) -> int | tuple[int, ...]:
+    if isinstance(space, gym.spaces.Box):
+        shape = tuple(int(dim) for dim in space.shape)
+        if len(shape) == 1:
+            return shape[0]
+        return shape
+    if isinstance(space, gym.spaces.Discrete):
+        return int(space.n)
+    raise TypeError(f"Unsupported observation space type: {type(space)!r}")
+
+
+def _num_actions_from_space(space: gym.Space) -> int:
+    if isinstance(space, gym.spaces.Discrete):
+        return int(space.n)
+    if isinstance(space, gym.spaces.Box):
+        return int(space.shape[0])
+    raise TypeError(f"Unsupported action space type: {type(space)!r}")
+
+
+def _action_dim_from_space(space: gym.Space) -> int:
+    """HyperCEZ ``control_dim``: scalar discrete action or continuous vector size."""
+    if isinstance(space, gym.spaces.Discrete):
+        return 1
+    if isinstance(space, gym.spaces.Box):
+        return int(space.shape[0])
+    raise TypeError(f"Unsupported action space type: {type(space)!r}")
+
+
 class TrainingEnv:
     """Environment handle used by agents and :class:`~algorl.core.training_loop.TrainingLoop`."""
 
@@ -180,6 +208,21 @@ class TrainingEnv:
             raise RuntimeError("TrainingEnv does not support batched rollouts.")
         rollout_key = key if key is not None else jax.random.PRNGKey(0)
         return self._collect_rollout_fn(policy, num_steps, rollout_key)
+
+    @property
+    def observation_shape(self) -> int | tuple[int, ...]:
+        """Model input shape derived from :attr:`observation_space`."""
+        return _observation_shape_from_space(self.observation_space)
+
+    @property
+    def num_actions(self) -> int:
+        """Discrete branch count or continuous action dimension."""
+        return _num_actions_from_space(self.action_space)
+
+    @property
+    def action_dim(self) -> int:
+        """Control dimension fed to dynamics (1 for discrete scalar actions)."""
+        return _action_dim_from_space(self.action_space)
 
     @property
     def unwrapped(self) -> object:
