@@ -23,8 +23,8 @@ def test_efficient_zero_construction(cartpole_env: gym.Env) -> None:
     assert agent.learner is not None
     assert agent.learner.world_model is agent.world_model
     assert agent.replay_buffer is not None
-    assert agent.observation_space is cartpole_env.observation_space
-    assert agent.action_space is cartpole_env.action_space
+    assert agent.observation_space == cartpole_env.observation_space
+    assert agent.action_space == cartpole_env.action_space
 
 
 def test_efficient_zero_rejects_stubs_by_default(cartpole_env: gym.Env) -> None:
@@ -32,6 +32,6 @@ def test_efficient_zero_rejects_stubs_by_default(cartpole_env: gym.Env) -> None:
         arl.EfficientZero(cartpole_env)
 
 
-def test_agent_rejects_non_gymnasium_env() -> None:
-    with pytest.raises(TypeError, match="gymnasium.Env"):
+def test_agent_rejects_invalid_env() -> None:
+    with pytest.raises(TypeError, match="Expected gymnasium.Env"):
         arl.EfficientZero(object())  # type: ignore[arg-type]

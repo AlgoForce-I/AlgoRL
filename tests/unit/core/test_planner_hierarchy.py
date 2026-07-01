@@ -9,6 +9,7 @@ import pytest
 
 from algorl.backends.jax.planners.mcts.core import BaseMCTSPlanner, NormalizedObservationBatch, RecurrentFn
 from algorl.core.component_context import ComponentContext
+from algorl.envs import resolve_env
 from algorl.core.planner import BatchedPlanner, Planner
 
 
@@ -28,7 +29,7 @@ def mcts_planner(cartpole_env) -> _ConcreteMCTSPlanner:
     context = ComponentContext(
         backend=JAXBackend(),
         config=AlphaZeroConfig(require_implemented=False),
-        env=cartpole_env,
+        env=resolve_env(cartpole_env),
     )
     return _ConcreteMCTSPlanner(context)
 
@@ -60,7 +61,7 @@ def test_iter_search_chunks_uses_config_batch_size(cartpole_env) -> None:
     context = ComponentContext(
         backend=JAXBackend(),
         config=AlphaZeroConfig(require_implemented=False, search_batch_size=4),
-        env=cartpole_env,
+        env=resolve_env(cartpole_env),
     )
     planner = _ConcreteMCTSPlanner(context)
     chunks = list(planner.iter_search_chunks([1, 2, 3, 4, 5]))
@@ -89,7 +90,7 @@ def test_search_batch_size_rejects_invalid_config(cartpole_env) -> None:
     context = ComponentContext(
         backend=JAXBackend(),
         config=AlphaZeroConfig(require_implemented=False, search_batch_size=0),
-        env=cartpole_env,
+        env=resolve_env(cartpole_env),
     )
     planner = _ConcreteMCTSPlanner(context)
     with pytest.raises(ValueError, match="search_batch_size must be > 0"):

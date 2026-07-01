@@ -16,6 +16,7 @@ class BaseAgentConfig:
     train_freq: int = 1
     learning_starts: int = 1_000
     checkpoint_freq: int | None = None
+    jax_rollout_chunk: int = 64
     require_implemented: bool = True
 
     def with_overrides(self, **overrides: object) -> BaseAgentConfig:

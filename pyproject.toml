@@ -15,6 +15,7 @@ dependencies = { file = ["requirements.txt"] }
 
 [tool.setuptools.dynamic.optional-dependencies]
 jax = { file = ["requirements-jax.txt"] }
+jax-mtcworld = { file = ["requirements-jax-mtcworld.txt"] }
 torch = { file = ["requirements-torch.txt"] }
 dev = { file = ["requirements-dev.txt"] }
 

@@ -6,20 +6,21 @@ from typing import Any, ClassVar
 
 import gymnasium as gym
 
-from algorl.agents._base import GymnasiumAgent
+from algorl.agents._base import Agent
 from algorl.agents._compose import compose_agent
 from algorl.agents.configs import BaseAgentConfig
 from algorl.core.training_loop import TrainingLoop
 from algorl.core.types import Action, Observation
+from algorl.envs.training_env import TrainingEnv
 
 
-class ComposedAgent(GymnasiumAgent):
+class ComposedAgent(Agent):
     """Agent that wires world model, planner, learner, and buffer from a composition."""
 
     composition_name: ClassVar[str]
     config_class: ClassVar[type[BaseAgentConfig]]
 
-    def __init__(self, env: gym.Env, config: BaseAgentConfig | None = None) -> None:
+    def __init__(self, env: TrainingEnv | object, config: BaseAgentConfig | None = None) -> None:
         super().__init__(env)
         self.config = config or self.config_class()
         components = compose_agent(

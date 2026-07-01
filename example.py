@@ -15,10 +15,12 @@ import gymnasium as gym
 
 import algorl as arl
 from algorl.agents.configs import EfficientZeroConfig
+from MTCWorldMJX import CWConfig, make_cl_train_env
 
 
 def main() -> None:
-    env = gym.make("CartPole-v1")
+    config = CWConfig(seed=42, steps_per_task=10000)
+    env = make_cl_train_env("CW10", config=config)
 
     config = EfficientZeroConfig(
         backend="jax",
@@ -32,7 +34,7 @@ def main() -> None:
 
     # The agent composes its world model, planner, learner, and replay buffer.
     print(f"AlgoRL {arl.__version__}")
-    print(f"Environment: {env.spec.id if env.spec else 'unknown'}")
+    print(f"Environment: {env}")
     print(f"Backend: {agent.backend.name}")
     print(f"World model: {type(agent.world_model).__name__}")
     print(f"Planner: {type(agent.planner).__name__}")
@@ -50,7 +52,6 @@ def main() -> None:
     #   from algorl.agents.configs import DreamerV3Config
     #   agent = arl.DreamerV3(env, config=DreamerV3Config(require_implemented=False))
 
-    env.close()
 
 
 if __name__ == "__main__":

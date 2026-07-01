@@ -11,13 +11,14 @@ from algorl.backends.jax.backend import JAXBackend
 from algorl.backends.jax.envs import GymnasiumSearchEnvironment, search_env_from_context
 from algorl.backends.jax.planners.mcts.alphazero import AlphaZeroPlanner
 from algorl.core.component_context import ComponentContext
+from algorl.envs import resolve_env
 
 
 def test_factory_resolves_discrete_gym_env(cartpole_env: gym.Env) -> None:
     context = ComponentContext(
         backend=JAXBackend(),
         config=AlphaZeroConfig(require_implemented=False),
-        env=cartpole_env,
+        env=resolve_env(cartpole_env),
     )
     search_env = search_env_from_context(context)
     assert isinstance(search_env, GymnasiumSearchEnvironment)
@@ -29,7 +30,7 @@ def test_factory_resolves_continuous_box_env() -> None:
     context = ComponentContext(
         backend=JAXBackend(),
         config=AlphaZeroConfig(require_implemented=False),
-        env=env,
+        env=resolve_env(env),
     )
     search_env = search_env_from_context(context)
     assert isinstance(search_env, GymnasiumSearchEnvironment)
@@ -53,7 +54,7 @@ def test_factory_rejects_unsupported_action_space() -> None:
     context = ComponentContext(
         backend=JAXBackend(),
         config=AlphaZeroConfig(require_implemented=False),
-        env=env,
+        env=resolve_env(env),
     )
     with pytest.raises(NotImplementedError, match="No JAX SearchEnvironment adapter"):
         search_env_from_context(context)
@@ -99,7 +100,7 @@ def test_alphazero_search_on_cartpole(cartpole_env: gym.Env) -> None:
     context = ComponentContext(
         backend=JAXBackend(),
         config=AlphaZeroConfig(require_implemented=False, mcts_simulations=4),
-        env=cartpole_env,
+        env=resolve_env(cartpole_env),
     )
     planner = AlphaZeroPlanner(context, evaluate=fake_evaluate)
     planner.params = {"num_actions": cartpole_env.action_space.n}

@@ -12,6 +12,7 @@ from algorl.core.planner import Planner
 from algorl.core.replay_buffer import ReplayBuffer
 from algorl.core.training_loop import TrainingLoop
 from algorl.core.types import Action, Observation
+from algorl.envs.training_env import TrainingEnv
 
 
 class _RandomPlanner(Planner):
@@ -29,11 +30,11 @@ class _NoOpLearner(Learner):
 
 
 @pytest.fixture
-def cartpole_env() -> gym.Env:
-    return gym.make("CartPole-v1")
+def cartpole_env() -> TrainingEnv:
+    return TrainingEnv.from_gymnasium(gym.make("CartPole-v1"))
 
 
-def test_training_loop_collects_transitions(cartpole_env: gym.Env) -> None:
+def test_training_loop_collects_transitions(cartpole_env: TrainingEnv) -> None:
     config = BaseAgentConfig(learning_starts=0, train_freq=1, batch_size=1, seed=0)
     buffer = UniformReplayBuffer(capacity=100)
     loop = TrainingLoop(
@@ -48,7 +49,7 @@ def test_training_loop_collects_transitions(cartpole_env: gym.Env) -> None:
     assert loop.logger.history[-1]["step"] == 4
 
 
-def test_training_loop_waits_for_learning_starts(cartpole_env: gym.Env) -> None:
+def test_training_loop_waits_for_learning_starts(cartpole_env: TrainingEnv) -> None:
     config = BaseAgentConfig(learning_starts=10, train_freq=1, batch_size=1, seed=0)
     buffer = UniformReplayBuffer(capacity=100)
 

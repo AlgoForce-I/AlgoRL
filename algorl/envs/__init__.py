@@ -1,6 +1,22 @@
 """Gymnasium environment utilities."""
 
-from algorl.envs.interface import Env, check_gymnasium_env, gym
+from algorl.envs.interface import Env, check_env, gym
+from algorl.envs.gym_jax import JaxGymEnv
+from algorl.envs.jax_env import BatchedJaxEnv, JaxEnv, JaxRolloutBatch, PolicyFn
+from algorl.envs.resolve import resolve_env
+from algorl.envs.training_env import TrainingEnv
 from algorl.envs.wrappers import ActionRepeatWrapper
 
-__all__ = ["ActionRepeatWrapper", "Env", "check_gymnasium_env", "gym"]
+__all__ = [
+    "ActionRepeatWrapper",
+    "BatchedJaxEnv",
+    "Env",
+    "JaxEnv",
+    "JaxGymEnv",
+    "JaxRolloutBatch",
+    "PolicyFn",
+    "TrainingEnv",
+    "check_env",
+    "gym",
+    "resolve_env",
+]
