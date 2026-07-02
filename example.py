@@ -19,18 +19,17 @@ from MTCWorldMJX import CWConfig, make_cl_train_env
 
 
 def main() -> None:
-    config = CWConfig(seed=42, steps_per_task=1_000_000)
-    env = make_cl_train_env("CW10", config=config)
+    cw_config = CWConfig(seed=42, steps_per_task=1_000_000)
+    env = make_cl_train_env("CW10", config=cw_config)
 
-    config = EfficientZeroConfig(
+    ez_config = EfficientZeroConfig(
         backend="jax",
         seed=0,
         buffer_capacity=10_000,
-        learning_starts=1_000,
-        require_implemented=False,  # allow stub components during development
+        learning_starts=1_000
     )
 
-    agent = arl.EfficientZero(env, config=config)
+    agent = arl.EfficientZero(env, config=ez_config)
 
     # The agent composes its world model, planner, learner, and replay buffer.
     print(f"AlgoRL {arl.__version__}")
@@ -42,18 +41,6 @@ def main() -> None:
     print(f"Replay buffer: {type(agent.replay_buffer).__name__}")
 
     agent.learn(total_timesteps=10_000_000)
-
-    # Typical usage once implementations are complete:
-    #
-    #   observation, _ = env.reset()
-    #   action = agent.predict(observation)
-    #   agent.learn(total_timesteps=10_000)
-    #
-    # Other agents follow the same pattern, e.g.:
-    #
-    #   from algorl.agents.configs import DreamerV3Config
-    #   agent = arl.DreamerV3(env, config=DreamerV3Config(require_implemented=False))
-
 
 
 if __name__ == "__main__":
