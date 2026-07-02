@@ -229,6 +229,28 @@ class EfficientZeroConfig(SearchAgentConfig):
         return config.with_overrides(**overrides) if overrides else config
 
     @classmethod
+    def for_dmc_state_batched_cl_gpu(
+        cls,
+        *,
+        num_envs: int,
+        **overrides: object,
+    ) -> EfficientZeroConfig:
+        """GPU-friendly batched CW preset with full env/MCTS parallelism.
+
+        Keeps ``search_batch_size=num_envs`` and rollout chunk size at the balanced
+        preset so you can run 32 (or more) parallel actors and wide JIT MCTS.
+        Memory is saved on the learner side (smaller replay batch, partial reanalyze)
+        and by dropping MCTS trees after each search (see planner/training loop).
+        """
+        config = cls.for_dmc_state_batched_cl(
+            num_envs=num_envs,
+            batch_size=128,
+            reanalyze_ratio=0.5,
+            gradient_steps_per_rollout=1,
+        )
+        return config.with_overrides(**overrides) if overrides else config
+
+    @classmethod
     def for_dmc_state_throughput(cls, **overrides: object) -> EfficientZeroConfig:
         """HyperCEZ ``alt2`` preset tuned for maximum JAX throughput.
 

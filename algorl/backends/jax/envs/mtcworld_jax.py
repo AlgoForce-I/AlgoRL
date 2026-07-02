@@ -356,6 +356,7 @@ class BatchedContinualLearningJaxEnv:
 
     def _advance_task(self, key: jnp.ndarray) -> JaxState:
         self._seq_idx += 1
+        del self._vector_env
         self._vector_env = self._make_task_vector_env(self._seq_idx)
         key, reset_key = jax.random.split(key)
         return self._vector_env.reset(reset_key)

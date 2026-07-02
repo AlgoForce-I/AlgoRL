@@ -7,6 +7,7 @@ from typing import Any, Mapping
 
 import jax
 import jax.numpy as jnp
+import numpy as np
 
 from algorl.agents.configs import EfficientZeroConfig
 from algorl.backends.jax.nn.efficientzero.model import Params
@@ -53,13 +54,35 @@ class EfficientZeroBatchedResult:
     action_indices: jnp.ndarray
     action_weights: jnp.ndarray
     root_values: jnp.ndarray
-    search_tree: Any
     root_candidates: jnp.ndarray
+    search_tree: Any | None = None
     pred_values: jnp.ndarray | None = None
 
     @property
     def batch_size(self) -> int:
         return int(self.actions.shape[0])
+
+    def without_search_tree(self) -> EfficientZeroBatchedResult:
+        """Drop MCTS tree payloads; training only needs root policy/value tensors."""
+        if self.search_tree is None:
+            return self
+        return replace(self, search_tree=None)
+
+    def as_training_snapshot(self) -> EfficientZeroBatchedResult:
+        """Host NumPy snapshot for replay targets without retaining GPU search trees."""
+        return EfficientZeroBatchedResult(
+            actions=np.asarray(self.actions, dtype=np.float32),
+            action_indices=np.asarray(self.action_indices, dtype=np.int32),
+            action_weights=np.asarray(self.action_weights, dtype=np.float32),
+            root_values=np.asarray(self.root_values, dtype=np.float32),
+            search_tree=None,
+            root_candidates=np.asarray(self.root_candidates, dtype=np.float32),
+            pred_values=(
+                None
+                if self.pred_values is None
+                else np.asarray(self.pred_values, dtype=np.float32)
+            ),
+        )
 
     @classmethod
     def from_continuous_result(cls, result: ContinuousSearchResult) -> EfficientZeroBatchedResult:
@@ -80,7 +103,11 @@ class EfficientZeroBatchedResult:
             action_index=int(self.action_indices[index]),
             action_weights=jnp.asarray(self.action_weights[index]),
             root_value=float(self.root_values[index]),
-            search_tree=_slice_search_tree(self.search_tree, index),
+            search_tree=(
+                None
+                if self.search_tree is None
+                else _slice_search_tree(self.search_tree, index)
+            ),
             root_candidates=jnp.asarray(self.root_candidates[index]),
         )
 
@@ -254,8 +281,9 @@ class EfficientZeroPlanner(BatchedPlanner):
                 root_candidates=batched.root_candidates,
                 pred_values=pred_values,
             )
-        self.last_result = batched
-        return batched
+        training_snapshot = batched.as_training_snapshot()
+        self.last_result = training_snapshot
+        return training_snapshot
 
     def search(
         self,

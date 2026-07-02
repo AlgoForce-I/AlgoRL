@@ -173,6 +173,7 @@ class TrainingLoop:
                 on_step=on_rollout_step,
             )
             transitions = self._transitions_from_rollout(batch, search_results)
+            self._release_rollout_search_cache(search_results)
             num_added = 0
             for transition in transitions:
                 self.replay_buffer.add(transition)
@@ -304,9 +305,11 @@ class TrainingLoop:
                 obs_array = np.asarray(observations, dtype=np.float32)
                 obs_batch = [obs_array[lane] for lane in range(obs_array.shape[0])]
                 result = planner.search_batch(obs_batch, deterministic=False)
-                self.planner.last_result = result
+                snapshot_fn = getattr(result, "as_training_snapshot", None)
+                snapshot = snapshot_fn() if callable(snapshot_fn) else result
+                self.planner.last_result = snapshot
                 if search_results is not None:
-                    search_results.append(result)
+                    search_results.append(snapshot)
                 return jnp.asarray(result.actions, dtype=jnp.float32)
 
             return policy
@@ -398,10 +401,17 @@ class TrainingLoop:
         finally:
             if progress_bar is not None and hasattr(self.learner, "_on_reanalyze_progress"):
                 delattr(self.learner, "_on_reanalyze_progress")
+            self._release_rollout_search_cache([])
         merged = {**metrics, **trained_metrics}
         if progress_bar is not None:
             progress_bar.pulse({**trained_metrics, "phase": "buffer"})
         return merged
+
+    def _release_rollout_search_cache(self, search_results: list[Any]) -> None:
+        """Drop rollout MCTS payloads before learner reanalyze allocates GPU memory."""
+        search_results.clear()
+        if hasattr(self.planner, "last_result"):
+            self.planner.last_result = None
 
     def _log_step(
         self,

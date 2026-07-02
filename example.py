@@ -11,13 +11,17 @@ Install the package and JAX backend first::
 
 from __future__ import annotations
 
+from algorl.backends.jax.memory import configure_jax_gpu_memory
+
+configure_jax_gpu_memory(preallocate=False, memory_fraction=0.85)
+
 import algorl as arl
 from algorl.agents.configs import EfficientZeroConfig
 from algorl.backends.jax.envs import make_batched_cw_train_env
 from algorl.envs import resolve_env
 from MTCWorldMJX import CWConfig
 
-NUM_ENVS = 32
+NUM_ENVS = 32  # rollout + MCTS search_batch width (use max GPU parallelism here)
 
 
 def main() -> None:
@@ -30,13 +34,13 @@ def main() -> None:
     )
     env = resolve_env(jax_env, seed=42)
 
-    ez_config = EfficientZeroConfig.for_dmc_state_batched_cl(
+    ez_config = EfficientZeroConfig.for_dmc_state_batched_cl_gpu(
         num_envs=NUM_ENVS,
+        batch_size=256,
+        reanalyze_ratio=1.0,
         seed=0,
         buffer_capacity=10_000,
         learning_starts=1_000,
-        reanalyze_ratio=1,
-        gradient_steps_per_rollout=3
     )
 
     agent = arl.EfficientZero(env, config=ez_config)
