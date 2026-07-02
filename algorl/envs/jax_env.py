@@ -12,6 +12,7 @@ from algorl.core.types import Transition
 
 JaxState = Any
 PolicyFn = Callable[[jnp.ndarray, jnp.ndarray], jnp.ndarray]
+RolloutStepCallback = Callable[[int, dict[str, Any]], None]
 
 
 @dataclass(frozen=True)
@@ -103,4 +104,5 @@ class BatchedJaxEnv(Protocol):
         num_steps: int,
         *,
         key: jnp.ndarray,
+        on_step: RolloutStepCallback | None = None,
     ) -> JaxRolloutBatch: ...

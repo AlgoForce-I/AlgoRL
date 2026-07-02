@@ -188,7 +188,7 @@ class _MockBatchedEnv(TrainingEnv):
             num_envs=num_envs,
         )
 
-    def collect_rollout(self, policy, num_steps: int, *, key=None) -> JaxRolloutBatch:
+    def collect_rollout(self, policy, num_steps: int, *, key=None, on_step=None) -> JaxRolloutBatch:
         del key
         observations = np.zeros((num_steps, self.num_envs, 3), dtype=np.float32)
         actions = np.zeros((num_steps, self.num_envs, 1), dtype=np.float32)
@@ -197,6 +197,16 @@ class _MockBatchedEnv(TrainingEnv):
                 policy(observations[step_idx], np.array(0)),
                 dtype=np.float32,
             )
+            if on_step is not None:
+                on_step(
+                    self.num_envs,
+                    {
+                        "train/reward": 0.0,
+                        "rewards": np.zeros(self.num_envs, dtype=np.float32),
+                        "dones": np.zeros(self.num_envs, dtype=bool),
+                        "infos": [{} for _ in range(self.num_envs)],
+                    },
+                )
         return JaxRolloutBatch(
             observation=observations,
             action=actions,
@@ -204,6 +214,40 @@ class _MockBatchedEnv(TrainingEnv):
             next_observation=observations,
             done=np.zeros((num_steps, self.num_envs), dtype=bool),
         )
+
+
+def test_batched_gradient_steps_per_rollout_limits_train_calls() -> None:
+    num_envs = 2
+    env = _MockBatchedEnv(num_envs=num_envs)
+
+    class _CountingLearner(Learner):
+        def __init__(self) -> None:
+            self.calls = 0
+
+        def train_step(self, replay_buffer: ReplayBuffer) -> dict[str, float]:
+            self.calls += 1
+            return {"loss": float(self.calls)}
+
+    learner = _CountingLearner()
+    buffer = UniformReplayBuffer(capacity=100)
+    config = BaseAgentConfig(
+        learning_starts=0,
+        train_freq=1,
+        batch_size=1,
+        seed=0,
+        jax_rollout_chunk=2,
+        gradient_steps_per_rollout=1,
+    )
+    loop = TrainingLoop(
+        env=env,
+        planner=_BatchedPlanner(batch_size=num_envs),
+        learner=learner,
+        replay_buffer=buffer,
+        config=config,
+    )
+    loop.run(8)
+    assert len(buffer) == 8
+    assert learner.calls == 2
 
 
 def test_training_loop_batched_rollout_stores_search_targets() -> None:
@@ -228,6 +272,106 @@ def test_training_loop_batched_rollout_stores_search_targets() -> None:
         assert transition.info[SEARCH_VALUE_INFO_KEY] == float(index % num_envs)
 
 
+def test_training_loop_progress_bar_shows_training_phase(cartpole_env: TrainingEnv) -> None:
+    config = BaseAgentConfig(learning_starts=0, train_freq=1, batch_size=1, seed=0)
+    buffer = UniformReplayBuffer(capacity=100)
+
+    class _LossLearner(Learner):
+        def train_step(self, replay_buffer: ReplayBuffer) -> dict[str, float]:
+            replay_buffer.sample(1)
+            return {"loss": 0.42, "policy_loss": 0.1}
+
+    class _TrackingProgressBar:
+        def __init__(self) -> None:
+            self.pulses: list[dict[str, object]] = []
+            self.n = 0
+
+        def start(self, total: int, **kwargs) -> None:
+            del total, kwargs
+
+        def update(self, step_info=None, *, n: int = 1) -> None:
+            del step_info
+            self.n += n
+
+        def pulse(self, step_info=None) -> None:
+            if step_info is not None:
+                self.pulses.append(dict(step_info))
+
+        def close(self) -> None:
+            return
+
+    progress_bar = _TrackingProgressBar()
+    loop = TrainingLoop(
+        env=cartpole_env,
+        planner=_RandomPlanner(cartpole_env.action_space),
+        learner=_LossLearner(),
+        replay_buffer=buffer,
+        config=config,
+    )
+    loop.run(3, progress_bar=progress_bar)
+    phases = [pulse.get("phase") for pulse in progress_bar.pulses]
+    assert "training" in phases
+    assert any(pulse.get("loss") == 0.42 for pulse in progress_bar.pulses)
+
+
+def test_training_loop_batched_tensorboard_logs_during_rollout() -> None:
+    num_envs = 2
+    env = _MockBatchedEnv(num_envs=num_envs)
+    buffer = UniformReplayBuffer(capacity=100)
+    planner = _BatchedPlanner(batch_size=num_envs)
+    config = BaseAgentConfig(learning_starts=0, train_freq=100, batch_size=100, seed=0, jax_rollout_chunk=2)
+    with tempfile.TemporaryDirectory() as log_dir:
+        logger = TensorboardLogger(log_dir)
+        loop = TrainingLoop(
+            env=env,
+            planner=planner,
+            learner=_NoOpLearner(),
+            replay_buffer=buffer,
+            config=config,
+            logger=logger,
+        )
+        loop.run(4)
+        assert len(buffer) == 4
+        assert any("train/batched/mean_reward" in entry for entry in logger.history)
+        assert any("train/reward" in entry for entry in logger.history)
+
+
+def test_training_loop_batched_progress_bar_updates_during_rollout() -> None:
+    num_envs = 2
+    env = _MockBatchedEnv(num_envs=num_envs)
+    buffer = UniformReplayBuffer(capacity=100)
+    planner = _BatchedPlanner(batch_size=num_envs)
+    config = BaseAgentConfig(learning_starts=0, train_freq=100, batch_size=100, seed=0, jax_rollout_chunk=2)
+    loop = TrainingLoop(
+        env=env,
+        planner=planner,
+        learner=_NoOpLearner(),
+        replay_buffer=buffer,
+        config=config,
+    )
+
+    class _CountingProgressBar:
+        def __init__(self) -> None:
+            self.total = 0
+            self.n = 0
+
+        def start(self, total: int, **kwargs) -> None:
+            del kwargs
+            self.total = total
+
+        def update(self, step_info=None, *, n: int = 1) -> None:
+            del step_info
+            self.n += n
+
+        def close(self) -> None:
+            return
+
+    progress_bar = _CountingProgressBar()
+    loop.run(4, progress_bar=progress_bar)
+    assert progress_bar.n == 4
+    assert len(buffer) == 4
+
+
 def test_training_loop_merges_rollout_step_info() -> None:
     num_envs = 2
     env = _MockBatchedEnv(num_envs=num_envs)
@@ -244,8 +388,8 @@ def test_training_loop_merges_rollout_step_info() -> None:
 
     original_collect = env.collect_rollout
 
-    def collect_with_info(policy, num_steps, *, key=None):
-        batch = original_collect(policy, num_steps, key=key)
+    def collect_with_info(policy, num_steps, *, key=None, on_step=None):
+        batch = original_collect(policy, num_steps, key=key, on_step=on_step)
         return JaxRolloutBatch(
             observation=batch.observation,
             action=batch.action,

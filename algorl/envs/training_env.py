@@ -9,7 +9,7 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 
-from algorl.envs.jax_env import BatchedJaxEnv, JaxEnv, JaxRolloutBatch, JaxState, PolicyFn
+from algorl.envs.jax_env import BatchedJaxEnv, JaxEnv, JaxRolloutBatch, JaxState, PolicyFn, RolloutStepCallback
 
 
 def _box_space(shape: tuple[int, ...], *, low: float, high: float) -> gym.spaces.Box:
@@ -63,7 +63,7 @@ class TrainingEnv:
         reset_fn: Callable[[int | None], tuple[np.ndarray, dict[str, Any]]] | None = None,
         step_fn: Callable[[Any], tuple[np.ndarray, float, bool, bool, dict[str, Any]]] | None = None,
         search_environment_fn: Callable[[], Any] | None = None,
-        collect_rollout_fn: Callable[[PolicyFn, int, jnp.ndarray], JaxRolloutBatch] | None = None,
+        collect_rollout_fn: Callable[..., JaxRolloutBatch] | None = None,
     ) -> None:
         self.observation_space = observation_space
         self.action_space = action_space
@@ -146,8 +146,14 @@ class TrainingEnv:
             policy: PolicyFn,
             num_steps: int,
             rollout_key: jnp.ndarray,
+            on_step: RolloutStepCallback | None = None,
         ) -> JaxRolloutBatch:
-            return env.collect_rollout(policy, num_steps, key=rollout_key)
+            return env.collect_rollout(
+                policy,
+                num_steps,
+                key=rollout_key,
+                on_step=on_step,
+            )
 
         def reset(seed_value: int | None) -> tuple[np.ndarray, dict[str, Any]]:
             nonlocal key
@@ -203,11 +209,12 @@ class TrainingEnv:
         num_steps: int,
         *,
         key: jnp.ndarray | None = None,
+        on_step: RolloutStepCallback | None = None,
     ) -> JaxRolloutBatch:
         if self._collect_rollout_fn is None:
             raise RuntimeError("TrainingEnv does not support batched rollouts.")
         rollout_key = key if key is not None else jax.random.PRNGKey(0)
-        return self._collect_rollout_fn(policy, num_steps, rollout_key)
+        return self._collect_rollout_fn(policy, num_steps, rollout_key, on_step)
 
     @property
     def observation_shape(self) -> int | tuple[int, ...]:

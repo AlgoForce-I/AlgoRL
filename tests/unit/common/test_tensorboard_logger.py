@@ -35,3 +35,11 @@ def test_tensorboard_logger_records_episode_and_success_rate() -> None:
         metrics_2 = logger.record_episode(20, event_2)
         assert metrics_2["train/task/hammer-v3/success_rate"] == 0.5
         logger.close()
+
+
+def test_tensorboard_logger_flush_writes_events() -> None:
+    with tempfile.TemporaryDirectory() as log_dir:
+        logger = TensorboardLogger(log_dir)
+        logger.record(1, {"train/reward": 1.0})
+        logger.flush()
+        logger.close()

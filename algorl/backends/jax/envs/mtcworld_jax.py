@@ -14,7 +14,7 @@ from algorl.backends.jax.envs.mtcworld_search import (
     MtcworldCWTaskSearchEnvironment,
     MtcworldSearchEnvironment,
 )
-from algorl.envs.jax_env import BatchedJaxEnv, JaxEnv, JaxRolloutBatch, JaxState, PolicyFn
+from algorl.envs.jax_env import BatchedJaxEnv, JaxEnv, JaxRolloutBatch, JaxState, PolicyFn, RolloutStepCallback
 
 
 def require_mtcworld() -> Any:
@@ -34,6 +34,31 @@ def _as_bool(value: jnp.ndarray | bool | float) -> bool:
 
 def _as_float(value: jnp.ndarray | float) -> float:
     return float(np.asarray(value))
+
+
+def _emit_rollout_step(
+    on_step: RolloutStepCallback | None,
+    *,
+    num_envs: int,
+    reward: np.ndarray,
+    done: np.ndarray,
+    lane_infos: list[dict[str, Any]] | None = None,
+    step_info: dict[str, Any] | None = None,
+) -> None:
+    if on_step is None:
+        return
+    reward_array = np.asarray(reward, dtype=np.float32).reshape(-1)
+    done_array = np.asarray(done, dtype=bool).reshape(-1)
+    infos = lane_infos if lane_infos is not None else [{} for _ in range(int(reward_array.shape[0]))]
+    info: dict[str, Any] = {
+        "train/reward": float(np.mean(reward_array)),
+        "rewards": reward_array,
+        "dones": done_array,
+        "infos": [dict(item) for item in infos],
+    }
+    if step_info is not None:
+        info.update(step_info)
+    on_step(int(reward_array.shape[0]), info)
 
 
 class SawyerJaxEnv(JaxEnv):
@@ -359,6 +384,7 @@ class BatchedContinualLearningJaxEnv:
         num_steps: int,
         *,
         key: jnp.ndarray,
+        on_step: RolloutStepCallback | None = None,
     ) -> JaxRolloutBatch:
         if num_steps < 1:
             raise ValueError("num_steps must be >= 1")
@@ -420,6 +446,18 @@ class BatchedContinualLearningJaxEnv:
             next_observations.append(next_obs)
             dones.append(done)
             state = next_state
+            lane_info = step_infos[-1][0]
+            _emit_rollout_step(
+                on_step,
+                num_envs=self.num_envs,
+                reward=rewards[-1],
+                done=done,
+                lane_infos=step_infos[-1],
+                step_info={
+                    "task_name": lane_info.get("task_name"),
+                    "train/episode_success": lane_info.get("success"),
+                },
+            )
 
         self._state = state
         return JaxRolloutBatch(
@@ -521,6 +559,7 @@ class VectorJaxEnv(BatchedJaxEnv):
         num_steps: int,
         *,
         key: jnp.ndarray,
+        on_step: RolloutStepCallback | None = None,
     ) -> JaxRolloutBatch:
         if num_steps < 1:
             raise ValueError("num_steps must be >= 1")
@@ -553,6 +592,12 @@ class VectorJaxEnv(BatchedJaxEnv):
             next_observations.append(next_obs)
             dones.append(done)
             state = next_state
+            _emit_rollout_step(
+                on_step,
+                num_envs=self.num_envs,
+                reward=rewards[-1],
+                done=done,
+            )
 
         return JaxRolloutBatch(
             observation=np.stack(observations, axis=0),

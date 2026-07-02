@@ -117,6 +117,44 @@ def test_efficient_zero_learner_train_step_updates_params(learner_context: Compo
     assert changed
 
 
+def test_efficient_zero_learner_train_step_with_large_batch(learner_context: ComponentContext) -> None:
+    config = learner_context.config.with_overrides(batch_size=8, unroll_steps=5, trajectory_size=12)
+    context = ComponentContext(
+        backend=learner_context.backend,
+        config=config,
+        env=learner_context.env,
+    )
+    context.world_model = build_efficient_zero_world_model(context)
+    context.planner = build_efficient_zero_planner(context)
+    learner = build_efficient_zero_learner(context)
+    buffer = EfficientZeroReplayBuffer(
+        capacity=200,
+        config=config,
+        unroll_steps=config.unroll_steps,
+        trajectory_size=config.trajectory_size,
+    )
+    for index in range(80):
+        policy = np.full((4,), 0.25, dtype=np.float32)
+        candidates = np.zeros((4, 1), dtype=np.float32)
+        buffer.add(
+            Transition(
+                observation=np.full((4,), float(index), dtype=np.float32),
+                action=np.asarray([0.1], dtype=np.float32),
+                reward=float(index) * 0.1,
+                next_observation=np.full((4,), float(index + 1), dtype=np.float32),
+                done=index % 6 == 5,
+                info={
+                    POLICY_TARGET_INFO_KEY: policy,
+                    SEARCH_VALUE_INFO_KEY: float(index) * 0.05,
+                    ROOT_CANDIDATES_INFO_KEY: candidates,
+                    BEST_ACTION_INFO_KEY: np.asarray([0.1], dtype=np.float32),
+                },
+            )
+        )
+    metrics = learner.train_step(buffer)
+    assert np.isfinite(metrics["loss"])
+
+
 def test_as_candidate_matrix_normalizes_mcts_shapes() -> None:
     from algorl.backends.jax.learners.efficientzero.reanalyze import _as_candidate_matrix
 

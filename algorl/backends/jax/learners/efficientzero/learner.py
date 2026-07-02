@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import copy
 from functools import partial
+from collections.abc import Callable
 from typing import Any
 
 import jax
@@ -61,6 +62,13 @@ def _batch_to_arrays(batch: Batch) -> dict[str, jnp.ndarray]:
         else:
             arrays[key] = jnp.asarray(data[key], dtype=jnp.float32)
     return arrays
+
+
+def _time_major_for_scan(array: jnp.ndarray) -> jnp.ndarray:
+    """``jax.lax.scan`` runs over axis 0; training tensors are stored ``[B, T, ...]``."""
+    if array.ndim <= 1:
+        return array
+    return jnp.swapaxes(array, 0, 1)
 
 
 def _loss_from_batch(
@@ -160,14 +168,14 @@ def _loss_from_batch(
             "entropy": step_entropy,
         }
 
-    step_actions = actions[:, :unroll_steps]
-    step_rewards = rewards[:, :unroll_steps]
-    step_value_targets = value_targets[:, 1 : unroll_steps + 1]
-    step_policy_targets = policy_targets[:, 1 : unroll_steps + 1]
-    step_candidates = policy_candidates[:, 1 : unroll_steps + 1]
-    step_best_actions = best_actions[:, 1 : unroll_steps + 1]
-    step_next_obs = observations[:, 1 : unroll_steps + 1]
-    step_masks = masks
+    step_actions = _time_major_for_scan(actions[:, :unroll_steps])
+    step_rewards = _time_major_for_scan(rewards[:, :unroll_steps])
+    step_value_targets = _time_major_for_scan(value_targets[:, 1 : unroll_steps + 1])
+    step_policy_targets = _time_major_for_scan(policy_targets[:, 1 : unroll_steps + 1])
+    step_candidates = _time_major_for_scan(policy_candidates[:, 1 : unroll_steps + 1])
+    step_best_actions = _time_major_for_scan(best_actions[:, 1 : unroll_steps + 1])
+    step_next_obs = _time_major_for_scan(observations[:, 1 : unroll_steps + 1])
+    step_masks = _time_major_for_scan(masks)
     policy_valid = (jnp.arange(unroll_steps) + 1) < unroll_steps
     step_policy_masks = policy_valid.astype(jnp.float32)
     step_rngs = jax.random.split(unroll_rng, unroll_steps)
@@ -284,6 +292,7 @@ class EfficientZeroLearner(Learner):
             planner=self.planner,
             config=self.config,
             reanalyze_params=self._reanalyze_params,
+            on_reanalyze_progress=getattr(self, "_on_reanalyze_progress", None),
         )
         self._maybe_refresh_reanalyze_params()
 
@@ -330,6 +339,7 @@ def _prepare_training_batch(
     planner: Planner,
     config: EfficientZeroConfig,
     reanalyze_params: Params,
+    on_reanalyze_progress: Callable[[int, int], None] | None = None,
 ) -> dict[str, jnp.ndarray]:
     arrays = _batch_to_arrays(batch)
     observations = np.asarray(batch.data["observations"])
@@ -343,6 +353,7 @@ def _prepare_training_batch(
                 planner,
                 observations,
                 reanalyze_count=reanalyze_count,
+                on_progress=on_reanalyze_progress,
             )
         finally:
             planner.params = old_params

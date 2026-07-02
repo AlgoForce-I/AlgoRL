@@ -15,6 +15,7 @@ class BaseAgentConfig:
     batch_size: int = 32
     train_freq: int = 1
     learning_starts: int = 1_000
+    gradient_steps_per_rollout: int | None = None
     checkpoint_freq: int | None = None
     jax_rollout_chunk: int = 64
     require_implemented: bool = True
@@ -200,6 +201,30 @@ class EfficientZeroConfig(SearchAgentConfig):
             consistency_coeff=2.0,
             policy_action_num=4,
             random_action_num=12,
+        )
+        return config.with_overrides(**overrides) if overrides else config
+
+    @classmethod
+    def for_dmc_state_batched_cl(
+        cls,
+        *,
+        num_envs: int,
+        **overrides: object,
+    ) -> EfficientZeroConfig:
+        """Balanced batched continual-learning preset (HyperCEZ-style cadence).
+
+        Collects ``jax_rollout_chunk * num_envs`` env steps in parallel, then runs
+        one learner update (with full reanalyze by default) per rollout chunk.
+        This matches HyperCEZ ``dynamics_update_every`` >> 1 rather than training on
+        every env frame.
+        """
+        config = cls.for_dmc_state(
+            batch_size=256,
+            mcts_simulations=32,
+            jax_rollout_chunk=64,
+            search_batch_size=num_envs,
+            reanalyze_ratio=1.0,
+            gradient_steps_per_rollout=1,
         )
         return config.with_overrides(**overrides) if overrides else config
 

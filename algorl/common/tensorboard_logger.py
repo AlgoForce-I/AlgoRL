@@ -58,6 +58,10 @@ class TensorboardLogger(Logger):
             if isinstance(value, (int, float)):
                 self._writer.add_scalar(key, float(value), step)
 
+    def flush(self) -> None:
+        """Flush pending TensorBoard events so dashboards update promptly."""
+        self._writer.flush()
+
     def record_episode(self, step: int, event: EpisodeEndEvent) -> dict[str, float]:
         """Log episode metrics and update per-task success rates."""
         metrics = episode_metrics_from_event(event)

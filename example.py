@@ -17,7 +17,7 @@ from algorl.backends.jax.envs import make_batched_cw_train_env
 from algorl.envs import resolve_env
 from MTCWorldMJX import CWConfig
 
-NUM_ENVS = 8
+NUM_ENVS = 32
 
 
 def main() -> None:
@@ -30,13 +30,13 @@ def main() -> None:
     )
     env = resolve_env(jax_env, seed=42)
 
-    ez_config = EfficientZeroConfig.for_dmc_state_throughput(
+    ez_config = EfficientZeroConfig.for_dmc_state_batched_cl(
+        num_envs=NUM_ENVS,
         seed=0,
         buffer_capacity=10_000,
         learning_starts=1_000,
-        reanalyze_ratio=0.5,
-        search_batch_size=NUM_ENVS,
-        jax_rollout_chunk=64,
+        reanalyze_ratio=1,
+        gradient_steps_per_rollout=3
     )
 
     agent = arl.EfficientZero(env, config=ez_config)
@@ -59,6 +59,7 @@ def main() -> None:
     print(f"Rollout chunk: {agent.config.jax_rollout_chunk}")
     print(f"Learner batch size: {agent.config.batch_size}")
     print(f"Reanalyze ratio: {agent.config.reanalyze_ratio}")
+    print(f"Gradient steps per rollout: {agent.config.gradient_steps_per_rollout}")
 
     agent.learn(
         total_timesteps=10_000_000,
