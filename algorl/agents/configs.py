@@ -207,9 +207,9 @@ class EfficientZeroConfig(SearchAgentConfig):
     def for_dmc_state_throughput(cls, **overrides: object) -> EfficientZeroConfig:
         """HyperCEZ ``alt2`` preset tuned for maximum JAX throughput.
 
-        Uses larger learner batches, HyperCEZ simulation count, and disables
-        training-time MCTS reanalyze (implemented as a sequential Python loop
-        outside the JIT-compiled planner/learner path).
+        Uses larger learner batches and HyperCEZ simulation count. Reanalyze is
+        disabled by default because training-time reanalyze is a sequential
+        Python loop outside the JIT-compiled planner/learner path.
         """
         config = cls.for_dmc_state(
             reanalyze_ratio=0.0,

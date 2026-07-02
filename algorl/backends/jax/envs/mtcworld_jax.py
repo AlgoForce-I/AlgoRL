@@ -151,9 +151,6 @@ class ContinualLearningJaxEnv(JaxEnv):
     def __init__(self, cl_env: Any) -> None:
         self._cl_env = cl_env
         self._search_env = MtcworldCWSearchEnvironment(cl_env)
-        self._jit_reset = jax.jit(cl_env.reset)
-        self._jit_step = jax.jit(cl_env.step)
-        self._jit_reset_from_state = jax.jit(cl_env.reset_from_state)
 
     @property
     def observation_shape(self) -> tuple[int, ...]:
@@ -176,12 +173,12 @@ class ContinualLearningJaxEnv(JaxEnv):
         return self._search_env
 
     def reset(self, key: jnp.ndarray) -> JaxState:
-        state = self._jit_reset(key)
+        state = self._cl_env.reset(key)
         self._search_env.bind_state(state)
         return state
 
     def step(self, state: JaxState, action: jnp.ndarray) -> JaxState:
-        next_state = self._jit_step(state, action)
+        next_state = self._cl_env.step(state, action)
         self._search_env.bind_state(next_state)
         return next_state
 
@@ -211,7 +208,7 @@ class ContinualLearningJaxEnv(JaxEnv):
     def reset_after_episode(self, key: jnp.ndarray, state: JaxState) -> JaxState:
         if int(state.info["global_step"]) >= self._cl_env.steps_limit:
             return self.reset(key)
-        next_state = self._jit_reset_from_state(key, state)
+        next_state = self._cl_env.reset_from_state(key, state)
         self._search_env.bind_state(next_state)
         return next_state
 
