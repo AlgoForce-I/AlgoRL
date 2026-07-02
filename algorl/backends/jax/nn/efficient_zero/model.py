@@ -2,15 +2,16 @@
 
 from __future__ import annotations
 
-from typing import Any, Mapping
+from typing import Any, Mapping, TypeAlias
 
+import chex
 import jax
 import jax.numpy as jnp
 from flax import linen as nn
 
 from algorl.agents.configs import EfficientZeroConfig
 
-Params = Mapping[str, Any]
+Params: TypeAlias = chex.ArrayTree
 
 _SUPPORT_MIN = -300.0
 _SUPPORT_MAX = 301.0
@@ -26,25 +27,43 @@ def _symexp(x: jnp.ndarray) -> jnp.ndarray:
     return jnp.sign(x) * (jnp.exp(jnp.abs(x)) - 1.0)
 
 
+def _bin_centers(support_bins: int) -> jnp.ndarray:
+    """Support bin centers as a compile-time constant array."""
+    step = 600.0 / (support_bins - 1)
+    return jnp.array([-300.0 + i * step for i in range(support_bins)], dtype=jnp.float32)
+
+
 def _support_bins() -> jnp.ndarray:
     count = int(round((_SUPPORT_MAX - _SUPPORT_MIN) / _SUPPORT_DELTA)) + 1
-    return jnp.linspace(_SUPPORT_MIN, _SUPPORT_MAX, count)
+    return _bin_centers(count)
+
+
+def _pad_support_logits(logits: jnp.ndarray, support_bins: int) -> jnp.ndarray:
+    """Pad trailing support dimension to ``support_bins`` for scan-safe reduction."""
+    width = support_bins - logits.shape[-1]
+    if width <= 0:
+        return logits[..., :support_bins]
+    pad_spec = [(0, 0)] * (logits.ndim - 1) + [(0, width)]
+    return jnp.pad(logits, pad_spec, constant_values=-jnp.inf)
 
 
 def _vector_to_scalar(logits: jnp.ndarray, support_type: str, support_bins: int) -> jnp.ndarray:
+    """Map value/reward logits to a scalar expectation.
+
+    ``support_type`` is fixed per model config, so we branch in Python rather than
+    with ``lax.cond`` on the logit width. A traced shape branch here breaks XLA when
+    composed with Flax inference inside ``jax.jit``.
+    """
+    if support_type not in {"symlog", "support", "discrete"}:
+        raise ValueError(f"Unknown support type {support_type!r}")
+
     if support_type == "symlog":
-        if logits.shape[-1] == 1:
-            return _symexp(logits[..., 0])
-        probs = jax.nn.softmax(logits, axis=-1)
-        bins = jnp.linspace(-300.0, 300.0, support_bins)
-        return _symexp(jnp.sum(probs * bins, axis=-1))
+        return _symexp(logits[..., 0])
 
-    if support_type in {"support", "discrete"}:
-        probs = jax.nn.softmax(logits, axis=-1)
-        bins = jnp.linspace(-300.0, 300.0, support_bins)
-        return jnp.sum(probs * bins, axis=-1)
-
-    raise ValueError(f"Unknown support type {support_type!r}")
+    padded = _pad_support_logits(logits, support_bins)
+    probs = jax.nn.softmax(padded, axis=-1)
+    bins = _bin_centers(support_bins)
+    return jnp.sum(probs * bins, axis=-1)
 
 
 class EfficientZero(nn.Module):
