@@ -51,6 +51,7 @@ class EfficientZeroConfig(SearchAgentConfig):
     """
 
     reanalyze_ratio: float = 0.5
+    reanalyze_update_interval: int = 200
     unroll_steps: int = 5
     trajectory_size: int = 100
     learning_rate: float = 3e-4
@@ -64,6 +65,22 @@ class EfficientZeroConfig(SearchAgentConfig):
     IQL_weight: float = 0.5
     value_support_range: tuple[float, float] = (-299.0, 299.0)
     reward_support_range: tuple[float, float] = (-2.0, 2.0)
+    discount: float = 0.997
+    td_steps: int = 5
+    td_lambda: float = 0.95
+    gae_max_steps: int = 15
+    lstm_horizon_len: int = 5
+    value_target: str = "mixed"
+    model_value_target: str = "GAE"
+    start_use_mix_training_steps: int = 40_000
+    mixed_value_threshold: float = 20_000.0
+    use_priority: bool = True
+    priority_prob_alpha: float = 1.0
+    priority_prob_beta: float = 1.0
+    min_prior: float = 1e-6
+    top_transitions: float = 200_000.0
+    policy_action_num: int = 4
+    random_action_num: int = 12
     state_norm: bool = False
     value_prefix: bool = False
     v_num: int = 1
@@ -170,6 +187,19 @@ class EfficientZeroConfig(SearchAgentConfig):
             use_p_norm=False,
             noisy_net=False,
             reanalyze_ratio=1.0,
+            discount=0.997,
+            td_steps=5,
+            td_lambda=0.95,
+            gae_max_steps=15,
+            value_target="mixed",
+            model_value_target="GAE",
+            start_use_mix_training_steps=40_000,
+            mixed_value_threshold=20_000.0,
+            use_priority=True,
+            entropy_coeff=0.05,
+            consistency_coeff=2.0,
+            policy_action_num=4,
+            random_action_num=12,
         )
         return config.with_overrides(**overrides) if overrides else config
 

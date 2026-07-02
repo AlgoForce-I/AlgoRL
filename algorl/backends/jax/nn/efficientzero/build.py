@@ -9,7 +9,7 @@ import jax.numpy as jnp
 
 from algorl.agents.configs import EfficientZeroConfig
 from algorl.envs.training_env import TrainingEnv
-from algorl.backends.jax.nn.efficient_zero.blocks import (
+from algorl.backends.jax.nn.efficientzero.blocks import (
     ConvDynamicsNetwork,
     ConvRepresentationNetwork,
     ConvSupportLSTMNetwork,
@@ -28,7 +28,7 @@ from algorl.backends.jax.nn.efficient_zero.blocks import (
     flatten_spatial_shape,
     support_output_size,
 )
-from algorl.backends.jax.nn.efficient_zero.model import EfficientZero
+from algorl.backends.jax.nn.efficientzero.model import EfficientZero
 
 
 def infer_model_type(observation_shape: int | tuple[int, ...]) -> str:

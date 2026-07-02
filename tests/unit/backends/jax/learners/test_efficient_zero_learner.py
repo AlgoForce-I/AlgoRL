@@ -11,14 +11,16 @@ import numpy as np
 import pytest
 
 from algorl.agents.configs import EfficientZeroConfig
-from algorl.backends.jax.learners.efficient_zero import (
+from algorl.backends.jax.learners.efficientzero import (
     EfficientZeroLearner,
     build_efficient_zero_learner,
 )
-from algorl.backends.jax.planners.mcts.efficientzero import build_efficient_zero_planner
-from algorl.backends.jax.world_models.efficient_zero import build_efficient_zero_world_model
-from algorl.buffers.efficient_zero import (
+from algorl.backends.jax.planners.efficientzero import build_efficient_zero_planner
+from algorl.backends.jax.world_models.efficientzero import build_efficient_zero_world_model
+from algorl.buffers.efficientzero import (
+    BEST_ACTION_INFO_KEY,
     POLICY_TARGET_INFO_KEY,
+    ROOT_CANDIDATES_INFO_KEY,
     SEARCH_VALUE_INFO_KEY,
     EfficientZeroReplayBuffer,
 )
@@ -42,6 +44,8 @@ def learner_context(cartpole_training_env: TrainingEnv) -> ComponentContext:
         trajectory_size=4,
         learning_starts=0,
         mcts_simulations=2,
+        reanalyze_ratio=0.0,
+        use_priority=False,
     )
     context = ComponentContext(
         backend=get_backend("jax"),
@@ -56,6 +60,10 @@ def learner_context(cartpole_training_env: TrainingEnv) -> ComponentContext:
 def _fill_buffer(buffer: EfficientZeroReplayBuffer, *, policy_dim: int = 4) -> None:
     for index in range(8):
         policy = np.full((policy_dim,), 1.0 / policy_dim, dtype=np.float32)
+        candidates = np.stack(
+            [np.asarray([0.1], dtype=np.float32) for _ in range(policy_dim)],
+            axis=0,
+        )
         buffer.add(
             Transition(
                 observation=np.full((4,), float(index), dtype=np.float32),
@@ -66,6 +74,8 @@ def _fill_buffer(buffer: EfficientZeroReplayBuffer, *, policy_dim: int = 4) -> N
                 info={
                     POLICY_TARGET_INFO_KEY: policy,
                     SEARCH_VALUE_INFO_KEY: float(index) * 0.05,
+                    ROOT_CANDIDATES_INFO_KEY: candidates,
+                    BEST_ACTION_INFO_KEY: np.asarray([0.1], dtype=np.float32),
                 },
             )
         )
@@ -80,6 +90,7 @@ def test_efficient_zero_learner_train_step_updates_params(learner_context: Compo
     learner = build_efficient_zero_learner(learner_context)
     buffer = EfficientZeroReplayBuffer(
         capacity=100,
+        config=learner_context.config,
         unroll_steps=learner_context.config.unroll_steps,
         trajectory_size=learner_context.config.trajectory_size,
     )

@@ -18,10 +18,10 @@ from mctx._src import search as mctx_search
 from mctx._src.action_selection import switching_action_selection_wrapper
 from mctx._src.base import InteriorActionSelectionFn
 
-from algorl.backends.jax.nn.efficient_zero.model import EfficientZero as EfficientZeroNetwork
-from algorl.backends.jax.nn.efficient_zero.model import Params
+from algorl.backends.jax.nn.efficientzero.model import EfficientZero as EfficientZeroNetwork
+from algorl.backends.jax.nn.efficientzero.model import Params
 from algorl.backends.jax.planners.mcts.core import RecurrentFn
-from algorl.backends.jax.world_models.efficient_zero import EfficientZeroLatentState
+from algorl.backends.jax.world_models.efficientzero import EfficientZeroLatentState
 
 Array: TypeAlias = jax.Array
 NodeIndex: TypeAlias = Array

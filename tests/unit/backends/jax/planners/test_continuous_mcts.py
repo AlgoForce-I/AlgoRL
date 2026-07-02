@@ -33,7 +33,7 @@ from algorl.backends.jax.planners.mcts.continuous import (
     run_continuous_search,
     sample_actions,
 )
-from algorl.backends.jax.world_models.efficient_zero import (
+from algorl.backends.jax.world_models.efficientzero import (
     EfficientZeroLatentState,
     build_efficient_zero_world_model,
 )

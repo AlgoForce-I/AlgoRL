@@ -52,7 +52,7 @@ def _build_alphazero_planner(context: ComponentContext) -> Planner:
 
 
 def _build_efficient_zero_planner(context: ComponentContext) -> Planner:
-    from algorl.backends.jax.planners.mcts.efficientzero import build_efficient_zero_planner
+    from algorl.backends.jax.planners.efficientzero import build_efficient_zero_planner
 
     return build_efficient_zero_planner(context)
 

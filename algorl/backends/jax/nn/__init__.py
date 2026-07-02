@@ -3,7 +3,7 @@
 Each algorithm family lives in its own subpackage under ``nn/``.
 """
 
-from algorl.backends.jax.nn.efficient_zero import (
+from algorl.backends.jax.nn.efficientzero import (
     EfficientZero,
     build_efficient_zero_model,
     build_efficient_zero_model_from_env,

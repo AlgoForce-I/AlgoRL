@@ -1,6 +1,6 @@
 """EfficientZero Flax networks and model construction."""
 
-from algorl.backends.jax.nn.efficient_zero.build import (
+from algorl.backends.jax.nn.efficientzero.build import (
     build_efficient_zero_model,
     build_efficient_zero_model_from_env,
     infer_model_type,
@@ -8,7 +8,7 @@ from algorl.backends.jax.nn.efficient_zero.build import (
     init_efficient_zero_params_from_env,
     init_efficient_zero_params_from_model,
 )
-from algorl.backends.jax.nn.efficient_zero.model import EfficientZero
+from algorl.backends.jax.nn.efficientzero.model import EfficientZero
 
 __all__ = [
     "EfficientZero",

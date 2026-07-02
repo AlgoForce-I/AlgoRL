@@ -22,11 +22,10 @@ def main() -> None:
     cw_config = CWConfig(seed=42, steps_per_task=1_000_000)
     env = make_cl_train_env("CW10", config=cw_config)
 
-    ez_config = EfficientZeroConfig(
-        backend="jax",
+    ez_config = EfficientZeroConfig.for_dmc_state(
         seed=0,
         buffer_capacity=10_000,
-        learning_starts=1_000
+        learning_starts=1_000,
     )
 
     agent = arl.EfficientZero(env, config=ez_config)

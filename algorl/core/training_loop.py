@@ -245,6 +245,13 @@ class TrainingLoop:
             np.asarray(last_result.action_weights[0], dtype=np.float32),
         )
         enriched.setdefault("search_value", float(last_result.root_values[0]))
+        if last_result.pred_values is not None:
+            enriched.setdefault("pred_value", float(last_result.pred_values[0]))
+        enriched.setdefault(
+            "root_candidates",
+            np.asarray(last_result.root_candidates[0], dtype=np.float32),
+        )
+        enriched.setdefault("best_action", np.asarray(last_result.actions[0], dtype=np.float32))
         return enriched
 
     def _should_train(self, step: int) -> bool:

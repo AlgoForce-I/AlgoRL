@@ -10,7 +10,7 @@ import pytest
 from algorl.agents._compose import compose_agent
 from algorl.agents.configs import EfficientZeroConfig
 from algorl.backends.jax.factory import JAXComponentFactory
-from algorl.backends.jax.world_models.efficient_zero import (
+from algorl.backends.jax.world_models.efficientzero import (
     EfficientZeroLatentState,
     EfficientZeroWorldModel,
     build_efficient_zero_world_model,

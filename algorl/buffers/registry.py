@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from algorl.buffers.efficient_zero import EfficientZeroReplayBuffer
+from algorl.buffers.efficientzero import EfficientZeroReplayBuffer
 from algorl.buffers.episode import EpisodeReplayBuffer
 from algorl.buffers.replay import UniformReplayBuffer
 from algorl.buffers.search import SearchReplayBuffer
@@ -28,6 +28,7 @@ def _build_efficient_zero(context: ComponentContext) -> ReplayBuffer:
     trajectory_size = int(getattr(context.config, "trajectory_size", 100))
     return EfficientZeroReplayBuffer(
         capacity=context.config.buffer_capacity,
+        config=context.config,
         unroll_steps=context.config.unroll_steps,
         trajectory_size=trajectory_size,
     )

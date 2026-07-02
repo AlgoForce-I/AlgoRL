@@ -1,7 +1,7 @@
 """JAX learner registry.
 
 Implement concrete learners in this package, e.g.:
-- ``efficient_zero.py`` for EfficientZero losses and parameter updates
+- ``efficientzero/`` for EfficientZero losses and parameter updates
 - ``muzero.py`` for MuZero losses
 - ``alphazero.py`` for AlphaZero policy/value losses
 - ``dreamer.py`` for DreamerV3 losses
@@ -13,7 +13,7 @@ Register implementations with ``@registry.register("kind")`` instead of ``if`` c
 
 from __future__ import annotations
 
-from algorl.backends.jax.learners.efficient_zero import (
+from algorl.backends.jax.learners.efficientzero import (
     EfficientZeroLearner,
     build_efficient_zero_learner,
 )

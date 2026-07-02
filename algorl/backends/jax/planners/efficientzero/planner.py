@@ -9,7 +9,7 @@ import jax
 import jax.numpy as jnp
 
 from algorl.agents.configs import EfficientZeroConfig
-from algorl.backends.jax.nn.efficient_zero.model import Params
+from algorl.backends.jax.nn.efficientzero.model import Params
 from algorl.backends.jax.planners.mcts.continuous import (
     ContinuousSearchConfig,
     ContinuousSearchResult,
@@ -25,7 +25,7 @@ from algorl.backends.jax.planners.mcts.core import (
     normalize_observation_batch,
     validate_search_batch_size,
 )
-from algorl.backends.jax.world_models.efficient_zero import EfficientZeroWorldModel
+from algorl.backends.jax.world_models.efficientzero import EfficientZeroWorldModel
 from algorl.core.component_context import ComponentContext
 from algorl.core.planner import BatchedPlanner
 from algorl.core.types import Action, Observation
@@ -55,6 +55,7 @@ class EfficientZeroBatchedResult:
     root_values: jnp.ndarray
     search_tree: Any
     root_candidates: jnp.ndarray
+    pred_values: jnp.ndarray | None = None
 
     @property
     def batch_size(self) -> int:
@@ -130,7 +131,7 @@ def continuous_search_config_from_agent(
         num_top_actions=num_actions,
         gumbel_scale=0.0,
         use_gumbel_noise=False,
-        lstm_horizon_len=config.unroll_steps,
+        lstm_horizon_len=config.lstm_horizon_len,
     )
 
 
@@ -221,6 +222,7 @@ class EfficientZeroPlanner(BatchedPlanner):
             rng=build_key,
             add_noise=add_noise,
         )
+        pred_values = jnp.asarray(root.value, dtype=jnp.float32)
 
         if self._use_jit and self._jitted_search is not None:
             result = self._jitted_search(
@@ -242,6 +244,16 @@ class EfficientZeroPlanner(BatchedPlanner):
             )
 
         batched = EfficientZeroBatchedResult.from_continuous_result(result)
+        if pred_values is not None:
+            batched = EfficientZeroBatchedResult(
+                actions=batched.actions,
+                action_indices=batched.action_indices,
+                action_weights=batched.action_weights,
+                root_values=batched.root_values,
+                search_tree=batched.search_tree,
+                root_candidates=batched.root_candidates,
+                pred_values=pred_values,
+            )
         self.last_result = batched
         return batched
 

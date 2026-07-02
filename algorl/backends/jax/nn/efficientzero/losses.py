@@ -6,7 +6,7 @@ import jax
 import jax.numpy as jnp
 
 from algorl.agents.configs import EfficientZeroConfig
-from algorl.backends.jax.nn.efficient_zero.model import _symexp, _vector_to_scalar
+from algorl.backends.jax.nn.efficientzero.model import _symexp, _vector_to_scalar
 
 _SUPPORT_EPSILON = 0.001
 
@@ -142,15 +142,31 @@ def continuous_policy_loss(
     policy: jnp.ndarray,
     best_action: jnp.ndarray,
     *,
+    candidates: jnp.ndarray | None = None,
+    target_policy: jnp.ndarray | None = None,
     entropy_rng: jax.Array | None = None,
     entropy_samples: int = 64,
 ) -> tuple[jnp.ndarray, jnp.ndarray]:
-    """Simple squashed-Gaussian policy loss (Eq. 7) using the executed action."""
+    """Squashed-Gaussian policy loss (Eq. 6 full pi or Eq. 7 simple pi)."""
     action_dim = policy.shape[-1] // 2
     mean = policy[..., :action_dim]
     std = policy[..., action_dim:]
     clipped_best = jnp.clip(best_action, -0.999, 0.999)
-    policy_loss = -squashed_normal_log_prob(mean, std, clipped_best)
+
+    if (
+        candidates is not None
+        and target_policy is not None
+        and candidates.shape[-2] > 0
+        and action_dim == 1
+    ):
+        log_probs = squashed_normal_log_prob(
+            mean[..., None, :],
+            std[..., None, :],
+            jnp.clip(candidates, -0.999, 0.999),
+        )
+        policy_loss = -jnp.sum(target_policy * log_probs, axis=-1)
+    else:
+        policy_loss = -squashed_normal_log_prob(mean, std, clipped_best)
 
     if entropy_rng is None:
         return policy_loss, jnp.zeros_like(policy_loss)

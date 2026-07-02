@@ -9,13 +9,13 @@ import jax
 import jax.numpy as jnp
 
 from algorl.agents.configs import EfficientZeroConfig
-from algorl.backends.jax.nn.efficient_zero.build import (
+from algorl.backends.jax.nn.efficientzero.build import (
     build_efficient_zero_model_from_env,
     infer_model_type,
     init_efficient_zero_params_from_env,
 )
-from algorl.backends.jax.nn.efficient_zero.model import EfficientZero as EfficientZeroNetwork
-from algorl.backends.jax.nn.efficient_zero.model import Params
+from algorl.backends.jax.nn.efficientzero.model import EfficientZero as EfficientZeroNetwork
+from algorl.backends.jax.nn.efficientzero.model import Params
 from algorl.core.component_context import ComponentContext
 from algorl.core.types import Action, LatentState, Observation
 from algorl.core.world_model import WorldModel
