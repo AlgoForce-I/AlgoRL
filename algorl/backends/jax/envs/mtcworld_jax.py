@@ -202,6 +202,7 @@ class ContinualLearningJaxEnv(JaxEnv):
             "task_changed": bool(state.info.get("task_changed", False)),
             "forced_task_change": bool(state.info.get("forced_task_change", False)),
             "task_name": self.task_names[seq_idx],
+            "success": _as_float(state.metrics.get("success", 0.0)),
         }
 
     def reset_after_episode(self, key: jnp.ndarray, state: JaxState) -> JaxState:

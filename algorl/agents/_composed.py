@@ -38,6 +38,14 @@ class ComposedAgent(Agent):
         callbacks = kwargs.pop("callbacks", None)
         logger = kwargs.pop("logger", None)
         checkpoint_path = kwargs.pop("checkpoint_path", None)
+        tensorboard = bool(kwargs.pop("tensorboard", False))
+        tensorboard_log_dir = kwargs.pop("tensorboard_log_dir", None)
+
+        if logger is None and (tensorboard or tensorboard_log_dir is not None):
+            log_dir = tensorboard_log_dir or f"runs/{self.composition_name}"
+            from algorl.common.tensorboard_logger import TensorboardLogger
+
+            logger = TensorboardLogger(log_dir)
 
         loop = TrainingLoop(
             env=self.env,

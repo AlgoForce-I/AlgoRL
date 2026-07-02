@@ -40,7 +40,7 @@ def main() -> None:
     print(f"Learner: {type(agent.learner).__name__}")
     print(f"Replay buffer: {type(agent.replay_buffer).__name__}")
 
-    agent.learn(total_timesteps=10_000_000)
+    agent.learn(total_timesteps=10_000_000, tensorboard_log_dir="runs/cw10_ez")
 
 
 if __name__ == "__main__":

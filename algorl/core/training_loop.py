@@ -11,7 +11,9 @@ import numpy as np
 from algorl.agents.configs import BaseAgentConfig
 from algorl.common.callbacks import Callback, CallbackList
 from algorl.common.checkpoints import save_checkpoint
+from algorl.common.episode_metrics import EpisodeMetricsTracker
 from algorl.common.logger import Logger
+from algorl.common.tensorboard_logger import TensorboardLogger
 from algorl.core.learner import Learner
 from algorl.core.planner import Planner
 from algorl.core.replay_buffer import ReplayBuffer
@@ -43,6 +45,7 @@ class TrainingLoop:
             [callbacks] if callbacks is not None else []
         )
         self.logger = logger or Logger()
+        self._episode_tracker = EpisodeMetricsTracker()
         self._key = jax.random.PRNGKey(config.seed)
 
     def run(
@@ -53,10 +56,21 @@ class TrainingLoop:
         extra_step_info: dict[str, Any] | None = None,
     ) -> None:
         """Interact with the environment and call ``learner.train_step`` on schedule."""
-        if self.env.is_batched:
-            self._run_batched(total_timesteps, checkpoint_path=checkpoint_path, extra_step_info=extra_step_info)
-            return
-        self._run_sequential(total_timesteps, checkpoint_path=checkpoint_path, extra_step_info=extra_step_info)
+        try:
+            if self.env.is_batched:
+                self._run_batched(
+                    total_timesteps,
+                    checkpoint_path=checkpoint_path,
+                    extra_step_info=extra_step_info,
+                )
+                return
+            self._run_sequential(
+                total_timesteps,
+                checkpoint_path=checkpoint_path,
+                extra_step_info=extra_step_info,
+            )
+        finally:
+            self._close_logger()
 
     def _run_sequential(
         self,
@@ -65,7 +79,8 @@ class TrainingLoop:
         checkpoint_path: str | None,
         extra_step_info: dict[str, Any] | None,
     ) -> None:
-        observation, _ = self.env.reset(seed=self.config.seed)
+        observation, reset_info = self.env.reset(seed=self.config.seed)
+        self._episode_tracker.begin_episode(reset_info)
         metrics: dict[str, Any] = {}
 
         for step in range(total_timesteps):
@@ -84,8 +99,13 @@ class TrainingLoop:
                 )
             )
 
+            episode_event = self._episode_tracker.observe_step(float(reward), done, dict(info))
+            if episode_event is not None:
+                metrics = self._record_episode(step, episode_event, metrics)
+
             if done:
-                observation, _ = self.env.reset()
+                observation, reset_info = self.env.reset()
+                self._episode_tracker.begin_episode(reset_info)
             else:
                 observation = next_observation
 
@@ -113,6 +133,14 @@ class TrainingLoop:
             for transition in transitions:
                 self.replay_buffer.add(transition)
                 steps_collected += 1
+                episode_event = self._episode_tracker.observe_step(
+                    float(transition.reward),
+                    bool(transition.done),
+                    dict(transition.info),
+                )
+                if episode_event is not None:
+                    metrics = self._record_episode(step_counter, episode_event, metrics)
+                    self._episode_tracker.begin_episode(dict(transition.info))
                 metrics = self._maybe_train(step_counter, metrics)
                 self._log_step(
                     step_counter,
@@ -137,6 +165,27 @@ class TrainingLoop:
 
         return policy
 
+    def _record_episode(
+        self,
+        step: int,
+        event: object,
+        metrics: dict[str, Any],
+    ) -> dict[str, Any]:
+        from algorl.common.episode_metrics import EpisodeEndEvent
+
+        if not isinstance(event, EpisodeEndEvent):
+            return metrics
+        if isinstance(self.logger, TensorboardLogger):
+            episode_metrics = self.logger.record_episode(step, event)
+        else:
+            episode_metrics = self._episode_tracker.metrics_from_event(event)
+        return {**metrics, **episode_metrics}
+
+    def _close_logger(self) -> None:
+        close = getattr(self.logger, "close", None)
+        if callable(close):
+            close()
+
     def _maybe_train(self, step: int, metrics: dict[str, Any]) -> dict[str, Any]:
         if self._should_train(step):
             return self.learner.train_step(self.replay_buffer)
@@ -151,7 +200,12 @@ class TrainingLoop:
         metrics: dict[str, Any],
         extra_step_info: dict[str, Any] | None,
     ) -> None:
-        step_info = {"reward": float(reward), "done": done, **metrics}
+        prefixed_metrics = {
+            (key if str(key).startswith("train/") else f"train/{key}"): value
+            for key, value in metrics.items()
+            if isinstance(value, (int, float)) and not isinstance(value, bool)
+        }
+        step_info = {"train/reward": float(reward), "done": done, **prefixed_metrics}
         if extra_step_info:
             step_info.update(extra_step_info)
         self.logger.record(step, step_info)
