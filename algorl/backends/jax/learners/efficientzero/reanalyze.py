@@ -1,12 +1,31 @@
-"""Batch MCTS reanalyze for EfficientZero training."""
+"""Batch MCTS reanalyze for EfficientZero training.
+
+Reanalyze runs as eager Python orchestration around :meth:`EfficientZeroPlanner.search_batch`.
+Planner outputs may be JAX arrays, but padding/merging here uses NumPy on the host.
+The learner converts the returned arrays to ``jnp.ndarray`` immediately before the
+JIT-compiled update.
+"""
 
 from __future__ import annotations
 
 import numpy as np
 
-import jax.numpy as jnp
-
 from algorl.backends.jax.planners.efficientzero import EfficientZeroPlanner
+
+
+def _as_host_array(value: object, *, dtype: np.dtype = np.float32) -> np.ndarray:
+    """Materialize planner outputs to a host NumPy array."""
+    return np.asarray(value, dtype=dtype)
+
+
+def _as_candidate_matrix(candidates: object) -> np.ndarray:
+    """Normalize root candidate actions to ``[num_candidates, action_dim]``."""
+    root_candidates = _as_host_array(candidates)
+    if root_candidates.ndim == 1:
+        return root_candidates.reshape(-1, 1)
+    if root_candidates.ndim == 2:
+        return root_candidates
+    return root_candidates.reshape(root_candidates.shape[0], -1)
 
 
 def reanalyze_training_batch(
@@ -37,12 +56,12 @@ def reanalyze_training_batch(
         step_best: list[np.ndarray] = []
 
         for step_index in range(window):
-            obs = np.asarray(observations[batch_index, step_index], dtype=np.float32)
+            obs = _as_host_array(observations[batch_index, step_index])
             result = planner.search_batch(obs, deterministic=True)
             single = result.to_single(0)
-            weights = np.asarray(single.action_weights, dtype=np.float32).reshape(-1)
-            candidates = np.asarray(single.root_candidates, dtype=np.float32).reshape(-1, -1)
-            best = np.asarray(single.action, dtype=np.float32).reshape(-1)
+            weights = _as_host_array(single.action_weights).reshape(-1)
+            candidates = _as_candidate_matrix(single.root_candidates)
+            best = _as_host_array(single.action).reshape(-1)
 
             step_policies.append(weights)
             step_values.append(float(single.root_value))

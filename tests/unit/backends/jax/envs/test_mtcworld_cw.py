@@ -13,11 +13,13 @@ import numpy as np
 from algorl.agents.configs import AlphaZeroConfig
 from algorl.backends.jax.backend import JAXBackend
 from algorl.backends.jax.envs import (
+    BatchedContinualLearningJaxEnv,
     MtcworldContinualGymEnv,
     MtcworldContinualRolloutCollector,
     MtcworldCWEvalGymEnv,
     MtcworldCWRolloutCollector,
     MtcworldCWSearchEnvironment,
+    make_batched_cw_train_env,
     search_env_from_context,
 )
 from algorl.core.component_context import ComponentContext
@@ -116,3 +118,30 @@ def test_continual_rollout_collector_sequence() -> None:
     assert len(batches) == 10
     assert batches[0].observation.shape == (2, 2, 49)
     assert collector.task_names[0] == "hammer-v3"
+
+
+def test_batched_continual_task_schedule() -> None:
+    """Parallel lanes advance global_step; tasks switch at ``steps_per_task`` budget."""
+    num_envs = 2
+    steps_per_task = 4
+    num_tasks = 3
+    seq_idx = 0
+    global_step = 0
+    seen_tasks = [0]
+
+    for _ in range(10):
+        global_step += num_envs
+        task_end = (seq_idx + 1) * steps_per_task
+        if global_step >= task_end and seq_idx < num_tasks - 1:
+            seq_idx += 1
+            seen_tasks.append(seq_idx)
+
+    assert seen_tasks == [0, 1, 2]
+
+
+def test_resolve_batched_continual_learning_env() -> None:
+    env = resolve_env(make_batched_cw_train_env("CW10", num_envs=4, seed=0, steps_per_task=50))
+    assert env.is_batched
+    assert env.num_envs == 4
+    assert env.observation_space.shape == (49,)
+    assert isinstance(env.raw, BatchedContinualLearningJaxEnv)

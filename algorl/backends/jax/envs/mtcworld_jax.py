@@ -213,6 +213,252 @@ class ContinualLearningJaxEnv(JaxEnv):
         return next_state
 
 
+        return next_state
+
+
+def _build_cw_vector_jax_env(
+    benchmark: str,
+    task_index: int,
+    *,
+    num_envs: int,
+    seed: int,
+    config: Any | None,
+    bench: Any | None = None,
+) -> VectorJaxEnv:
+    """Vectorized JAX env for one Continual World task with task one-hot observations."""
+    from MTCWorldMJX.cw_benchmarks import CWBenchmark, cw_sawyer_config
+    from MTCWorldMJX.mt_benchmarks import VectorEnv, rand_vecs_for_env
+
+    resolved_bench = bench or CWBenchmark(benchmark, config=config, seed=seed)
+    env_name = resolved_bench.task_names[task_index]
+    sawyer_config = cw_sawyer_config(resolved_bench.config)
+    vector_env = VectorEnv(
+        env_name,
+        rand_vecs_for_env(resolved_bench.tasks, env_name),
+        num_envs,
+        config=sawyer_config,
+        partially_observable=resolved_bench.config.partially_observable,
+        task_select="random",
+        seed=seed,
+    )
+    adapter = as_mtcworld_jax_env_from_spec(
+        benchmark=benchmark,
+        task_index=task_index,
+        vector_env=vector_env,
+        seed=seed,
+        config=config,
+    )
+    if not isinstance(adapter, VectorJaxEnv):
+        raise TypeError(f"Expected VectorJaxEnv, got {type(adapter)!r}.")
+    return adapter
+
+
+class BatchedContinualLearningJaxEnv:
+    """Parallel rollouts within each CW task; tasks advance sequentially."""
+
+    def __init__(
+        self,
+        benchmark: str,
+        *,
+        num_envs: int,
+        seed: int,
+        config: Any | None = None,
+        steps_per_task: int,
+        bench: Any | None = None,
+    ) -> None:
+        if num_envs < 1:
+            raise ValueError("num_envs must be >= 1")
+        if steps_per_task < 1:
+            raise ValueError("steps_per_task must be >= 1")
+
+        from MTCWorldMJX.cw_benchmarks import CWBenchmark
+
+        self._bench = bench or CWBenchmark(benchmark, config=config, seed=seed)
+        self.benchmark_name = benchmark
+        self.num_envs = num_envs
+        self.seed = seed
+        self.config = config
+        self.steps_per_task = steps_per_task
+        self.num_tasks = self._bench.num_tasks
+        self.task_names = tuple(self._bench.task_names)
+        self.steps_limit = self.num_tasks * steps_per_task
+        mtc = require_mtcworld()
+        self._obs_dim = mtc.cw_obs_dim(self.num_tasks)
+
+        self._seq_idx = 0
+        self._global_step = 0
+        self._vector_env = self._make_task_vector_env(0)
+        self._state: JaxState | None = None
+
+    def _make_task_vector_env(self, task_index: int) -> VectorJaxEnv:
+        return _build_cw_vector_jax_env(
+            self.benchmark_name,
+            task_index,
+            num_envs=self.num_envs,
+            seed=self.seed + task_index,
+            config=self.config,
+            bench=self._bench,
+        )
+
+    @property
+    def observation_shape(self) -> tuple[int, ...]:
+        return (self._obs_dim,)
+
+    @property
+    def action_shape(self) -> tuple[int, ...]:
+        return self._vector_env.action_shape
+
+    @property
+    def current_task_index(self) -> int:
+        return self._seq_idx
+
+    @property
+    def current_task_name(self) -> str:
+        return self.task_names[self._seq_idx]
+
+    def reset(self, key: jnp.ndarray) -> JaxState:
+        self._seq_idx = 0
+        self._global_step = 0
+        self._vector_env = self._make_task_vector_env(0)
+        self._state = self._vector_env.reset(key)
+        return self._state
+
+    def observation(self, state: JaxState) -> jnp.ndarray:
+        return self._vector_env.observation(state)
+
+    def step(self, state: JaxState, actions: jnp.ndarray) -> JaxState:
+        return self._vector_env.step(state, actions)
+
+    def _advance_task(self, key: jnp.ndarray) -> JaxState:
+        self._seq_idx += 1
+        self._vector_env = self._make_task_vector_env(self._seq_idx)
+        key, reset_key = jax.random.split(key)
+        return self._vector_env.reset(reset_key)
+
+    def _lane_info(
+        self,
+        state: JaxState,
+        env_idx: int,
+        *,
+        task_changed: bool,
+        forced_task_change: bool,
+    ) -> dict[str, Any]:
+        success = state.metrics.get("success", jnp.zeros((self.num_envs,)))
+        return {
+            "seq_idx": self._seq_idx,
+            "global_step": self._global_step,
+            "task_name": self.task_names[self._seq_idx],
+            "task_changed": task_changed,
+            "forced_task_change": forced_task_change,
+            "success": _as_float(success[env_idx]),
+        }
+
+    def collect_rollout(
+        self,
+        policy: PolicyFn,
+        num_steps: int,
+        *,
+        key: jnp.ndarray,
+    ) -> JaxRolloutBatch:
+        if num_steps < 1:
+            raise ValueError("num_steps must be >= 1")
+        if self._state is None:
+            key, reset_key = jax.random.split(key)
+            self.reset(reset_key)
+
+        _, rollout_key = jax.random.split(key)
+        step_keys = jax.random.split(rollout_key, num_steps)
+        state = self._state
+        assert state is not None
+
+        observations: list[np.ndarray] = []
+        actions: list[np.ndarray] = []
+        rewards: list[np.ndarray] = []
+        next_observations: list[np.ndarray] = []
+        dones: list[np.ndarray] = []
+        step_infos: list[list[dict[str, Any]]] = []
+
+        for step_idx in range(num_steps):
+            obs = np.asarray(self.observation(state), dtype=np.float32)
+            action = np.asarray(policy(obs, step_keys[step_idx]), dtype=np.float32)
+            next_state = self.step(state, jnp.asarray(action, dtype=jnp.float32))
+            next_obs = np.asarray(self.observation(next_state), dtype=np.float32)
+            episode_done = np.asarray(
+                (next_state.truncated + next_state.terminated) > 0,
+                dtype=bool,
+            )
+
+            self._global_step += self.num_envs
+            task_end = (self._seq_idx + 1) * self.steps_per_task
+            forced_task_change = self._global_step >= task_end
+            task_changed = forced_task_change and self._seq_idx < self.num_tasks - 1
+
+            if task_changed:
+                step_keys[step_idx], advance_key = jax.random.split(step_keys[step_idx])
+                next_state = self._advance_task(advance_key)
+                next_obs = np.asarray(self.observation(next_state), dtype=np.float32)
+                done = np.ones((self.num_envs,), dtype=bool)
+            else:
+                done = episode_done
+                if forced_task_change and self._seq_idx >= self.num_tasks - 1:
+                    done = np.ones((self.num_envs,), dtype=bool)
+
+            step_infos.append(
+                [
+                    self._lane_info(
+                        next_state,
+                        env_idx,
+                        task_changed=task_changed,
+                        forced_task_change=forced_task_change,
+                    )
+                    for env_idx in range(self.num_envs)
+                ]
+            )
+            observations.append(obs)
+            actions.append(action)
+            rewards.append(np.asarray(next_state.reward, dtype=np.float32))
+            next_observations.append(next_obs)
+            dones.append(done)
+            state = next_state
+
+        self._state = state
+        return JaxRolloutBatch(
+            observation=np.stack(observations, axis=0),
+            action=np.stack(actions, axis=0),
+            reward=np.stack(rewards, axis=0),
+            next_observation=np.stack(next_observations, axis=0),
+            done=np.stack(dones, axis=0),
+            step_info=step_infos,
+        )
+
+
+def make_batched_cw_train_env(
+    benchmark: str,
+    *,
+    num_envs: int = 8,
+    seed: int = 0,
+    config: Any | None = None,
+    steps_per_task: int | None = None,
+) -> BatchedContinualLearningJaxEnv:
+    """Batched CW training: ``num_envs`` parallel actors per task, tasks in sequence."""
+    from MTCWorldMJX.cw_benchmarks import CWBenchmark
+
+    bench = CWBenchmark(benchmark, config=config, seed=seed)
+    resolved_steps = steps_per_task
+    if resolved_steps is None and config is not None:
+        resolved_steps = getattr(config, "steps_per_task", None)
+    if resolved_steps is None:
+        resolved_steps = bench.config.steps_per_task
+    return BatchedContinualLearningJaxEnv(
+        benchmark,
+        num_envs=num_envs,
+        seed=seed,
+        config=config,
+        steps_per_task=int(resolved_steps),
+        bench=bench,
+    )
+
+
 class VectorJaxEnv(BatchedJaxEnv):
     """Adapter for ``MTCWorldMJX.mt_benchmarks.VectorEnv``."""
 
@@ -281,32 +527,39 @@ class VectorJaxEnv(BatchedJaxEnv):
 
         reset_key, rollout_key = jax.random.split(key)
         state = self.reset(reset_key)
-
-        def body(carry: JaxState, step_key: jnp.ndarray) -> tuple[JaxState, dict[str, jnp.ndarray]]:
-            current_state = carry
-            obs = self.observation(current_state)
-            actions = policy(obs, step_key)
-            next_state = self.step(current_state, actions)
-            next_obs = self.observation(next_state)
-            done = (next_state.truncated + next_state.terminated) > 0
-            return next_state, {
-                "observation": obs,
-                "action": actions,
-                "reward": next_state.reward,
-                "next_observation": next_obs,
-                "done": done,
-            }
-
         step_keys = jax.random.split(rollout_key, num_steps)
-        final_state, trajectory = jax.lax.scan(body, state, step_keys)
-        del final_state
+
+        # Eager loop: policies may call MCTS / planner code with NumPy and Python
+        # side effects, which cannot run inside ``jax.lax.scan``.
+        observations: list[np.ndarray] = []
+        actions: list[np.ndarray] = []
+        rewards: list[np.ndarray] = []
+        next_observations: list[np.ndarray] = []
+        dones: list[np.ndarray] = []
+
+        for step_idx in range(num_steps):
+            obs = np.asarray(self.observation(state), dtype=np.float32)
+            action = np.asarray(policy(obs, step_keys[step_idx]), dtype=np.float32)
+            next_state = self.step(state, jnp.asarray(action, dtype=jnp.float32))
+            next_obs = np.asarray(self.observation(next_state), dtype=np.float32)
+            done = np.asarray(
+                (next_state.truncated + next_state.terminated) > 0,
+                dtype=bool,
+            )
+
+            observations.append(obs)
+            actions.append(action)
+            rewards.append(np.asarray(next_state.reward, dtype=np.float32))
+            next_observations.append(next_obs)
+            dones.append(done)
+            state = next_state
 
         return JaxRolloutBatch(
-            observation=np.asarray(trajectory["observation"], dtype=np.float32),
-            action=np.asarray(trajectory["action"], dtype=np.float32),
-            reward=np.asarray(trajectory["reward"], dtype=np.float32),
-            next_observation=np.asarray(trajectory["next_observation"], dtype=np.float32),
-            done=np.asarray(trajectory["done"], dtype=bool),
+            observation=np.stack(observations, axis=0),
+            action=np.stack(actions, axis=0),
+            reward=np.stack(rewards, axis=0),
+            next_observation=np.stack(next_observations, axis=0),
+            done=np.stack(dones, axis=0),
         )
 
 
@@ -406,6 +659,11 @@ class MtcworldRolloutCollector:
         self._adapter = adapter
 
     @property
+    def jax_env(self) -> VectorJaxEnv:
+        """Batched JAX adapter for :class:`~algorl.envs.training_env.TrainingEnv.from_jax`."""
+        return self._adapter
+
+    @property
     def vector_env(self) -> Any:
         return self._adapter.vector_env
 
@@ -432,33 +690,16 @@ class MtcworldCWRolloutCollector(MtcworldRolloutCollector):
         seed: int = 0,
         config: Any | None = None,
     ) -> None:
-        from MTCWorldMJX.cw_benchmarks import CWBenchmark, cw_sawyer_config
-        from MTCWorldMJX.mt_benchmarks import VectorEnv, rand_vecs_for_env
-
-        bench = CWBenchmark(benchmark, config=config, seed=seed)
-        env_name = bench.task_names[task_index]
-        sawyer_config = cw_sawyer_config(bench.config)
-        vector_env = VectorEnv(
-            env_name,
-            rand_vecs_for_env(bench.tasks, env_name),
-            num_envs,
-            config=sawyer_config,
-            partially_observable=bench.config.partially_observable,
-            task_select="random",
-            seed=seed,
-        )
-        adapter = as_mtcworld_jax_env_from_spec(
-            benchmark=benchmark,
-            task_index=task_index,
-            vector_env=vector_env,
+        adapter = _build_cw_vector_jax_env(
+            benchmark,
+            task_index,
+            num_envs=num_envs,
             seed=seed,
             config=config,
         )
-        if not isinstance(adapter, VectorJaxEnv):
-            raise TypeError(f"Expected VectorJaxEnv, got {type(adapter)!r}.")
         self.benchmark_name = benchmark
         self.task_index = task_index
-        self.env_id = env_name
+        self.env_id = adapter.vector_env.env_name
         self.num_envs = adapter.num_envs
         self.seed = seed
         self._adapter = adapter

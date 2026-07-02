@@ -8,6 +8,7 @@ from algorl.backends.jax.envs.mtcworld import (
     MtcworldGymEnv,
 )
 from algorl.backends.jax.envs.mtcworld_jax import (
+    BatchedContinualLearningJaxEnv,
     ContinualLearningJaxEnv,
     CWTaskJaxEnv,
     MtcworldContinualRolloutCollector,
@@ -18,6 +19,7 @@ from algorl.backends.jax.envs.mtcworld_jax import (
     VectorJaxEnv,
     as_mtcworld_jax_env,
     as_mtcworld_jax_env_from_spec,
+    make_batched_cw_train_env,
     require_mtcworld,
 )
 from algorl.backends.jax.envs.mtcworld_search import (
@@ -30,6 +32,7 @@ from algorl.envs.jax_env import PolicyFn
 
 __all__ = [
     "CW_BENCHMARK_NAMES",
+    "BatchedContinualLearningJaxEnv",
     "ContinualLearningJaxEnv",
     "CWTaskJaxEnv",
     "GymnasiumSearchEnv",
@@ -52,6 +55,7 @@ __all__ = [
     "VectorJaxEnv",
     "as_mtcworld_jax_env",
     "as_mtcworld_jax_env_from_spec",
+    "make_batched_cw_train_env",
     "require_mtcworld",
     "search_env_from_context",
 ]

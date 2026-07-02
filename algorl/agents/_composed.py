@@ -40,12 +40,22 @@ class ComposedAgent(Agent):
         checkpoint_path = kwargs.pop("checkpoint_path", None)
         tensorboard = bool(kwargs.pop("tensorboard", False))
         tensorboard_log_dir = kwargs.pop("tensorboard_log_dir", None)
+        progress_bar = kwargs.pop("progress_bar", None)
+        progress_bar_kwargs = kwargs.pop("progress_bar_kwargs", None)
 
         if logger is None and (tensorboard or tensorboard_log_dir is not None):
             log_dir = tensorboard_log_dir or f"runs/{self.composition_name}"
             from algorl.common.tensorboard_logger import TensorboardLogger
 
             logger = TensorboardLogger(log_dir)
+
+        if progress_bar is True:
+            from algorl.common.progress_bar import TqdmProgressBar
+
+            bar_kwargs = progress_bar_kwargs or {}
+            progress_bar = TqdmProgressBar(**bar_kwargs)
+        elif progress_bar is False:
+            progress_bar = None
 
         loop = TrainingLoop(
             env=self.env,
@@ -60,6 +70,7 @@ class ComposedAgent(Agent):
             total_timesteps,
             checkpoint_path=checkpoint_path,
             extra_step_info=kwargs or None,
+            progress_bar=progress_bar,
         )
 
     def predict(

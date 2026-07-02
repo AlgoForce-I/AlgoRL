@@ -13,12 +13,13 @@ from algorl.common.callbacks import Callback, CallbackList
 from algorl.common.checkpoints import save_checkpoint
 from algorl.common.episode_metrics import EpisodeMetricsTracker
 from algorl.common.logger import Logger
+from algorl.common.progress_bar import TqdmProgressBar
 from algorl.common.tensorboard_logger import TensorboardLogger
 from algorl.core.learner import Learner
-from algorl.core.planner import BatchedPlanner
+from algorl.core.planner import BatchedPlanner, Planner
 from algorl.core.replay_buffer import ReplayBuffer
 from algorl.core.types import Action, Observation, Transition
-from algorl.envs.jax_env import PolicyFn
+from algorl.envs.jax_env import JaxRolloutBatch, PolicyFn
 from algorl.envs.training_env import TrainingEnv
 
 
@@ -54,22 +55,29 @@ class TrainingLoop:
         *,
         checkpoint_path: str | None = None,
         extra_step_info: dict[str, Any] | None = None,
+        progress_bar: TqdmProgressBar | None = None,
     ) -> None:
         """Interact with the environment and call ``learner.train_step`` on schedule."""
+        if progress_bar is not None:
+            progress_bar.start(total_timesteps)
         try:
             if self.env.is_batched:
                 self._run_batched(
                     total_timesteps,
                     checkpoint_path=checkpoint_path,
                     extra_step_info=extra_step_info,
+                    progress_bar=progress_bar,
                 )
                 return
             self._run_sequential(
                 total_timesteps,
                 checkpoint_path=checkpoint_path,
                 extra_step_info=extra_step_info,
+                progress_bar=progress_bar,
             )
         finally:
+            if progress_bar is not None:
+                progress_bar.close()
             self._close_logger()
 
     def _run_sequential(
@@ -78,6 +86,7 @@ class TrainingLoop:
         *,
         checkpoint_path: str | None,
         extra_step_info: dict[str, Any] | None,
+        progress_bar: TqdmProgressBar | None,
     ) -> None:
         observation, reset_info = self.env.reset(seed=self.config.seed)
         self._episode_tracker.begin_episode(reset_info)
@@ -110,8 +119,16 @@ class TrainingLoop:
                 observation = next_observation
 
             metrics = self._maybe_train(step, metrics)
-            self._log_step(step, reward=reward, done=done, metrics=metrics, extra_step_info=extra_step_info)
+            step_info = self._log_step(
+                step,
+                reward=reward,
+                done=done,
+                metrics=metrics,
+                extra_step_info=extra_step_info,
+            )
             self._maybe_checkpoint(step, metrics, checkpoint_path)
+            if progress_bar is not None:
+                progress_bar.update(step_info)
 
     def _run_batched(
         self,
@@ -119,6 +136,7 @@ class TrainingLoop:
         *,
         checkpoint_path: str | None,
         extra_step_info: dict[str, Any] | None,
+        progress_bar: TqdmProgressBar | None,
     ) -> None:
         chunk_size = max(1, self.config.jax_rollout_chunk)
         metrics: dict[str, Any] = {}
@@ -128,8 +146,13 @@ class TrainingLoop:
         while steps_collected < total_timesteps:
             chunk_steps = min(chunk_size, total_timesteps - steps_collected)
             self._key, rollout_key = jax.random.split(self._key)
-            batch = self.env.collect_rollout(self._batched_policy(), chunk_steps, key=rollout_key)
-            transitions = batch.to_transitions()
+            search_results: list[Any] = []
+            batch = self.env.collect_rollout(
+                self._batched_policy(search_results),
+                chunk_steps,
+                key=rollout_key,
+            )
+            transitions = self._transitions_from_rollout(batch, search_results)
             for transition in transitions:
                 self.replay_buffer.add(transition)
                 steps_collected += 1
@@ -142,7 +165,7 @@ class TrainingLoop:
                     metrics = self._record_episode(step_counter, episode_event, metrics)
                     self._episode_tracker.begin_episode(dict(transition.info))
                 metrics = self._maybe_train(step_counter, metrics)
-                self._log_step(
+                step_info = self._log_step(
                     step_counter,
                     reward=transition.reward,
                     done=transition.done,
@@ -150,22 +173,24 @@ class TrainingLoop:
                     extra_step_info=extra_step_info,
                 )
                 self._maybe_checkpoint(step_counter, metrics, checkpoint_path)
+                if progress_bar is not None:
+                    progress_bar.update(step_info)
                 step_counter += 1
                 if steps_collected >= total_timesteps:
                     break
 
-    def _batched_policy(self) -> PolicyFn:
+    def _batched_policy(self, search_results: list[Any] | None = None) -> PolicyFn:
         planner = self.planner
 
         if isinstance(planner, BatchedPlanner):
-            def policy(observations: jnp.ndarray, key: jnp.ndarray) -> jnp.ndarray:
+            def policy(observations: jnp.ndarray | np.ndarray, key: jnp.ndarray) -> jnp.ndarray:
                 del key
-                obs_batch = [
-                    np.asarray(observations[lane], dtype=np.float32)
-                    for lane in range(observations.shape[0])
-                ]
+                obs_array = np.asarray(observations, dtype=np.float32)
+                obs_batch = [obs_array[lane] for lane in range(obs_array.shape[0])]
                 result = planner.search_batch(obs_batch, deterministic=False)
                 self.planner.last_result = result
+                if search_results is not None:
+                    search_results.append(result)
                 return jnp.asarray(result.actions, dtype=jnp.float32)
 
             return policy
@@ -179,6 +204,30 @@ class TrainingLoop:
             return jnp.asarray(actions, dtype=jnp.float32)
 
         return policy
+
+    def _transitions_from_rollout(
+        self,
+        batch: JaxRolloutBatch,
+        search_results: list[Any],
+    ) -> list[Transition]:
+        transitions: list[Transition] = []
+        for step_idx in range(batch.num_steps):
+            result = search_results[step_idx] if step_idx < len(search_results) else None
+            for env_idx in range(batch.num_envs):
+                info = self._search_info_from_result(result, env_idx)
+                if batch.step_info is not None:
+                    info = {**batch.step_info[step_idx][env_idx], **info}
+                transitions.append(
+                    Transition(
+                        observation=batch.observation[step_idx, env_idx],
+                        action=batch.action[step_idx, env_idx],
+                        reward=float(batch.reward[step_idx, env_idx]),
+                        next_observation=batch.next_observation[step_idx, env_idx],
+                        done=bool(batch.done[step_idx, env_idx]),
+                        info=info,
+                    )
+                )
+        return transitions
 
     def _record_episode(
         self,
@@ -214,7 +263,7 @@ class TrainingLoop:
         done: bool,
         metrics: dict[str, Any],
         extra_step_info: dict[str, Any] | None,
-    ) -> None:
+    ) -> dict[str, Any]:
         prefixed_metrics = {
             (key if str(key).startswith("train/") else f"train/{key}"): value
             for key, value in metrics.items()
@@ -225,6 +274,7 @@ class TrainingLoop:
             step_info.update(extra_step_info)
         self.logger.record(step, step_info)
         self.callbacks.on_step(step, step_info)
+        return step_info
 
     def _maybe_checkpoint(
         self,
@@ -255,19 +305,26 @@ class TrainingLoop:
         if last_result is None:
             return info
         enriched = dict(info)
-        enriched.setdefault(
-            "policy_target",
-            np.asarray(last_result.action_weights[0], dtype=np.float32),
-        )
-        enriched.setdefault("search_value", float(last_result.root_values[0]))
-        if last_result.pred_values is not None:
-            enriched.setdefault("pred_value", float(last_result.pred_values[0]))
-        enriched.setdefault(
-            "root_candidates",
-            np.asarray(last_result.root_candidates[0], dtype=np.float32),
-        )
-        enriched.setdefault("best_action", np.asarray(last_result.actions[0], dtype=np.float32))
+        for key, value in self._search_info_from_result(last_result, 0).items():
+            enriched.setdefault(key, value)
         return enriched
+
+    def _search_info_from_result(self, result: Any, index: int) -> dict[str, object]:
+        if result is None:
+            return {}
+        batch_size = int(getattr(result, "batch_size", 1))
+        if not 0 <= index < batch_size:
+            return {}
+        info: dict[str, object] = {
+            "policy_target": np.asarray(result.action_weights[index], dtype=np.float32),
+            "search_value": float(result.root_values[index]),
+            "root_candidates": np.asarray(result.root_candidates[index], dtype=np.float32),
+            "best_action": np.asarray(result.actions[index], dtype=np.float32),
+        }
+        pred_values = getattr(result, "pred_values", None)
+        if pred_values is not None:
+            info["pred_value"] = float(pred_values[index])
+        return info
 
     def _should_train(self, step: int) -> bool:
         if step < self.config.learning_starts:

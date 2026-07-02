@@ -115,3 +115,13 @@ def test_efficient_zero_learner_train_step_updates_params(learner_context: Compo
         )
     )
     assert changed
+
+
+def test_as_candidate_matrix_normalizes_mcts_shapes() -> None:
+    from algorl.backends.jax.learners.efficientzero.reanalyze import _as_candidate_matrix
+
+    matrix = _as_candidate_matrix(np.zeros((16, 4), dtype=np.float32))
+    assert matrix.shape == (16, 4)
+
+    vector = _as_candidate_matrix(np.zeros(16, dtype=np.float32))
+    assert vector.shape == (16, 1)

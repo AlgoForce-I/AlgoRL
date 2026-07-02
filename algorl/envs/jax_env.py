@@ -23,6 +23,7 @@ class JaxRolloutBatch:
     reward: np.ndarray
     next_observation: np.ndarray
     done: np.ndarray
+    step_info: list[list[dict[str, Any]]] | None = None
 
     @property
     def num_steps(self) -> int:
