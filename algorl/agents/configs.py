@@ -52,6 +52,18 @@ class EfficientZeroConfig(SearchAgentConfig):
 
     reanalyze_ratio: float = 0.5
     unroll_steps: int = 5
+    trajectory_size: int = 100
+    learning_rate: float = 3e-4
+    reward_loss_coeff: float = 1.0
+    value_loss_coeff: float = 0.5
+    policy_loss_coeff: float = 1.0
+    consistency_coeff: float = 2.0
+    entropy_coeff: float = 0.05
+    max_grad_norm: float = 5.0
+    use_IQL: bool = False
+    IQL_weight: float = 0.5
+    value_support_range: tuple[float, float] = (-299.0, 299.0)
+    reward_support_range: tuple[float, float] = (-2.0, 2.0)
     state_norm: bool = False
     value_prefix: bool = False
     v_num: int = 1

@@ -19,7 +19,7 @@ from MTCWorldMJX import CWConfig, make_cl_train_env
 
 
 def main() -> None:
-    config = CWConfig(seed=42, steps_per_task=10000)
+    config = CWConfig(seed=42, steps_per_task=1_000_000)
     env = make_cl_train_env("CW10", config=config)
 
     config = EfficientZeroConfig(
@@ -40,6 +40,8 @@ def main() -> None:
     print(f"Planner: {type(agent.planner).__name__}")
     print(f"Learner: {type(agent.learner).__name__}")
     print(f"Replay buffer: {type(agent.replay_buffer).__name__}")
+
+    agent.learn(total_timesteps=10_000_000)
 
     # Typical usage once implementations are complete:
     #

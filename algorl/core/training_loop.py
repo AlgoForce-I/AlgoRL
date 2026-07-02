@@ -80,7 +80,7 @@ class TrainingLoop:
                     reward=float(reward),
                     next_observation=next_observation,
                     done=done,
-                    info=info,
+                    info=self._enrich_transition_info(dict(info)),
                 )
             )
 
@@ -180,6 +180,18 @@ class TrainingLoop:
 
     def _select_action(self, observation: Observation) -> Action:
         return self.planner.search(observation, deterministic=False)
+
+    def _enrich_transition_info(self, info: dict[str, object]) -> dict[str, object]:
+        last_result = getattr(self.planner, "last_result", None)
+        if last_result is None:
+            return info
+        enriched = dict(info)
+        enriched.setdefault(
+            "policy_target",
+            np.asarray(last_result.action_weights[0], dtype=np.float32),
+        )
+        enriched.setdefault("search_value", float(last_result.root_values[0]))
+        return enriched
 
     def _should_train(self, step: int) -> bool:
         if step < self.config.learning_starts:

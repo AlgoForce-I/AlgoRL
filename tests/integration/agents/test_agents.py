@@ -27,9 +27,10 @@ def test_efficient_zero_construction(cartpole_env: gym.Env) -> None:
     assert agent.action_space == cartpole_env.action_space
 
 
-def test_efficient_zero_rejects_stubs_by_default(cartpole_env: gym.Env) -> None:
-    with pytest.raises(NotImplementedError, match="Stub component"):
-        arl.EfficientZero(cartpole_env)
+def test_efficient_zero_constructs_with_defaults(cartpole_env: gym.Env) -> None:
+    agent = arl.EfficientZero(cartpole_env)
+    assert agent.learner is not None
+    assert agent.replay_buffer is not None
 
 
 def test_agent_rejects_invalid_env() -> None:
