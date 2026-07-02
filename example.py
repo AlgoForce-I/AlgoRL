@@ -11,8 +11,6 @@ Install the package and JAX backend first::
 
 from __future__ import annotations
 
-import gymnasium as gym
-
 import algorl as arl
 from algorl.agents.configs import EfficientZeroConfig
 from MTCWorldMJX import CWConfig, make_cl_train_env
@@ -22,10 +20,11 @@ def main() -> None:
     cw_config = CWConfig(seed=42, steps_per_task=1_000_000)
     env = make_cl_train_env("CW10", config=cw_config)
 
-    ez_config = EfficientZeroConfig.for_dmc_state(
+    ez_config = EfficientZeroConfig.for_dmc_state_throughput(
         seed=0,
         buffer_capacity=10_000,
         learning_starts=1_000,
+        reanalyze_ratio=0.5,
     )
 
     agent = arl.EfficientZero(env, config=ez_config)
@@ -38,6 +37,9 @@ def main() -> None:
     print(f"Planner: {type(agent.planner).__name__}")
     print(f"Learner: {type(agent.learner).__name__}")
     print(f"Replay buffer: {type(agent.replay_buffer).__name__}")
+    print(f"JIT MCTS: {getattr(agent.planner, '_use_jit', False)}")
+    print(f"Learner batch size: {agent.config.batch_size}")
+    print(f"Reanalyze ratio: {agent.config.reanalyze_ratio}")
 
     agent.learn(total_timesteps=10_000_000, tensorboard_log_dir="runs/cw10_ez")
 

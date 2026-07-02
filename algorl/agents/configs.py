@@ -203,6 +203,23 @@ class EfficientZeroConfig(SearchAgentConfig):
         )
         return config.with_overrides(**overrides) if overrides else config
 
+    @classmethod
+    def for_dmc_state_throughput(cls, **overrides: object) -> EfficientZeroConfig:
+        """HyperCEZ ``alt2`` preset tuned for maximum JAX throughput.
+
+        Uses larger learner batches, HyperCEZ simulation count, and disables
+        training-time MCTS reanalyze (implemented as a sequential Python loop
+        outside the JIT-compiled planner/learner path).
+        """
+        config = cls.for_dmc_state(
+            reanalyze_ratio=0.0,
+            batch_size=256,
+            mcts_simulations=32,
+            jax_rollout_chunk=256,
+            search_batch_size=8,
+        )
+        return config.with_overrides(**overrides) if overrides else config
+
 
 @dataclass(frozen=True)
 class MuZeroConfig(SearchAgentConfig):

@@ -15,7 +15,7 @@ from algorl.common.episode_metrics import EpisodeMetricsTracker
 from algorl.common.logger import Logger
 from algorl.common.tensorboard_logger import TensorboardLogger
 from algorl.core.learner import Learner
-from algorl.core.planner import Planner
+from algorl.core.planner import BatchedPlanner
 from algorl.core.replay_buffer import ReplayBuffer
 from algorl.core.types import Action, Observation, Transition
 from algorl.envs.jax_env import PolicyFn
@@ -155,6 +155,21 @@ class TrainingLoop:
                     break
 
     def _batched_policy(self) -> PolicyFn:
+        planner = self.planner
+
+        if isinstance(planner, BatchedPlanner):
+            def policy(observations: jnp.ndarray, key: jnp.ndarray) -> jnp.ndarray:
+                del key
+                obs_batch = [
+                    np.asarray(observations[lane], dtype=np.float32)
+                    for lane in range(observations.shape[0])
+                ]
+                result = planner.search_batch(obs_batch, deterministic=False)
+                self.planner.last_result = result
+                return jnp.asarray(result.actions, dtype=jnp.float32)
+
+            return policy
+
         def policy(observations: jnp.ndarray, key: jnp.ndarray) -> jnp.ndarray:
             del key
             actions = []
