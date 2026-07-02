@@ -20,8 +20,8 @@ from algorl.backends.jax.planners.mcts.continuous import (
     ContinuousSearchState,
     _initial_extra_data,
     _initialize_root_selection,
-    _root_embedding,
     _root_improved_policy,
+    _to_recurrent_embedding,
     _update_min_max_stats_unbatched,
     build_continuous_root,
     build_continuous_root_from_model,
@@ -59,22 +59,32 @@ def _stub_search_config(**overrides: object) -> ContinuousSearchConfig:
 def _build_stub_root(
     config: ContinuousSearchConfig,
     gumbel_scores: list[float],
+    *,
+    batch_size: int = 1,
 ) -> tuple[mctx.RootFnOutput, jnp.ndarray, ContinuousSearchExtraData]:
     num_actions = config.num_sampled_actions
-    candidates = jnp.arange(num_actions, dtype=jnp.float32)[:, None] * 0.1
+    candidates = jnp.arange(num_actions, dtype=jnp.float32)[None, :, None] * 0.1
+    if batch_size > 1:
+        candidates = jnp.tile(candidates, (batch_size, 1, 1))
     embedding = ContinuousSearchState(
-        latent_state=jnp.zeros((1,), dtype=jnp.float32),
+        latent_state=jnp.zeros((batch_size, 1), dtype=jnp.float32),
         candidates=candidates,
-        depth=jnp.array(0, dtype=jnp.int32),
+        depth=jnp.zeros((batch_size,), dtype=jnp.int32),
     )
     gumbel = jnp.asarray(gumbel_scores, dtype=jnp.float32)[None, :]
+    if batch_size > 1:
+        gumbel = jnp.tile(gumbel, (batch_size, 1))
     extra_data = _initial_extra_data(gumbel, config)
     root = mctx.RootFnOutput(
-        prior_logits=jnp.zeros((1, num_actions), dtype=jnp.float32),
-        value=jnp.array([0.5], dtype=jnp.float32),
-        embedding=_root_embedding(embedding),
+        prior_logits=jnp.zeros((batch_size, num_actions), dtype=jnp.float32),
+        value=jnp.full((batch_size,), 0.5, dtype=jnp.float32),
+        embedding=_to_recurrent_embedding(embedding),
     )
     return root, candidates, extra_data
+
+
+def _tree_batch_slice(tree: mctx.Tree, batch_index: int = 0) -> mctx.Tree:
+    return jax.tree.map(lambda x: x[batch_index], tree)
 
 
 def _stub_recurrent_step(
@@ -155,7 +165,7 @@ def test_build_continuous_root(world_model) -> None:
     )
     assert root.value.shape == (1,)
     assert root.prior_logits.shape == (1, 8)
-    assert candidates.shape == (8, world_model.env.action_dim)
+    assert candidates.shape == (1, 8, world_model.env.action_dim)
     assert extra.gumbel.shape == (1, 8)
 
 
@@ -187,8 +197,8 @@ def test_run_continuous_search_with_world_model(world_model) -> None:
         root_candidates=root_candidates,
     )
     assert result.action_indices.shape == (1,)
-    assert result.action_weights.shape == (8,)
-    assert jnp.isclose(jnp.sum(result.action_weights), 1.0)
+    assert result.action_weights.shape == (1, 8)
+    assert jnp.isclose(jnp.sum(result.action_weights[0]), 1.0)
     assert result.actions.shape[-1] == world_model.env.action_dim
     assert jnp.isfinite(result.root_values).all()
 
@@ -227,7 +237,7 @@ def test_continuous_root_action_selection_picks_least_visited() -> None:
     selector = ContinuousActionSelection(config)
     action = selector.root(
         jnp.zeros((), dtype=jnp.uint32),
-        tree,
+        _tree_batch_slice(tree),
         jnp.array(mctx.Tree.ROOT_INDEX, dtype=jnp.int32),
     )
     assert int(action) == 0
@@ -270,7 +280,7 @@ def test_continuous_interior_action_selection_picks_best_score() -> None:
     selector = ContinuousActionSelection(config)
     action = selector.interior(
         jnp.zeros((), dtype=jnp.uint32),
-        tree,
+        _tree_batch_slice(tree),
         jnp.array(1, dtype=jnp.int32),
         jnp.zeros((), dtype=jnp.int32),
     )
@@ -388,7 +398,7 @@ def test_build_continuous_root_from_model_is_jittable(world_model) -> None:
     )
     root, candidates, extra = jit_build(world_model.params, obs, rng)
     assert root.value.shape == (1,)
-    assert candidates.shape == (8, world_model.env.action_dim)
+    assert candidates.shape == (1, 8, world_model.env.action_dim)
     assert extra.gumbel.shape == (1, 8)
 
 
@@ -433,3 +443,36 @@ def test_jitted_continuous_search_matches_eager(world_model) -> None:
     assert int(jit_result.action_indices[0]) == int(eager_result.action_indices[0])
     assert jnp.allclose(jit_result.action_weights, eager_result.action_weights, atol=1e-5)
     assert jnp.allclose(jit_result.root_values, eager_result.root_values, atol=1e-5)
+
+
+def test_run_continuous_search_batch_independent_envs() -> None:
+    config = _stub_search_config(num_simulations=8)
+    batch_size = 2
+    root, root_candidates, extra_data = _build_stub_root(
+        config,
+        [10.0, 1.0, 1.0, 1.0],
+        batch_size=batch_size,
+    )
+    recurrent_fn = make_continuous_recurrent_fn(_stub_recurrent_step, config=config)
+    rng_key = jax.random.PRNGKey(21)
+    result = run_continuous_search(
+        params={},
+        rng_key=rng_key,
+        root=root,
+        recurrent_fn=recurrent_fn,
+        config=config,
+        extra_data=extra_data,
+        root_candidates=root_candidates,
+    )
+    assert result.action_indices.shape == (batch_size,)
+    assert result.actions.shape == (batch_size, 1)
+    assert result.action_weights.shape == (batch_size, config.num_sampled_actions)
+    assert result.root_values.shape == (batch_size,)
+    assert result.root_candidates.shape == (batch_size, config.num_sampled_actions, 1)
+    assert int(result.action_indices[0]) == 0
+    assert int(result.search_tree.children_visits.shape[0]) == batch_size
+    per_env_visits = jnp.sum(
+        result.search_tree.children_visits[:, mctx.Tree.ROOT_INDEX],
+        axis=-1,
+    )
+    assert jnp.all(per_env_visits == config.num_simulations)

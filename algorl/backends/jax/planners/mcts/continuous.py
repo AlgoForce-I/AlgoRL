@@ -284,19 +284,29 @@ def build_continuous_root_from_model(
     rng: Array,
     add_noise: bool = True,
 ) -> tuple[mctx.RootFnOutput, Array, ContinuousSearchExtraData]:
-    """JIT-traceable root build using Flax model ``params``."""
+    """JIT-traceable batched root build using Flax model ``params``.
+
+    ``observation`` may be a single vector ``[obs_dim]`` or a batch ``[B, obs_dim]``.
+    Returns MCTX batch-native roots with ``root.value.shape == (B,)``.
+    """
     obs = _ensure_obs_batch(observation)
+    batch_size = obs.shape[0]
     infer_key, rng = jax.random.split(rng)
-    state, value, policy = model.initial_inference(
-        params,
-        obs[0],
-        training=False,
-        rng=infer_key,
-    )
-    return _build_continuous_root_from_inference(
-        state,
-        value,
-        policy,
+    infer_keys = jax.random.split(infer_key, batch_size)
+
+    def infer_one(single_obs: Array, key: Array) -> tuple[Array, Array, Array]:
+        return model.initial_inference(
+            params,
+            single_obs,
+            training=False,
+            rng=key,
+        )
+
+    states, values, policies = jax.vmap(infer_one)(obs, infer_keys)
+    return _build_continuous_roots_batch(
+        states,
+        values,
+        policies,
         config=config,
         rng=rng,
         add_noise=add_noise,
@@ -311,55 +321,67 @@ def build_continuous_root(
     rng: Array,
     add_noise: bool = True,
 ) -> tuple[mctx.RootFnOutput, Array, ContinuousSearchExtraData]:
-    """Build an MCTX root (eager path via a bound world-model callable)."""
+    """Build batched MCTX roots via a bound world-model callable."""
     obs = _ensure_obs_batch(observation)
-    latent, value, policy = initial_step_fn(obs[0])
-    return _build_continuous_root_from_inference(
-        latent.state,
-        value,
-        policy,
+
+    def infer_one(single_obs: Array) -> tuple[Array, Array, Array]:
+        latent, value, policy = initial_step_fn(single_obs)
+        return latent.state, value, policy
+
+    states, values, policies = jax.vmap(infer_one)(obs)
+    return _build_continuous_roots_batch(
+        states,
+        values,
+        policies,
         config=config,
         rng=rng,
         add_noise=add_noise,
     )
 
 
-def _build_continuous_root_from_inference(
-    latent_state: Array,
-    value: Array,
-    policy: Array,
+def _build_continuous_roots_batch(
+    latent_states: Array,
+    values: Array,
+    policies: Array,
     *,
     config: ContinuousSearchConfig,
     rng: Array,
     add_noise: bool,
 ) -> tuple[mctx.RootFnOutput, Array, ContinuousSearchExtraData]:
+    """Build ``B`` independent roots for MCTX search."""
+    batch_size = latent_states.shape[0]
     num_actions = config.num_sampled_actions
-    candidates, _log_probs = sample_actions(
-        policy[None, ...],
-        rng,
-        config=config,
-        add_noise=add_noise,
-    )
-    candidates = candidates[0]
+    sample_keys = jax.random.split(rng, batch_size)
+
+    def sample_for_env(policy: Array, key: Array) -> Array:
+        candidates, _ = sample_actions(
+            policy[None, ...],
+            key,
+            config=config,
+            add_noise=add_noise,
+        )
+        return _pad_candidates(candidates[0], num_actions)
+
+    candidates = jax.vmap(sample_for_env)(policies, sample_keys)
     embedding = ContinuousSearchState(
-        latent_state=latent_state,
-        candidates=_pad_candidates(candidates, num_actions),
-        depth=jnp.array(0, dtype=jnp.int32),
+        latent_state=latent_states,
+        candidates=candidates,
+        depth=jnp.zeros((batch_size,), dtype=jnp.int32),
     )
     if config.use_gumbel_noise:
         rng, gumbel_key = jax.random.split(rng)
         gumbel = config.gumbel_scale * jax.random.gumbel(
             gumbel_key,
-            shape=(1, num_actions),
+            shape=(batch_size, num_actions),
             dtype=jnp.float32,
         )
     else:
-        gumbel = jnp.zeros((1, num_actions), dtype=jnp.float32)
+        gumbel = jnp.zeros((batch_size, num_actions), dtype=jnp.float32)
     extra_data = _initial_extra_data(gumbel, config)
     root = mctx.RootFnOutput(
-        prior_logits=jnp.zeros((1, num_actions), dtype=jnp.float32),
-        value=jnp.asarray(value, dtype=jnp.float32).reshape(1),
-        embedding=_root_embedding(embedding),
+        prior_logits=jnp.zeros((batch_size, num_actions), dtype=jnp.float32),
+        value=jnp.asarray(values, dtype=jnp.float32).reshape(batch_size),
+        embedding=_to_recurrent_embedding(embedding),
     )
     return root, candidates, extra_data
 
@@ -435,7 +457,8 @@ class ContinuousActionSelection:
     ) -> Array:
         del rng_key
         extra = tree.extra_data
-        selected, num_selected = _extra_selection(extra)
+        selected = extra.selected_children
+        num_selected = extra.num_selected
         children_visits = _tree_children_visits(tree, node_index)
         max_selected = self._config.num_top_actions
         candidate_indices = selected[:max_selected]
@@ -811,7 +834,8 @@ def _run_continuous_search_impl(
     )
 
     action_indices = extra_data.selected_children[:, 0]
-    actions = _select_root_actions(root_candidates, action_indices, batch_size)
+    root_candidates = _normalize_root_candidates(root_candidates, batch_size)
+    actions = _select_root_actions(root_candidates, action_indices)
     return ContinuousSearchResult(
         actions=actions,
         action_indices=action_indices,
@@ -829,16 +853,6 @@ def _run_continuous_search_impl(
 
 def _to_recurrent_embedding(state: ContinuousSearchState) -> RecurrentState:
     return state  # type: ignore[return-value]
-
-
-def _root_embedding(state: ContinuousSearchState) -> RecurrentState:
-    return _to_recurrent_embedding(
-        ContinuousSearchState(
-            latent_state=state.latent_state[None, ...],
-            candidates=state.candidates[None, ...],
-            depth=state.depth[None, ...],
-        )
-    )
 
 
 # ---------------------------------------------------------------------------
@@ -941,7 +955,8 @@ def _normalize_value(
     *,
     config: ContinuousSearchConfig,
 ) -> Array:
-    maximum, minimum = _extra_min_max(extra)
+    maximum = extra.min_max_maximum
+    minimum = extra.min_max_minimum
     delta = maximum - minimum
     norm = jnp.where(
         delta > 0,
@@ -1003,21 +1018,20 @@ def _update_min_max_stats(
     return _update_min_max_stats_unbatched(tree, extra, leaf_index)
 
 
-def _maybe_sequential_halving(
+def _maybe_sequential_halving_unbatched(
     extra: ContinuousSearchExtraData,
     tree: ContinuousMCTSTree,
     *,
     simulation_idx: Array,
     config: ContinuousSearchConfig,
 ) -> ContinuousSearchExtraData:
-    batch_index = 0
-    should_halve = (simulation_idx + 1) >= extra.visit_num_for_next_phase[batch_index]
-    num_selected = extra.num_selected[batch_index]
+    should_halve = (simulation_idx + 1) >= extra.visit_num_for_next_phase
+    num_selected = extra.num_selected
     can_halve = num_selected > 1
 
     def halve(extra_data: ContinuousSearchExtraData) -> ContinuousSearchExtraData:
-        selected = extra_data.selected_children[batch_index]
-        children_prior = tree.children_prior_logits[batch_index, mctx.Tree.ROOT_INDEX]
+        selected = extra_data.selected_children
+        children_prior = tree.children_prior_logits[mctx.Tree.ROOT_INDEX]
         transformed_q = _transformed_completed_q(
             tree,
             jnp.array(mctx.Tree.ROOT_INDEX, dtype=jnp.int32),
@@ -1025,7 +1039,7 @@ def _maybe_sequential_halving(
             config,
             num_children=config.num_sampled_actions,
         )
-        gumbel = extra_data.gumbel[batch_index]
+        gumbel = extra_data.gumbel
         slot_indices = jnp.arange(config.num_top_actions)
         active = slot_indices < num_selected
         actions_at_slots = selected[slot_indices]
@@ -1049,8 +1063,8 @@ def _maybe_sequential_halving(
             jnp.full((config.num_sampled_actions,), -1, dtype=jnp.int32),
         )
 
-        current_m = jnp.maximum(1, extra_data.current_num_top_actions[batch_index] // 2)
-        current_phase = extra_data.current_phase[batch_index] + 1
+        current_m = jnp.maximum(1, extra_data.current_num_top_actions // 2)
+        current_phase = extra_data.current_phase + 1
         log_top = jnp.float32(math.log2(config.num_top_actions))
         extra_visit = jax.lax.cond(
             current_m > 2,
@@ -1065,27 +1079,23 @@ def _maybe_sequential_halving(
                 dtype=jnp.int32,
             ),
             lambda: jnp.asarray(
-                config.num_simulations - extra_data.used_visit_num[batch_index],
+                config.num_simulations - extra_data.used_visit_num,
                 dtype=jnp.int32,
             ),
         )
-        used_visit_num = extra_data.used_visit_num[batch_index] + extra_visit
+        used_visit_num = extra_data.used_visit_num + extra_visit
         visit_num_for_next_phase = jnp.minimum(
-            extra_data.visit_num_for_next_phase[batch_index] + extra_visit,
+            extra_data.visit_num_for_next_phase + extra_visit,
             config.num_simulations,
         )
         return replace(
             extra_data,
-            selected_children=extra_data.selected_children.at[batch_index].set(new_selected),
-            num_selected=extra_data.num_selected.at[batch_index].set(new_count),
-            current_num_top_actions=extra_data.current_num_top_actions.at[batch_index].set(
-                current_m
-            ),
-            current_phase=extra_data.current_phase.at[batch_index].set(current_phase),
-            visit_num_for_next_phase=extra_data.visit_num_for_next_phase.at[batch_index].set(
-                visit_num_for_next_phase
-            ),
-            used_visit_num=extra_data.used_visit_num.at[batch_index].set(used_visit_num),
+            selected_children=new_selected,
+            num_selected=new_count,
+            current_num_top_actions=current_m,
+            current_phase=current_phase,
+            visit_num_for_next_phase=visit_num_for_next_phase,
+            used_visit_num=used_visit_num,
         )
 
     return jax.lax.cond(
@@ -1096,7 +1106,24 @@ def _maybe_sequential_halving(
     )
 
 
-def _root_improved_policy(
+def _maybe_sequential_halving(
+    extra: ContinuousSearchExtraData,
+    tree: ContinuousMCTSTree,
+    *,
+    simulation_idx: Array,
+    config: ContinuousSearchConfig,
+) -> ContinuousSearchExtraData:
+    return jax.vmap(
+        lambda e, t: _maybe_sequential_halving_unbatched(
+            e,
+            t,
+            simulation_idx=simulation_idx,
+            config=config,
+        )
+    )(extra, tree)
+
+
+def _root_improved_policy_unbatched(
     tree: ContinuousMCTSTree,
     extra: ContinuousSearchExtraData,
     config: ContinuousSearchConfig,
@@ -1113,6 +1140,16 @@ def _root_improved_policy(
     return jax.nn.softmax(children_prior + transformed_q)
 
 
+def _root_improved_policy(
+    tree: ContinuousMCTSTree,
+    extra: ContinuousSearchExtraData,
+    config: ContinuousSearchConfig,
+) -> Array:
+    return jax.vmap(
+        lambda t, e: _root_improved_policy_unbatched(t, e, config)
+    )(tree, extra)
+
+
 def _pad_candidates(candidates: Array, num_actions: int) -> Array:
     action_dim = candidates.shape[-1]
     pad_len = num_actions - candidates.shape[0]
@@ -1120,49 +1157,38 @@ def _pad_candidates(candidates: Array, num_actions: int) -> Array:
     return padded[:num_actions]
 
 
+def _normalize_root_candidates(root_candidates: Array, batch_size: int) -> Array:
+    """Ensure ``[B, num_actions, action_dim]`` layout for MCTX batch size ``B``."""
+    if root_candidates.ndim == 3:
+        return root_candidates
+    if root_candidates.ndim == 2:
+        if batch_size > 1:
+            raise ValueError(
+                "batched search requires root_candidates with shape "
+                f"[{batch_size}, num_actions, action_dim], got {root_candidates.shape}"
+            )
+        return root_candidates[None, ...]
+    raise ValueError(
+        f"root_candidates must be rank 2 or 3, got shape {root_candidates.shape}"
+    )
+
+
 def _select_root_actions(
     root_candidates: Array,
     action_indices: Array,
-    batch_size: int,
 ) -> Array:
-    """Pick chosen root actions from ``[num_actions, action_dim]`` candidates."""
-    del batch_size
-    return root_candidates[action_indices[0]]
+    """Pick chosen root actions from ``[B, num_actions, action_dim]`` candidates."""
+    batch_indices = jnp.arange(action_indices.shape[0])
+    return root_candidates[batch_indices, action_indices]
 
 
 # ---------------------------------------------------------------------------
-# Tree accessors (batched search tree and unbatched simulate slices)
+# Tree accessors (unbatched MCTX simulate slices)
 # ---------------------------------------------------------------------------
-
-
-def _extra_selection(extra: ContinuousSearchExtraData) -> tuple[Array, Array]:
-    selected = extra.selected_children
-    num_selected = extra.num_selected
-    if selected.ndim > 1:
-        selected = selected[0]
-    if num_selected.ndim > 0:
-        num_selected = num_selected[0]
-    return selected, num_selected
-
-
-def _extra_min_max(extra: ContinuousSearchExtraData) -> tuple[Array, Array]:
-    maximum = extra.min_max_maximum
-    minimum = extra.min_max_minimum
-    if maximum.ndim > 0:
-        maximum = maximum[0]
-    if minimum.ndim > 0:
-        minimum = minimum[0]
-    return maximum, minimum
-
-
-def _is_unbatched_tree(tree: ContinuousMCTSTree) -> bool:
-    return tree.node_values.ndim == 1
 
 
 def _tree_gather_node_values(tree: ContinuousMCTSTree, node_indices: Array) -> Array:
-    if _is_unbatched_tree(tree):
-        return tree.node_values[node_indices]
-    return tree.node_values[0, node_indices]
+    return tree.node_values[node_indices]
 
 
 def _tree_children_slice(
@@ -1170,15 +1196,11 @@ def _tree_children_slice(
     node_index: NodeIndex,
     num_children: int,
 ) -> Array:
-    if values.ndim == 2:
-        return values[node_index, :num_children]
-    return values[0, node_index, :num_children]
+    return values[node_index, :num_children]
 
 
 def _tree_node_values(tree: ContinuousMCTSTree, node_index: NodeIndex) -> Array:
-    if _is_unbatched_tree(tree):
-        return tree.node_values[node_index]
-    return tree.node_values[0, node_index]
+    return tree.node_values[node_index]
 
 
 def _tree_children_rewards(tree: ContinuousMCTSTree, node_index: NodeIndex, action: int) -> Array:
@@ -1190,21 +1212,15 @@ def _tree_children_values(tree: ContinuousMCTSTree, node_index: NodeIndex, actio
 
 
 def _tree_children_index(tree: ContinuousMCTSTree, node_index: NodeIndex) -> Array:
-    if tree.children_index.ndim == 2:
-        return tree.children_index[node_index]
-    return tree.children_index[0, node_index]
+    return tree.children_index[node_index]
 
 
 def _tree_children_prior_logits(tree: ContinuousMCTSTree, node_index: NodeIndex) -> Array:
-    if tree.children_prior_logits.ndim == 2:
-        return tree.children_prior_logits[node_index]
-    return tree.children_prior_logits[0, node_index]
+    return tree.children_prior_logits[node_index]
 
 
 def _tree_node_visits(tree: ContinuousMCTSTree, node_index: NodeIndex) -> Array:
-    if _is_unbatched_tree(tree):
-        return tree.node_visits[node_index]
-    return tree.node_visits[0, node_index]
+    return tree.node_visits[node_index]
 
 
 def _tree_children_visits(tree: ContinuousMCTSTree, node_index: NodeIndex) -> Array:
