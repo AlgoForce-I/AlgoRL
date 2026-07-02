@@ -179,7 +179,7 @@ class TrainingLoop:
             )
 
     def _select_action(self, observation: Observation) -> Action:
-        return self.planner.search(observation, deterministic=True)
+        return self.planner.search(observation, deterministic=False)
 
     def _should_train(self, step: int) -> bool:
         if step < self.config.learning_starts:

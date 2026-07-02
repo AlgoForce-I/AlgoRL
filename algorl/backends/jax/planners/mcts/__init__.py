@@ -5,6 +5,14 @@ from algorl.backends.jax.planners.mcts.alphazero import (
     AlphaZeroRecurrentFn,
     build_alphazero_planner,
 )
+from algorl.backends.jax.planners.mcts.efficientzero import (
+    EfficientZeroBatchedResult,
+    EfficientZeroPlanner,
+    EfficientZeroSearchResult,
+    build_efficient_zero_planner,
+    continuous_search_config_from_agent,
+    uses_continuous_search,
+)
 from algorl.backends.jax.planners.mcts.continuous import (
     ContinuousActionSelection,
     ContinuousSearchConfig,
@@ -42,9 +50,15 @@ __all__ = [
     "AlphaZeroRecurrentFn",
     "BaseMCTSPlanner",
     "build_alphazero_planner",
+    "build_efficient_zero_planner",
     "build_continuous_root",
     "build_continuous_root_from_model",
     "ContinuousActionSelection",
+    "continuous_search_config_from_agent",
+    "uses_continuous_search",
+    "EfficientZeroBatchedResult",
+    "EfficientZeroPlanner",
+    "EfficientZeroSearchResult",
     "ContinuousSearchConfig",
     "ContinuousSearchResult",
     "ContinuousSearchState",

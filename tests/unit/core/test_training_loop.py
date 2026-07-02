@@ -18,8 +18,10 @@ from algorl.envs.training_env import TrainingEnv
 class _RandomPlanner(Planner):
     def __init__(self, action_space: gym.Space) -> None:
         self.action_space = action_space
+        self.last_deterministic: bool | None = None
 
     def search(self, observation: Observation, **kwargs) -> Action:
+        self.last_deterministic = kwargs.get("deterministic")
         return int(self.action_space.sample())
 
 
@@ -37,9 +39,10 @@ def cartpole_env() -> TrainingEnv:
 def test_training_loop_collects_transitions(cartpole_env: TrainingEnv) -> None:
     config = BaseAgentConfig(learning_starts=0, train_freq=1, batch_size=1, seed=0)
     buffer = UniformReplayBuffer(capacity=100)
+    planner = _RandomPlanner(cartpole_env.action_space)
     loop = TrainingLoop(
         env=cartpole_env,
-        planner=_RandomPlanner(cartpole_env.action_space),
+        planner=planner,
         learner=_NoOpLearner(),
         replay_buffer=buffer,
         config=config,
@@ -47,6 +50,7 @@ def test_training_loop_collects_transitions(cartpole_env: TrainingEnv) -> None:
     loop.run(5)
     assert len(buffer) == 5
     assert loop.logger.history[-1]["step"] == 4
+    assert planner.last_deterministic is False
 
 
 def test_training_loop_waits_for_learning_starts(cartpole_env: TrainingEnv) -> None:

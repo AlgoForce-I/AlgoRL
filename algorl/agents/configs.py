@@ -84,6 +84,7 @@ class EfficientZeroConfig(SearchAgentConfig):
     pred_hid_shape: int = 512
     pred_shape: int = 128
     policy_distribution: str = "squashed_gaussian"
+    use_gumbel: bool = False
     value_policy_detach: bool = False
     use_bn: bool = False
     use_p_norm: bool = False
@@ -105,6 +106,7 @@ class EfficientZeroConfig(SearchAgentConfig):
             projection_layers=(1024, 1024),
             projection_head_layers=(256, 1024),
             policy_distribution="discrete",
+            use_gumbel=True,
             reanalyze_ratio=1.0,
         )
         return config.with_overrides(**overrides) if overrides else config

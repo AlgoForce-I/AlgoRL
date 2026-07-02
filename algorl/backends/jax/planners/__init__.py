@@ -51,7 +51,14 @@ def _build_alphazero_planner(context: ComponentContext) -> Planner:
     return build_alphazero_planner(context)
 
 
-registry.register("alphazero", _build_alphazero_planner, stub=False)
+def _build_efficient_zero_planner(context: ComponentContext) -> Planner:
+    from algorl.backends.jax.planners.mcts.efficientzero import build_efficient_zero_planner
 
-for _kind in ("mcts", "imagination", "cem", "mpc"):
+    return build_efficient_zero_planner(context)
+
+
+registry.register("alphazero", _build_alphazero_planner, stub=False)
+registry.register("mcts", _build_efficient_zero_planner, stub=False)
+
+for _kind in ("imagination", "cem", "mpc"):
     _register_stub(_kind)
