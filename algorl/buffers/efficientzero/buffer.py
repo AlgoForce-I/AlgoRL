@@ -279,15 +279,23 @@ class EfficientZeroReplayBuffer(ReplayBuffer):
                 td_steps=self.config.td_steps,
             )
 
+        # HyperCEZ ``save_trajectory``: new transitions all get the buffer-wide max
+        # priority (optimistic init) so fresh data is sampled promptly; per-step
+        # priorities are refreshed once the samples pass through training.
+        if self.config.use_priority:
+            traj_priorities = (
+                np.abs(pred_values[: len(steps)] - np.asarray(bootstrapped[: len(steps)], dtype=np.float32))
+                + self.config.min_prior
+            )
+            max_prior = max(self._priorities) if self._priorities else 1.0
+            new_priority = float(max(max_prior, float(traj_priorities.max())))
+        else:
+            new_priority = 1.0
+
         for step_pos in range(len(steps)):
             if step_pos + self.unroll_steps < len(steps):
                 self._lookup.append((traj_idx, step_pos))
-                priority = abs(float(pred_values[step_pos]) - float(bootstrapped[step_pos]))
-                if self.config.use_priority:
-                    priority += self.config.min_prior
-                else:
-                    priority = 1.0
-                self._priorities.append(float(priority))
+                self._priorities.append(new_priority)
 
         self._total_commits += 1
         self._trim_to_capacity()

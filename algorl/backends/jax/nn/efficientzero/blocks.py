@@ -138,10 +138,11 @@ class VectorRepresentationNetwork(nn.Module):
 
     @nn.compact
     def __call__(self, obs: jnp.ndarray) -> jnp.ndarray:
-        x = obs.reshape(-1)
         expected = self.obs_dim * self.n_stack
-        if x.shape[0] != expected:
-            x = jnp.pad(x, (0, max(0, expected - x.shape[0])))[:expected]
+        x = obs
+        if x.shape[-1] != expected:
+            pad_width = [(0, 0)] * (x.ndim - 1) + [(0, max(0, expected - x.shape[-1]))]
+            x = jnp.pad(x, pad_width)[..., :expected]
 
         mean = jax.lax.stop_gradient(
             self.param("running_mean", nn.initializers.zeros, (expected,))
@@ -169,11 +170,14 @@ class VectorDynamicsNetwork(nn.Module):
 
     @nn.compact
     def __call__(self, state: jnp.ndarray, action: jnp.ndarray) -> jnp.ndarray:
-        action_vec = jnp.asarray(action, dtype=jnp.float32).reshape(-1)
-        if action_vec.shape[0] != self.action_dim:
-            action_vec = jnp.pad(action_vec, (0, max(0, self.action_dim - action_vec.shape[0])))[
-                : self.action_dim
+        action_vec = jnp.asarray(action, dtype=jnp.float32)
+        if action_vec.ndim == 0:
+            action_vec = action_vec.reshape(1)
+        if action_vec.shape[-1] != self.action_dim:
+            pad_width = [(0, 0)] * (action_vec.ndim - 1) + [
+                (0, max(0, self.action_dim - action_vec.shape[-1]))
             ]
+            action_vec = jnp.pad(action_vec, pad_width)[..., : self.action_dim]
         act_emb = nn.Dense(self.act_embed_shape)(action_vec)
         act_emb = nn.LayerNorm()(act_emb)
         act_emb = nn.relu(act_emb)
@@ -227,8 +231,8 @@ class VectorValuePolicyNetwork(nn.Module):
 
         if self.policy_distribution == "squashed_gaussian":
             action_dim = self.policy_output_size // 2
-            mu = 5.0 * jnp.tanh(policy[:action_dim] / 5.0)
-            std = jax.nn.softplus(policy[action_dim:] + 1.0) + 0.1
+            mu = 5.0 * jnp.tanh(policy[..., :action_dim] / 5.0)
+            std = jax.nn.softplus(policy[..., action_dim:] + 1.0) + 0.1
             std = jnp.clip(std, 0.1, 10.0)
             policy = jnp.concatenate([mu, std], axis=-1)
 
@@ -273,14 +277,13 @@ class VectorRewardLSTMNetwork(nn.Module):
     ) -> tuple[jnp.ndarray, tuple[jnp.ndarray, jnp.ndarray]]:
         x = ImproveResidualBlock(self.hidden_shape, self.hidden_shape)(state)
         x = nn.LayerNorm()(x)
-        x = x[None, ...]
         cell = nn.LSTMCell(self.lstm_hidden_size)
         carry = (
             reward_hidden
             if reward_hidden is not None
-            else cell.initialize_carry(jax.random.PRNGKey(0), (1,))
+            else cell.initialize_carry(jax.random.PRNGKey(0), x.shape)
         )
-        carry, y = cell(carry, x[0])
+        carry, y = cell(carry, x)
         reward = HyperMLP(
             [*_layer_sizes(self.rew_net_shape), self.output_size],
             use_layernorm=self.use_bn,

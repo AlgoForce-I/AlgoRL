@@ -219,8 +219,17 @@ def _loss_from_batch(
         - entropy_total * config.entropy_coeff
     )
     weighted = total * weights
-    loss = jnp.sum(weighted) / (jnp.sum(weights) + 1e-8) / float(unroll_steps)
-    priorities = jnp.abs(pred_scalars / float(unroll_steps) - value_targets[:, 0]) + config.min_prior
+    # HyperCEZ: ``(weights * loss).mean()`` with a 1/unroll_steps gradient hook.
+    loss = jnp.mean(weighted) / float(unroll_steps)
+
+    # HyperCEZ fresh priority: |min-ensemble value - target| on the first step,
+    # clipped to [0, 1e5] for continuous control.
+    pred_priority_values = pred_scalars
+    if pred_priority_values.ndim == 2:
+        pred_priority_values = jnp.min(pred_priority_values, axis=0)
+    if config.clip_inference_values:
+        pred_priority_values = jnp.clip(pred_priority_values, 0.0, 1e5)
+    priorities = jnp.abs(pred_priority_values - value_targets[:, 0]) + config.min_prior
 
     metrics = {
         "loss": loss,
@@ -270,8 +279,11 @@ class EfficientZeroLearner(Learner):
             )
 
         self._rng_key = self.backend.random_key(self.config.seed + 2)
+        # torch ``Adam(weight_decay=...)`` adds L2 to gradients before the Adam
+        # update, so decayed weights go in front of the Adam transform.
         self._optimizer = optax.chain(
             optax.clip_by_global_norm(self.config.max_grad_norm),
+            optax.add_decayed_weights(self.config.weight_decay),
             optax.adam(self.config.learning_rate),
         )
         self._opt_state = self._optimizer.init(self.params)

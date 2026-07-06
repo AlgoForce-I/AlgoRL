@@ -115,14 +115,15 @@ class EfficientZero(nn.Module):
         *,
         rng: jax.Array | None,
     ) -> jnp.ndarray:
+        # ``values`` is stacked over the ensemble on axis 0: [v_num, ..., bins].
         if self.config.v_num > 2:
             if rng is None:
                 raise ValueError("rng is required when v_num > 2 during inference.")
             indices = jax.random.choice(rng, self.config.v_num, (2,), replace=False)
-            values = values[..., indices, :]
+            values = values[indices]
 
         if self.config.value_support_type == "symlog":
-            output_values = _symexp(values).min(axis=-2)
+            output_values = jnp.min(_symexp(values[..., 0]), axis=0)
         else:
             output_values = jnp.min(
                 vector_to_scalar(
@@ -131,7 +132,7 @@ class EfficientZero(nn.Module):
                     support_bins=self.config.support_bins,
                     support_range=self.config.value_support_range,
                 ),
-                axis=-1,
+                axis=0,
             )
 
         if self.config.clip_inference_values:

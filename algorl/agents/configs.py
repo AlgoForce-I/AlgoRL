@@ -58,6 +58,7 @@ class EfficientZeroConfig(SearchAgentConfig):
     unroll_steps: int = 5
     trajectory_size: int = 100
     learning_rate: float = 3e-4
+    weight_decay: float = 0.0
     reward_loss_coeff: float = 1.0
     value_loss_coeff: float = 0.5
     policy_loss_coeff: float = 1.0
@@ -165,6 +166,7 @@ class EfficientZeroConfig(SearchAgentConfig):
             policy_distribution="discrete",
             use_gumbel=True,
             reanalyze_ratio=1.0,
+            weight_decay=1e-4,
         )
         return config.with_overrides(**overrides) if overrides else config
 
@@ -185,6 +187,7 @@ class EfficientZeroConfig(SearchAgentConfig):
             projection_head_layers=(256, 1024),
             policy_distribution="squashed_gaussian",
             reanalyze_ratio=1.0,
+            weight_decay=1e-4,
         )
         return config.with_overrides(**overrides) if overrides else config
 
@@ -235,6 +238,7 @@ class EfficientZeroConfig(SearchAgentConfig):
             random_action_num=12,
             buffer_capacity=100_000,
             mcts_simulations=32,
+            weight_decay=2e-5,
         )
         return config.with_overrides(**overrides) if overrides else config
 
