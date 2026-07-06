@@ -127,6 +127,25 @@ class EfficientZeroConfig(SearchAgentConfig):
     use_bn: bool = False
     use_p_norm: bool = False
     noisy_net: bool = False
+    schedule_horizon: str = "auto"
+    schedule_mix_start_fraction: float | None = None
+    schedule_auto_td_fraction: float | None = None
+    schedule_mixed_value_buffer_fraction: float | None = None
+
+    def with_schedule_for_run(
+        self,
+        total_timesteps: int,
+        *,
+        num_envs: int = 1,
+    ) -> EfficientZeroConfig:
+        """Apply :func:`~algorl.buffers.efficientzero.schedule.resolve_efficient_zero_schedule`."""
+        from algorl.buffers.efficientzero.schedule import resolve_efficient_zero_schedule
+
+        return resolve_efficient_zero_schedule(
+            self,
+            total_timesteps,
+            num_envs=num_envs,
+        )
 
     @classmethod
     def for_atari(cls, **overrides: object) -> EfficientZeroConfig:

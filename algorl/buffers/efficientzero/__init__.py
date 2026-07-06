@@ -13,6 +13,11 @@ from algorl.buffers.efficientzero.buffer import (
     search_fields_from_transition_info,
     step_from_transition,
 )
+from algorl.buffers.efficientzero.schedule import (
+    estimate_gradient_step_budget,
+    resolve_efficient_zero_schedule,
+    schedule_ratios,
+)
 from algorl.buffers.efficientzero.targets import (
     adaptive_td_steps,
     bootstrapped_values,
@@ -38,6 +43,9 @@ __all__ = [
     "mix_value_targets",
     "prepare_bootstrapped_batch_values",
     "trajectory_padding_gap",
+    "estimate_gradient_step_budget",
+    "resolve_efficient_zero_schedule",
+    "schedule_ratios",
     "search_fields_from_transition_info",
     "step_from_transition",
 ]
