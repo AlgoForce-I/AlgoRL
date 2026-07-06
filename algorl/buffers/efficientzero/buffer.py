@@ -334,7 +334,6 @@ class EfficientZeroReplayBuffer(ReplayBuffer):
         dones: list[np.ndarray] = []
         masks: list[np.ndarray] = []
         mix_masks: list[np.ndarray] = []
-        policy_masks: list[np.ndarray] = []
         sample_indices: list[int] = []
         weights: list[float] = []
 
@@ -403,7 +402,6 @@ class EfficientZeroReplayBuffer(ReplayBuffer):
                     mask[step_i:] = 0.0
                     break
             masks.append(mask)
-            policy_masks.append(np.ones((window,), dtype=np.float32))
             sample_indices.append(int(flat_index))
             if hasattr(self, "_last_weights"):
                 weights.append(float(self._last_weights[offset]))
@@ -423,7 +421,6 @@ class EfficientZeroReplayBuffer(ReplayBuffer):
             "dones": np.stack(dones, axis=0),
             "masks": np.stack(masks, axis=0),
             "mix_masks": np.stack(mix_masks, axis=0),
-            "policy_masks": np.stack(policy_masks, axis=0),
             "indices": np.asarray(sample_indices, dtype=np.int32),
             "weights": np.asarray(weights, dtype=np.float32),
         }

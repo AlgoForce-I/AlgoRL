@@ -113,7 +113,7 @@ def continuous_policy_loss(
 
     HyperCEZ ``continuous_loss``: ``action_dim == 1`` uses full candidate distribution
     loss; multi-dimensional control uses best-action log-prob only. Trajectory
-    ``mask`` (padding) may scale the loss; mismatch masks are stored but not applied.
+    ``mask`` (padding) may scale the loss.
     """
     action_dim = policy.shape[-1] // 2
     mean = policy[..., :action_dim]

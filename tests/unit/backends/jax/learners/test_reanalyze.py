@@ -34,12 +34,28 @@ class _RecordingPlanner:
     def __init__(self, *, search_batch_size: int) -> None:
         self.search_batch_size = search_batch_size
         self.batch_sizes: list[int] = []
+        self.search_params: list[object | None] = []
+        self.use_self_play_flags: list[bool] = []
 
-    def search_batch(self, observations, *, deterministic: bool = False, temperature: float = 1.0, **kwargs):
+    def search_batch(
+        self,
+        observations,
+        *,
+        deterministic: bool = False,
+        temperature: float = 1.0,
+        params=None,
+        use_self_play: bool = True,
+        **kwargs,
+    ):
         del deterministic, temperature, kwargs
         batch_size = len(observations) if isinstance(observations, list) else int(np.asarray(observations).shape[0])
         self.batch_sizes.append(batch_size)
+        self.search_params.append(params)
+        self.use_self_play_flags.append(use_self_play)
         return _RecordingSearchResult(batch_size)
+
+
+_REANALYZE_PARAMS = {"model": "reanalyze"}
 
 
 def test_normalize_observation_batch_accepts_numpy_stack() -> None:
@@ -53,7 +69,12 @@ def test_normalize_observation_batch_accepts_numpy_stack() -> None:
 def test_reanalyze_uses_planner_search_batch_size() -> None:
     planner = _RecordingPlanner(search_batch_size=4)
     observations = np.zeros((5, 3, 2), dtype=np.float32)
-    reanalyze_training_batch(planner, observations, reanalyze_count=5)
+    reanalyze_training_batch(
+        planner,
+        observations,
+        params=_REANALYZE_PARAMS,
+        reanalyze_count=5,
+    )
     assert planner.batch_sizes == [4, 4, 4, 3]
 
 
@@ -65,10 +86,25 @@ def test_reanalyze_search_batch_size_override() -> None:
     reanalyze_policy_batch(
         planner,
         observations,
+        params=_REANALYZE_PARAMS,
         reanalyze_count=5,
         search_batch_size=4,
     )
     assert planner.batch_sizes == [4, 4, 4, 3]
+
+
+def test_reanalyze_search_uses_reanalyze_params() -> None:
+    planner = _RecordingPlanner(search_batch_size=8)
+    observations = np.zeros((2, 4, 3), dtype=np.float32)
+    reanalyze_training_batch(
+        planner,
+        observations,
+        params=_REANALYZE_PARAMS,
+        reanalyze_count=2,
+    )
+    assert planner.search_params
+    assert all(params is _REANALYZE_PARAMS for params in planner.search_params)
+    assert all(use_self_play is False for use_self_play in planner.use_self_play_flags)
 
 
 def test_reanalyze_preserves_trajectory_shapes() -> None:
@@ -77,6 +113,7 @@ def test_reanalyze_preserves_trajectory_shapes() -> None:
     policy_targets, search_values, policy_candidates, best_actions = reanalyze_training_batch(
         planner,
         observations,
+        params=_REANALYZE_PARAMS,
         reanalyze_count=2,
     )
     assert policy_targets.shape == (2, 4, 2)

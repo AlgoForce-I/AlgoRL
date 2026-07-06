@@ -57,7 +57,6 @@ def _batch_to_arrays(batch: Batch) -> dict[str, jnp.ndarray]:
         "masks",
         "weights",
         "indices",
-        "policy_masks",
     )
     data = batch.data
     missing = [key for key in required if key not in data]
@@ -69,8 +68,6 @@ def _batch_to_arrays(batch: Batch) -> dict[str, jnp.ndarray]:
         if key == "dones":
             arrays[key] = jnp.asarray(data[key]).astype(jnp.bool_)
         elif key == "policy_candidates":
-            arrays[key] = jnp.asarray(data[key], dtype=jnp.float32)
-        elif key == "policy_masks":
             arrays[key] = jnp.asarray(data[key], dtype=jnp.float32)
         else:
             arrays[key] = jnp.asarray(data[key], dtype=jnp.float32)
@@ -434,29 +431,18 @@ def _prepare_training_batch(
     arrays["search_values"] = jnp.asarray(batch.data["search_values"], dtype=jnp.float32)
 
     reanalyze_count = int(config.batch_size * config.reanalyze_ratio)
-    policy_masks = np.asarray(batch.data.get("policy_masks", np.ones(observations.shape[:2])), dtype=np.float32)
 
     if reanalyze_count > 0 and isinstance(planner, EfficientZeroPlanner):
-        old_params = planner.params
-        planner.params = reanalyze_params
-        try:
-            temperature = mcts_temperature(config, trained_steps)
-            (
-                policy_targets,
-                search_values,
-                policy_candidates,
-                best_actions,
-                reanalyzed_masks,
-            ) = reanalyze_policy_batch(
-                planner,
-                observations,
-                reanalyze_count=reanalyze_count,
-                temperature=temperature,
-                search_batch_size=effective_reanalyze_search_batch_size(config),
-                on_progress=on_reanalyze_progress,
-            )
-        finally:
-            planner.params = old_params
+        temperature = mcts_temperature(config, trained_steps)
+        policy_targets, search_values, policy_candidates, best_actions = reanalyze_policy_batch(
+            planner,
+            observations,
+            params=reanalyze_params,
+            reanalyze_count=reanalyze_count,
+            temperature=temperature,
+            search_batch_size=effective_reanalyze_search_batch_size(config),
+            on_progress=on_reanalyze_progress,
+        )
 
         arrays["policy_targets"] = jnp.asarray(
             _merge_reanalyze(arrays["policy_targets"], policy_targets, reanalyze_count),
@@ -474,7 +460,6 @@ def _prepare_training_batch(
             _merge_reanalyze(arrays["best_actions"], best_actions, reanalyze_count),
             dtype=jnp.float32,
         )
-        policy_masks = _merge_reanalyze(policy_masks, reanalyzed_masks, reanalyze_count)
 
     if config.value_target == "search":
         arrays["value_targets"] = arrays["search_values"]
@@ -490,7 +475,6 @@ def _prepare_training_batch(
             + arrays["search_values"] * (1.0 - mix_masks)
         )
 
-    arrays["policy_masks"] = jnp.asarray(policy_masks, dtype=jnp.float32)
     return arrays
 
 
