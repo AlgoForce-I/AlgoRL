@@ -13,7 +13,17 @@ import numpy as np
 import optax
 
 from algorl.agents.configs import EfficientZeroConfig
-from algorl.backends.jax.learners.efficientzero.reanalyze import reanalyze_training_batch
+from algorl.backends.jax.learners.efficientzero.reanalyze import (
+    batch_initial_values,
+    effective_reanalyze_search_batch_size,
+    mcts_temperature,
+    reanalyze_policy_batch,
+)
+from algorl.buffers.efficientzero.targets import (
+    prepare_bootstrapped_batch_values,
+    prepare_gae_batch_values,
+)
+from algorl.backends.jax.nn.efficientzero.obs_norm import update_representation_obs_stats
 from algorl.backends.jax.nn.efficientzero.losses import (
     _reduce_value_logits,
     apply_half_gradient,
@@ -47,6 +57,7 @@ def _batch_to_arrays(batch: Batch) -> dict[str, jnp.ndarray]:
         "masks",
         "weights",
         "indices",
+        "policy_masks",
     )
     data = batch.data
     missing = [key for key in required if key not in data]
@@ -58,6 +69,8 @@ def _batch_to_arrays(batch: Batch) -> dict[str, jnp.ndarray]:
         if key == "dones":
             arrays[key] = jnp.asarray(data[key]).astype(jnp.bool_)
         elif key == "policy_candidates":
+            arrays[key] = jnp.asarray(data[key], dtype=jnp.float32)
+        elif key == "policy_masks":
             arrays[key] = jnp.asarray(data[key], dtype=jnp.float32)
         else:
             arrays[key] = jnp.asarray(data[key], dtype=jnp.float32)
@@ -129,7 +142,6 @@ def _loss_from_batch(
             best_action,
             next_obs,
             step_mask,
-            policy_mask,
             step_rng,
         ) = step_inputs
 
@@ -156,8 +168,8 @@ def _loss_from_batch(
             target_policy=target_policy,
             entropy_rng=step_rng,
         )
-        step_policy = step_policy * step_mask * policy_mask
-        step_entropy = step_entropy * step_mask * policy_mask
+        step_policy = step_policy * step_mask
+        step_entropy = step_entropy * step_mask
 
         next_state = apply_half_gradient(next_state)
         return (next_state, next_reward_hidden), {
@@ -176,8 +188,6 @@ def _loss_from_batch(
     step_best_actions = _time_major_for_scan(best_actions[:, 1 : unroll_steps + 1])
     step_next_obs = _time_major_for_scan(observations[:, 1 : unroll_steps + 1])
     step_masks = _time_major_for_scan(masks)
-    policy_valid = (jnp.arange(unroll_steps) + 1) < unroll_steps
-    step_policy_masks = policy_valid.astype(jnp.float32)
     step_rngs = jax.random.split(unroll_rng, unroll_steps)
     step_indices = jnp.arange(unroll_steps, dtype=jnp.int32)
 
@@ -194,7 +204,6 @@ def _loss_from_batch(
             step_best_actions,
             step_next_obs,
             step_masks,
-            step_policy_masks,
             step_rngs,
         ),
     )
@@ -251,8 +260,12 @@ class EfficientZeroLearner(Learner):
         self.planner = context.planner
         self.model = self.world_model.model
         self.params: Params = self.world_model.params
+        self._self_play_params: Params = copy.deepcopy(self.params)
         self._reanalyze_params: Params = copy.deepcopy(self.params)
+        self._recent_reanalyze_params: Params = copy.deepcopy(self.params)
         self._train_steps = 0
+        if isinstance(self.planner, EfficientZeroPlanner):
+            self.planner.self_play_params = self._self_play_params
 
         if self.config.policy_distribution == "discrete":
             raise NotImplementedError(
@@ -287,16 +300,24 @@ class EfficientZeroLearner(Learner):
             beta=beta,
             trained_steps=self._train_steps,
         )
+        self._rng_key, step_key = jax.random.split(self._rng_key)
         arrays = _prepare_training_batch(
             batch,
             planner=self.planner,
             config=self.config,
+            model=self.model,
             reanalyze_params=self._reanalyze_params,
+            trained_steps=self._train_steps,
+            total_transitions=replay_buffer.total_transitions,
+            rng_key=step_key,
             on_reanalyze_progress=getattr(self, "_on_reanalyze_progress", None),
         )
-        self._maybe_refresh_reanalyze_params()
-
-        self._rng_key, step_key = jax.random.split(self._rng_key)
+        self.params = update_representation_obs_stats(
+            self.params,
+            np.asarray(arrays["observations"]),
+        )
+        self._propagate_obs_norm_stats()
+        self._maybe_refresh_model_copies()
         self.params, self._opt_state, metrics = self._update(
             self.params,
             self._opt_state,
@@ -318,14 +339,45 @@ class EfficientZeroLearner(Learner):
     def _priority_beta(self) -> float:
         if not self.config.use_priority:
             return 1.0
-        return min(1.0, self.config.priority_prob_beta)
+        total = max(1, self.config.total_training_steps)
+        initial = self.config.priority_prob_beta
+        progress = min(1.0, self._train_steps / total)
+        return float(initial + (1.0 - initial) * progress)
 
-    def _maybe_refresh_reanalyze_params(self) -> None:
-        interval = max(1, self.config.reanalyze_update_interval)
-        if self._train_steps > 0 and self._train_steps % interval == 0:
-            self._reanalyze_params = copy.deepcopy(self.params)
+    def _maybe_refresh_model_copies(self) -> None:
+        self_play_interval = max(1, self.config.self_play_update_interval)
+        if self._train_steps > 0 and self._train_steps % self_play_interval == 0:
+            self._self_play_params = copy.deepcopy(self.params)
+            if isinstance(self.planner, EfficientZeroPlanner):
+                self.planner.self_play_params = self._self_play_params
+
+        reanalyze_interval = max(1, self.config.reanalyze_update_interval)
+        if self._train_steps > 0 and self._train_steps % reanalyze_interval == 0:
+            self._reanalyze_params = copy.deepcopy(self._recent_reanalyze_params)
+            self._recent_reanalyze_params = copy.deepcopy(self.params)
+
         if isinstance(self.planner, EfficientZeroPlanner):
             self.planner.params = self.params
+
+    def _propagate_obs_norm_stats(self) -> None:
+        """Keep online observation stats aligned across planner model copies."""
+        source = self.params["representation_model"]
+        for attr in ("_self_play_params", "_reanalyze_params", "_recent_reanalyze_params"):
+            target = getattr(self, attr)
+            rep = dict(target["representation_model"])
+            for key in ("running_mean", "running_var", "running_count"):
+                if key in source:
+                    rep[key] = source[key]
+            target["representation_model"] = rep
+        if isinstance(self.planner, EfficientZeroPlanner):
+            for params in (self.planner.params, self.planner.self_play_params):
+                if params is None:
+                    continue
+                rep = dict(params["representation_model"])
+                for key in ("running_mean", "running_var", "running_count"):
+                    if key in source:
+                        rep[key] = source[key]
+                params["representation_model"] = rep
 
     def _sync_params(self) -> None:
         self.world_model.params = self.params
@@ -338,35 +390,82 @@ def _prepare_training_batch(
     *,
     planner: Planner,
     config: EfficientZeroConfig,
+    model: EfficientZeroNetwork,
     reanalyze_params: Params,
+    trained_steps: int,
+    total_transitions: int,
+    rng_key: jax.Array,
     on_reanalyze_progress: Callable[[int, int], None] | None = None,
 ) -> dict[str, jnp.ndarray]:
     arrays = _batch_to_arrays(batch)
-    observations = np.asarray(batch.data["observations"])
+    observations = np.asarray(batch.data["observations"], dtype=np.float32)
+    rewards = np.asarray(batch.data["rewards"], dtype=np.float32)
+    sample_indices = np.asarray(batch.data["indices"], dtype=np.int32)
+
+    def infer_values(obs: np.ndarray) -> np.ndarray:
+        return batch_initial_values(
+            model,
+            reanalyze_params,
+            obs,
+            rng_key=rng_key,
+            mini_batch_size=config.reanalyze_mini_batch_size,
+        )
+
+    if config.model_value_target == "bootstrapped":
+        bootstrapped = prepare_bootstrapped_batch_values(
+            observations,
+            rewards,
+            sample_indices,
+            total_transitions=total_transitions,
+            config=config,
+            infer_values=infer_values,
+        )
+    else:
+        bootstrapped = prepare_gae_batch_values(
+            observations,
+            rewards,
+            sample_indices,
+            total_transitions=total_transitions,
+            config=config,
+            infer_values=infer_values,
+        )
+
+    arrays["value_targets"] = jnp.asarray(bootstrapped, dtype=jnp.float32)
+    arrays["search_values"] = jnp.asarray(batch.data["search_values"], dtype=jnp.float32)
 
     reanalyze_count = int(config.batch_size * config.reanalyze_ratio)
+    policy_masks = np.asarray(batch.data.get("policy_masks", np.ones(observations.shape[:2])), dtype=np.float32)
+
     if reanalyze_count > 0 and isinstance(planner, EfficientZeroPlanner):
         old_params = planner.params
         planner.params = reanalyze_params
         try:
-            policy_targets, search_values, policy_candidates, best_actions = reanalyze_training_batch(
+            temperature = mcts_temperature(config, trained_steps)
+            (
+                policy_targets,
+                search_values,
+                policy_candidates,
+                best_actions,
+                reanalyzed_masks,
+            ) = reanalyze_policy_batch(
                 planner,
                 observations,
                 reanalyze_count=reanalyze_count,
+                temperature=temperature,
+                search_batch_size=effective_reanalyze_search_batch_size(config),
                 on_progress=on_reanalyze_progress,
             )
         finally:
             planner.params = old_params
+
         arrays["policy_targets"] = jnp.asarray(
             _merge_reanalyze(arrays["policy_targets"], policy_targets, reanalyze_count),
             dtype=jnp.float32,
         )
         arrays["search_values"] = jnp.asarray(
-            _merge_reanalyze_1d(arrays["value_targets"], search_values, reanalyze_count),
+            _merge_reanalyze_1d(arrays["search_values"], search_values, reanalyze_count),
             dtype=jnp.float32,
         )
-        if config.value_target == "search":
-            arrays["value_targets"] = arrays["search_values"]
         arrays["policy_candidates"] = jnp.asarray(
             _merge_reanalyze(arrays["policy_candidates"], policy_candidates, reanalyze_count),
             dtype=jnp.float32,
@@ -375,6 +474,23 @@ def _prepare_training_batch(
             _merge_reanalyze(arrays["best_actions"], best_actions, reanalyze_count),
             dtype=jnp.float32,
         )
+        policy_masks = _merge_reanalyze(policy_masks, reanalyzed_masks, reanalyze_count)
+
+    if config.value_target == "search":
+        arrays["value_targets"] = arrays["search_values"]
+    elif config.value_target == "max":
+        arrays["value_targets"] = jnp.maximum(arrays["value_targets"], arrays["search_values"])
+    elif (
+        config.value_target == "mixed"
+        and trained_steps >= config.start_use_mix_training_steps
+    ):
+        mix_masks = jnp.asarray(batch.data["mix_masks"], dtype=jnp.float32)
+        arrays["value_targets"] = (
+            arrays["value_targets"] * mix_masks
+            + arrays["search_values"] * (1.0 - mix_masks)
+        )
+
+    arrays["policy_masks"] = jnp.asarray(policy_masks, dtype=jnp.float32)
     return arrays
 
 

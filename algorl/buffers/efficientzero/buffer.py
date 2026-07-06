@@ -13,6 +13,7 @@ from algorl.buffers.efficientzero.targets import (
     bootstrapped_values,
     gae_values,
     mix_value_targets,
+    trajectory_padding_gap,
 )
 from algorl.core.replay_buffer import ReplayBuffer
 from algorl.core.types import Action, Batch, Transition
@@ -93,6 +94,7 @@ class EfficientZeroTrajectory:
                 td_steps=config.td_steps,
                 td_lambda=config.td_lambda,
                 gae_max_steps=config.gae_max_steps,
+                auto_td_steps=config.auto_td_steps,
             )
         self.bootstrapped_values = bootstrapped_values(
             rewards,
@@ -234,7 +236,8 @@ class EfficientZeroReplayBuffer(ReplayBuffer):
         current.steps = list(steps)
 
         if self._pending_commit is not None:
-            tail = current.steps[: self.unroll_steps]
+            gap = trajectory_padding_gap(self.config)
+            tail = current.steps[:gap]
             self._pending_commit.pad_over(tail)
             self._pending_commit.finalize_targets(self.config)
             self._store_trajectory(self._pending_commit.steps, self._pending_commit)
@@ -295,11 +298,13 @@ class EfficientZeroReplayBuffer(ReplayBuffer):
             rng = np.random.default_rng()
             return rng.choice(total, size=batch_size, replace=False)
 
-        priorities = np.asarray(self._priorities[:total], dtype=np.float64)
-        if total > self.config.top_transitions:
+        # HyperCEZ: permanently zero priorities outside the top-transitions window.
+        if total > int(self.config.top_transitions):
             cutoff = total - int(self.config.top_transitions)
-            priorities[:cutoff] = 0.0
+            for index in range(cutoff):
+                self._priorities[index] = 0.0
 
+        priorities = np.asarray(self._priorities[:total], dtype=np.float64)
         probs = priorities**self.config.priority_prob_alpha
         total_prob = probs.sum()
         if total_prob <= 0.0:
@@ -329,6 +334,7 @@ class EfficientZeroReplayBuffer(ReplayBuffer):
         dones: list[np.ndarray] = []
         masks: list[np.ndarray] = []
         mix_masks: list[np.ndarray] = []
+        policy_masks: list[np.ndarray] = []
         sample_indices: list[int] = []
         weights: list[float] = []
 
@@ -397,6 +403,7 @@ class EfficientZeroReplayBuffer(ReplayBuffer):
                     mask[step_i:] = 0.0
                     break
             masks.append(mask)
+            policy_masks.append(np.ones((window,), dtype=np.float32))
             sample_indices.append(int(flat_index))
             if hasattr(self, "_last_weights"):
                 weights.append(float(self._last_weights[offset]))
@@ -416,6 +423,7 @@ class EfficientZeroReplayBuffer(ReplayBuffer):
             "dones": np.stack(dones, axis=0),
             "masks": np.stack(masks, axis=0),
             "mix_masks": np.stack(mix_masks, axis=0),
+            "policy_masks": np.stack(policy_masks, axis=0),
             "indices": np.asarray(sample_indices, dtype=np.int32),
             "weights": np.asarray(weights, dtype=np.float32),
         }

@@ -140,8 +140,8 @@ JittedContinuousSearchFn = Callable[
     ContinuousSearchResult,
 ]
 SimulationStepFn = Callable[
-    [Array, tuple[Array, ContinuousMCTSTree, ContinuousSearchExtraData]],
-    tuple[Array, ContinuousMCTSTree, ContinuousSearchExtraData],
+    [Array, tuple[ContinuousSearchParams, Array, ContinuousMCTSTree, ContinuousSearchExtraData]],
+    tuple[ContinuousSearchParams, Array, ContinuousMCTSTree, ContinuousSearchExtraData],
 ]
 
 
@@ -213,6 +213,7 @@ def sample_actions(
     config: ContinuousSearchConfig,
     add_noise: bool = True,
     sample_nums: int | None = None,
+    temperature: float = 1.0,
 ) -> tuple[Array, Array]:
     """Sample candidate continuous actions (EfficientZero-V2 ``MCTS_base.sample_actions``)."""
     batch_size, policy_dim = policy.shape
@@ -230,7 +231,7 @@ def sample_actions(
 
     mean = policy[:, :action_dim]
     std = policy[:, action_dim:]
-    safe_std = jnp.maximum(std, 1e-6)
+    safe_std = jnp.maximum(std, 1e-6) * jnp.asarray(temperature, dtype=jnp.float32)
 
     rng, policy_key, random_key = jax.random.split(rng, 3)
     policy_eps = jax.random.normal(policy_key, (batch_size, n_policy, action_dim))
@@ -283,6 +284,7 @@ def build_continuous_root_from_model(
     config: ContinuousSearchConfig,
     rng: Array,
     add_noise: bool = True,
+    temperature: float = 1.0,
 ) -> tuple[mctx.RootFnOutput, Array, ContinuousSearchExtraData]:
     """JIT-traceable batched root build using Flax model ``params``.
 
@@ -310,6 +312,7 @@ def build_continuous_root_from_model(
         config=config,
         rng=rng,
         add_noise=add_noise,
+        temperature=temperature,
     )
 
 
@@ -347,6 +350,7 @@ def _build_continuous_roots_batch(
     config: ContinuousSearchConfig,
     rng: Array,
     add_noise: bool,
+    temperature: float = 1.0,
 ) -> tuple[mctx.RootFnOutput, Array, ContinuousSearchExtraData]:
     """Build ``B`` independent roots for MCTX search."""
     batch_size = latent_states.shape[0]
@@ -359,6 +363,7 @@ def _build_continuous_roots_batch(
             key,
             config=config,
             add_noise=add_noise,
+            temperature=temperature,
         )
         return _pad_candidates(candidates[0], num_actions)
 
@@ -700,15 +705,15 @@ def _simulation_body(
 
 def _make_jitted_simulation_step(
     *,
-    params: ContinuousSearchParams,
     recurrent_fn: mctx.RecurrentFn,
     action_selection_fn: InteriorActionSelectionFn,
     config: ContinuousSearchConfig,
 ) -> SimulationStepFn:
-    """``fori_loop`` step with a per-search ``jax.jit`` kernel (params closed)."""
+    """``fori_loop`` step with a single reused ``jax.jit`` kernel (params are traced)."""
 
     @jax.jit
     def run_one_simulation(
+        params: ContinuousSearchParams,
         simulation_idx: Array,
         rng_key: Array,
         tree: ContinuousMCTSTree,
@@ -727,10 +732,17 @@ def _make_jitted_simulation_step(
 
     def simulation_step(
         simulation_idx: Array,
-        carry: tuple[Array, ContinuousMCTSTree, ContinuousSearchExtraData],
-    ) -> tuple[Array, ContinuousMCTSTree, ContinuousSearchExtraData]:
-        rng_key, tree, extra_data = carry
-        return run_one_simulation(simulation_idx, rng_key, tree, extra_data)
+        carry: tuple[ContinuousSearchParams, Array, ContinuousMCTSTree, ContinuousSearchExtraData],
+    ) -> tuple[ContinuousSearchParams, Array, ContinuousMCTSTree, ContinuousSearchExtraData]:
+        params, rng_key, tree, extra_data = carry
+        rng_key, tree, extra_data = run_one_simulation(
+            params,
+            simulation_idx,
+            rng_key,
+            tree,
+            extra_data,
+        )
+        return params, rng_key, tree, extra_data
 
     return simulation_step
 
@@ -739,12 +751,17 @@ def make_jitted_continuous_search(
     config: ContinuousSearchConfig,
     recurrent_fn: mctx.RecurrentFn,
 ) -> JittedContinuousSearchFn:
-    """Return a search function with a ``jax.jit``-compiled simulation kernel.
+    """Return a search function with one reused ``jax.jit`` simulation kernel.
 
-    Each MCTS simulation is compiled separately. A single outer ``jit`` over the
-    full loop currently hits XLA issues when composed with EfficientZero expand.
+    The compiled kernel is created once when this factory runs. ``params`` are
+    passed as traced arguments so weights can change without redefining the JIT.
     """
     action_selection_fn = ContinuousActionSelection(config).as_mctx()
+    simulation_step = _make_jitted_simulation_step(
+        recurrent_fn=recurrent_fn,
+        action_selection_fn=action_selection_fn,
+        config=config,
+    )
 
     def search(
         params: ContinuousSearchParams,
@@ -753,12 +770,6 @@ def make_jitted_continuous_search(
         extra_data: ContinuousSearchExtraData,
         root_candidates: Array,
     ) -> ContinuousSearchResult:
-        simulation_step = _make_jitted_simulation_step(
-            params=params,
-            recurrent_fn=recurrent_fn,
-            action_selection_fn=action_selection_fn,
-            config=config,
-        )
         return _run_continuous_search_impl(
             params=params,
             rng_key=rng_key,
@@ -786,7 +797,6 @@ def run_continuous_search(
     """Run EfficientZero-V2 ``search_continuous`` using MCTX tree primitives."""
     action_selection_fn = ContinuousActionSelection(config).as_mctx()
     simulation_step = _make_jitted_simulation_step(
-        params=params,
         recurrent_fn=recurrent_fn,
         action_selection_fn=action_selection_fn,
         config=config,
@@ -826,11 +836,11 @@ def _run_continuous_search_impl(
     )
     tree = tree.replace(extra_data=_initialize_root_selection(tree, extra_data, config))
 
-    rng_key, tree, extra_data = jax.lax.fori_loop(
+    _, rng_key, tree, extra_data = jax.lax.fori_loop(
         0,
         config.num_simulations,
         simulation_step,
-        (rng_key, tree, extra_data),
+        (params, rng_key, tree, extra_data),
     )
 
     action_indices = extra_data.selected_children[:, 0]

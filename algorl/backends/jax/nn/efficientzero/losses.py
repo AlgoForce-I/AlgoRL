@@ -6,58 +6,8 @@ import jax
 import jax.numpy as jnp
 
 from algorl.agents.configs import EfficientZeroConfig
-from algorl.backends.jax.nn.efficientzero.model import _symexp, _vector_to_scalar
-
-_SUPPORT_EPSILON = 0.001
-
-
-def _dmc_transform(x: jnp.ndarray) -> jnp.ndarray:
-    sign = jnp.where(x < 0.0, -1.0, 1.0)
-    return sign * (jnp.sqrt(jnp.abs(x) + 1.0) - 1.0) + _SUPPORT_EPSILON * x
-
-
-def scalar_to_support(
-    targets: jnp.ndarray,
-    *,
-    support_range: tuple[float, float],
-    support_bins: int,
-) -> jnp.ndarray:
-    """Map scalar targets to a categorical support distribution (DMC preset)."""
-    x_min, x_max = support_range
-    transformed_min = _dmc_transform(jnp.asarray(x_min, dtype=jnp.float32))
-    transformed_max = _dmc_transform(jnp.asarray(x_max, dtype=jnp.float32))
-    scale = (transformed_max - transformed_min) / float(support_bins - 1)
-
-    sign = jnp.where(targets < 0.0, -1.0, 1.0)
-    transformed = sign * (jnp.sqrt(jnp.abs(targets) + 1.0) - 1.0) + _SUPPORT_EPSILON * targets
-    transformed = transformed / scale
-
-    low = transformed_min / scale
-    high = transformed_max / scale - 1e-5
-    transformed = jnp.clip(transformed, low, high)
-    shifted = transformed - low
-
-    low_idx = jnp.floor(shifted).astype(jnp.int32)
-    high_idx = jnp.ceil(shifted).astype(jnp.int32)
-    weight_high = shifted - jnp.floor(shifted)
-    weight_low = 1.0 - weight_high
-
-    batch_shape = targets.shape
-    target = jnp.zeros(batch_shape + (support_bins,), dtype=jnp.float32)
-    if target.ndim == 1:
-        target = target.at[high_idx].add(weight_high)
-        target = target.at[low_idx].add(weight_low)
-        return target
-
-    flat_target = target.reshape((-1, support_bins))
-    flat_high = high_idx.reshape(-1)
-    flat_low = low_idx.reshape(-1)
-    flat_weight_high = weight_high.reshape(-1)
-    flat_weight_low = weight_low.reshape(-1)
-    rows = jnp.arange(flat_target.shape[0])
-    flat_target = flat_target.at[rows, flat_high].add(flat_weight_high)
-    flat_target = flat_target.at[rows, flat_low].add(flat_weight_low)
-    return flat_target.reshape(batch_shape + (support_bins,))
+from algorl.backends.jax.nn.efficientzero.model import _symexp
+from algorl.backends.jax.nn.efficientzero.support import scalar_to_support, vector_to_scalar
 
 
 def kl_categorical_loss(logits: jnp.ndarray, target: jnp.ndarray) -> jnp.ndarray:
@@ -93,7 +43,12 @@ def squashed_normal_log_prob(mean: jnp.ndarray, std: jnp.ndarray, actions: jnp.n
 def _reduce_value_logits(values: jnp.ndarray, config: EfficientZeroConfig) -> jnp.ndarray:
     if config.value_support_type == "symlog":
         return _symexp(values[..., 0])
-    return _vector_to_scalar(values, config.value_support_type, config.support_bins)
+    return vector_to_scalar(
+        values,
+        support_type=config.value_support_type,
+        support_bins=config.support_bins,
+        support_range=config.value_support_range,
+    )
 
 
 def value_loss(
@@ -120,7 +75,14 @@ def value_loss(
         positive = (error > 0.0).astype(jnp.float32)
         weight = (1.0 - positive) * config.IQL_weight + positive * (1.0 - config.IQL_weight)
         return weight * per_sample
-    return per_sample
+
+    # HyperCEZ Value_loss applies IQL_weight=0.5 asymmetry even when use_IQL=False.
+    reformed = _reduce_value_logits(predictions, config)
+    error = reformed - targets
+    positive = (error > 0.0).astype(jnp.float32)
+    iql_weight = 0.5
+    weight = (1.0 - positive) * iql_weight + positive * (1.0 - iql_weight)
+    return weight * per_sample
 
 
 def reward_loss(
@@ -147,18 +109,24 @@ def continuous_policy_loss(
     entropy_rng: jax.Array | None = None,
     entropy_samples: int = 64,
 ) -> tuple[jnp.ndarray, jnp.ndarray]:
-    """Squashed-Gaussian policy loss (Eq. 6 full pi or Eq. 7 simple pi)."""
+    """Squashed-Gaussian policy loss (Eq. 6 full pi or Eq. 7 simple pi).
+
+    HyperCEZ ``continuous_loss``: ``action_dim == 1`` uses full candidate distribution
+    loss; multi-dimensional control uses best-action log-prob only. Trajectory
+    ``mask`` (padding) may scale the loss; mismatch masks are stored but not applied.
+    """
     action_dim = policy.shape[-1] // 2
     mean = policy[..., :action_dim]
     std = policy[..., action_dim:]
     clipped_best = jnp.clip(best_action, -0.999, 0.999)
 
-    if (
-        candidates is not None
+    use_full_pi = (
+        action_dim == 1
+        and candidates is not None
         and target_policy is not None
         and candidates.shape[-2] > 0
-        and action_dim == 1
-    ):
+    )
+    if use_full_pi:
         log_probs = squashed_normal_log_prob(
             mean[..., None, :],
             std[..., None, :],

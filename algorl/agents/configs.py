@@ -52,6 +52,8 @@ class EfficientZeroConfig(SearchAgentConfig):
     """
 
     reanalyze_ratio: float = 0.5
+    reanalyze_search_batch_size: int | None = None
+    reanalyze_mini_batch_size: int = 256
     reanalyze_update_interval: int = 200
     unroll_steps: int = 5
     trajectory_size: int = 100
@@ -72,9 +74,15 @@ class EfficientZeroConfig(SearchAgentConfig):
     gae_max_steps: int = 15
     lstm_horizon_len: int = 5
     value_target: str = "mixed"
-    model_value_target: str = "GAE"
+    model_value_target: str = "bootstrapped"
     start_use_mix_training_steps: int = 40_000
     mixed_value_threshold: float = 20_000.0
+    auto_td_steps: int = 30_000
+    self_play_update_interval: int = 100
+    change_temperature: bool = True
+    total_training_steps: int = 100_000
+    dynamics_update_every: int = 10
+    std_magnification: float = 3.0
     use_priority: bool = True
     priority_prob_alpha: float = 1.0
     priority_prob_beta: float = 1.0
@@ -193,14 +201,21 @@ class EfficientZeroConfig(SearchAgentConfig):
             td_lambda=0.95,
             gae_max_steps=15,
             value_target="mixed",
-            model_value_target="GAE",
+            model_value_target="bootstrapped",
             start_use_mix_training_steps=40_000,
+            auto_td_steps=60_000,
+            self_play_update_interval=100,
+            change_temperature=True,
+            total_training_steps=100_000,
+            dynamics_update_every=10,
             mixed_value_threshold=20_000.0,
             use_priority=True,
             entropy_coeff=0.05,
             consistency_coeff=2.0,
             policy_action_num=4,
             random_action_num=12,
+            buffer_capacity=100_000,
+            mcts_simulations=32,
         )
         return config.with_overrides(**overrides) if overrides else config
 
@@ -214,17 +229,21 @@ class EfficientZeroConfig(SearchAgentConfig):
         """Balanced batched continual-learning preset (HyperCEZ-style cadence).
 
         Collects ``jax_rollout_chunk * num_envs`` env steps in parallel, then runs
-        one learner update (with full reanalyze by default) per rollout chunk.
-        This matches HyperCEZ ``dynamics_update_every`` >> 1 rather than training on
-        every env frame.
+        one learner update per rollout chunk. ``jax_rollout_chunk`` is chosen so
+        ``chunk * num_envs ≈ dynamics_update_every`` (HyperCEZ trainer cadence).
         """
+        dynamics_every = 10
+        if overrides and "dynamics_update_every" in overrides:
+            dynamics_every = int(overrides["dynamics_update_every"])  # type: ignore[arg-type]
+        rollout_chunk = max(1, dynamics_every // max(1, num_envs))
         config = cls.for_dmc_state(
             batch_size=256,
             mcts_simulations=32,
-            jax_rollout_chunk=64,
+            jax_rollout_chunk=rollout_chunk,
             search_batch_size=num_envs,
             reanalyze_ratio=1.0,
             gradient_steps_per_rollout=1,
+            dynamics_update_every=dynamics_every,
         )
         return config.with_overrides(**overrides) if overrides else config
 
@@ -246,6 +265,28 @@ class EfficientZeroConfig(SearchAgentConfig):
             num_envs=num_envs,
             batch_size=128,
             reanalyze_ratio=0.5,
+            gradient_steps_per_rollout=1,
+            dynamics_update_every=10,
+        )
+        return config.with_overrides(**overrides) if overrides else config
+
+    @classmethod
+    def for_dmc_state_sequential_gpu(
+        cls,
+        *,
+        reanalyze_search_batch_size: int = 128,
+        **overrides: object,
+    ) -> EfficientZeroConfig:
+        """Single-env Gymnasium/DMC preset with wide reanalyze MCTS batches.
+
+        Rollout MCTS stays at ``search_batch_size=1`` while reanalyze runs
+        ``reanalyze_search_batch_size`` roots per JIT search (HyperCEZ batches
+        all reanalyze roots; this exposes that knob without batched env rollouts).
+        """
+        config = cls.for_dmc_state(
+            search_batch_size=1,
+            reanalyze_search_batch_size=reanalyze_search_batch_size,
+            jax_rollout_chunk=10,
             gradient_steps_per_rollout=1,
         )
         return config.with_overrides(**overrides) if overrides else config

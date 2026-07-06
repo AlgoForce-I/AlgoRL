@@ -6,6 +6,7 @@ from typing import Any
 
 import jax
 import jax.numpy as jnp
+import numpy as np
 
 from algorl.agents.configs import EfficientZeroConfig
 from algorl.envs.training_env import TrainingEnv
@@ -364,6 +365,12 @@ def init_efficient_zero_params(
     state = jnp.zeros((model.config.hidden_shape,), dtype=jnp.float32)
 
     rep_vars = model.representation_model.init(keys[0], obs)
+    rep_params = dict(rep_vars["params"])
+    obs_dim = int(np.prod(np.asarray(obs).shape))
+    rep_params.setdefault("running_mean", jnp.zeros((obs_dim,), dtype=jnp.float32))
+    rep_params.setdefault("running_var", jnp.ones((obs_dim,), dtype=jnp.float32))
+    rep_params.setdefault("running_count", jnp.asarray(1e3, dtype=jnp.float32))
+
     dyn_vars = model.dynamics_model.init(keys[1], state, action)
     if model.config.value_prefix:
         reward_vars = model.reward_prediction_model.init(keys[2], state, None)
@@ -377,7 +384,7 @@ def init_efficient_zero_params(
     )
 
     return {
-        "representation_model": rep_vars["params"],
+        "representation_model": rep_params,
         "dynamics_model": dyn_vars["params"],
         "reward_prediction_model": reward_vars["params"],
         "value_policy_model": value_policy_vars["params"],

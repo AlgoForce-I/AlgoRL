@@ -10,12 +10,7 @@ import jax.numpy as jnp
 from flax import linen as nn
 
 from algorl.agents.configs import EfficientZeroConfig
-
-Params: TypeAlias = chex.ArrayTree
-
-_SUPPORT_MIN = -300.0
-_SUPPORT_MAX = 301.0
-_SUPPORT_DELTA = 1.0
+from algorl.backends.jax.nn.efficientzero.support import vector_to_scalar
 
 
 def _normalize_state(state: jnp.ndarray, eps: float = 1e-6) -> jnp.ndarray:
@@ -27,43 +22,7 @@ def _symexp(x: jnp.ndarray) -> jnp.ndarray:
     return jnp.sign(x) * (jnp.exp(jnp.abs(x)) - 1.0)
 
 
-def _bin_centers(support_bins: int) -> jnp.ndarray:
-    """Support bin centers as a compile-time constant array."""
-    step = 600.0 / (support_bins - 1)
-    return jnp.array([-300.0 + i * step for i in range(support_bins)], dtype=jnp.float32)
-
-
-def _support_bins() -> jnp.ndarray:
-    count = int(round((_SUPPORT_MAX - _SUPPORT_MIN) / _SUPPORT_DELTA)) + 1
-    return _bin_centers(count)
-
-
-def _pad_support_logits(logits: jnp.ndarray, support_bins: int) -> jnp.ndarray:
-    """Pad trailing support dimension to ``support_bins`` for scan-safe reduction."""
-    width = support_bins - logits.shape[-1]
-    if width <= 0:
-        return logits[..., :support_bins]
-    pad_spec = [(0, 0)] * (logits.ndim - 1) + [(0, width)]
-    return jnp.pad(logits, pad_spec, constant_values=-jnp.inf)
-
-
-def _vector_to_scalar(logits: jnp.ndarray, support_type: str, support_bins: int) -> jnp.ndarray:
-    """Map value/reward logits to a scalar expectation.
-
-    ``support_type`` is fixed per model config, so we branch in Python rather than
-    with ``lax.cond`` on the logit width. A traced shape branch here breaks XLA when
-    composed with Flax inference inside ``jax.jit``.
-    """
-    if support_type not in {"symlog", "support", "discrete"}:
-        raise ValueError(f"Unknown support type {support_type!r}")
-
-    if support_type == "symlog":
-        return _symexp(logits[..., 0])
-
-    padded = _pad_support_logits(logits, support_bins)
-    probs = jax.nn.softmax(padded, axis=-1)
-    bins = _bin_centers(support_bins)
-    return jnp.sum(probs * bins, axis=-1)
+Params: TypeAlias = chex.ArrayTree
 
 
 class EfficientZero(nn.Module):
@@ -166,10 +125,11 @@ class EfficientZero(nn.Module):
             output_values = _symexp(values).min(axis=-2)
         else:
             output_values = jnp.min(
-                _vector_to_scalar(
+                vector_to_scalar(
                     values,
-                    self.config.value_support_type,
-                    self.config.support_bins,
+                    support_type=self.config.value_support_type,
+                    support_bins=self.config.support_bins,
+                    support_range=self.config.value_support_range,
                 ),
                 axis=-1,
             )
@@ -181,7 +141,12 @@ class EfficientZero(nn.Module):
     def _reduce_reward_prefix(self, value_prefix: jnp.ndarray) -> jnp.ndarray:
         if self.config.reward_support_type == "symlog":
             return _symexp(value_prefix)
-        return _vector_to_scalar(value_prefix, self.config.reward_support_type, self.config.support_bins)
+        return vector_to_scalar(
+            value_prefix,
+            support_type=self.config.reward_support_type,
+            support_bins=self.config.support_bins,
+            support_range=self.config.reward_support_range,
+        )
 
     def initial_inference(
         self,

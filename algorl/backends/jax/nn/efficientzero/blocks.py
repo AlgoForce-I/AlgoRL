@@ -127,13 +127,14 @@ class DownSample(nn.Module):
 
 
 class VectorRepresentationNetwork(nn.Module):
-    """HyperCEZ ``AltRepresentationNetwork``."""
+    """HyperCEZ ``AltRepresentationNetwork`` with online observation normalization."""
 
     obs_dim: int
     n_stack: int
     num_blocks: int
     rep_net_shape: int
     hidden_shape: int
+    obs_norm_epsilon: float = 1e-5
 
     @nn.compact
     def __call__(self, obs: jnp.ndarray) -> jnp.ndarray:
@@ -141,7 +142,14 @@ class VectorRepresentationNetwork(nn.Module):
         expected = self.obs_dim * self.n_stack
         if x.shape[0] != expected:
             x = jnp.pad(x, (0, max(0, expected - x.shape[0])))[:expected]
-        x = nn.LayerNorm()(x)
+
+        mean = jax.lax.stop_gradient(
+            self.param("running_mean", nn.initializers.zeros, (expected,))
+        )
+        var = jax.lax.stop_gradient(
+            self.param("running_var", nn.initializers.ones, (expected,))
+        )
+        x = (x - mean) / jnp.sqrt(var + self.obs_norm_epsilon)
         x = nn.Dense(self.hidden_shape)(x)
         x = nn.LayerNorm()(x)
         x = jnp.tanh(x)

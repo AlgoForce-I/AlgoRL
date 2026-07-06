@@ -27,6 +27,7 @@ class _RecordingSingleResult:
         self.root_value = float(index)
         self.root_candidates = np.zeros((num_candidates, action_dim), dtype=np.float32)
         self.action = np.zeros((action_dim,), dtype=np.float32)
+        self.action_index = 0
 
 
 class _RecordingPlanner:
@@ -34,8 +35,8 @@ class _RecordingPlanner:
         self.search_batch_size = search_batch_size
         self.batch_sizes: list[int] = []
 
-    def search_batch(self, observations, *, deterministic: bool = False):
-        del deterministic
+    def search_batch(self, observations, *, deterministic: bool = False, temperature: float = 1.0, **kwargs):
+        del deterministic, temperature, kwargs
         batch_size = len(observations) if isinstance(observations, list) else int(np.asarray(observations).shape[0])
         self.batch_sizes.append(batch_size)
         return _RecordingSearchResult(batch_size)
@@ -53,6 +54,20 @@ def test_reanalyze_uses_planner_search_batch_size() -> None:
     planner = _RecordingPlanner(search_batch_size=4)
     observations = np.zeros((5, 3, 2), dtype=np.float32)
     reanalyze_training_batch(planner, observations, reanalyze_count=5)
+    assert planner.batch_sizes == [4, 4, 4, 3]
+
+
+def test_reanalyze_search_batch_size_override() -> None:
+    planner = _RecordingPlanner(search_batch_size=1)
+    observations = np.zeros((5, 3, 2), dtype=np.float32)
+    from algorl.backends.jax.learners.efficientzero.reanalyze import reanalyze_policy_batch
+
+    reanalyze_policy_batch(
+        planner,
+        observations,
+        reanalyze_count=5,
+        search_batch_size=4,
+    )
     assert planner.batch_sizes == [4, 4, 4, 3]
 
 

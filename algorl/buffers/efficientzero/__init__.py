@@ -18,6 +18,8 @@ from algorl.buffers.efficientzero.targets import (
     bootstrapped_values,
     gae_values,
     mix_value_targets,
+    prepare_bootstrapped_batch_values,
+    trajectory_padding_gap,
 )
 
 __all__ = [
@@ -34,6 +36,8 @@ __all__ = [
     "bootstrapped_values",
     "gae_values",
     "mix_value_targets",
+    "prepare_bootstrapped_batch_values",
+    "trajectory_padding_gap",
     "search_fields_from_transition_info",
     "step_from_transition",
 ]

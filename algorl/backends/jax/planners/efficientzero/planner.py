@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import copy
 from dataclasses import dataclass, replace
 from typing import Any, Mapping
 
@@ -156,6 +157,10 @@ def continuous_search_config_from_agent(
         num_simulations=config.mcts_simulations,
         num_sampled_actions=num_actions,
         num_top_actions=num_actions,
+        policy_action_num=config.policy_action_num,
+        random_action_num=config.random_action_num,
+        std_magnification=config.std_magnification,
+        discount=config.discount,
         gumbel_scale=0.0,
         use_gumbel_noise=False,
         lstm_horizon_len=config.lstm_horizon_len,
@@ -189,6 +194,7 @@ class EfficientZeroPlanner(BatchedPlanner):
         self.world_model = world_model or self._require_world_model(context)
         self.model = self.world_model.model
         self.params: Params = self.world_model.params
+        self.self_play_params: Params = copy.deepcopy(self.params)
         self._search_config_override = search_config
         self._use_jit = use_jit
         self._rng_key = self.backend.random_key(context.config.seed)
@@ -228,12 +234,19 @@ class EfficientZeroPlanner(BatchedPlanner):
         observations: ObservationBatch,
         *,
         deterministic: bool = False,
+        temperature: float = 1.0,
+        use_self_play: bool = True,
+        params: Params | None = None,
         **kwargs: Any,
     ) -> EfficientZeroBatchedResult:
         """Run continuous MCTS for a batch of observations."""
         del kwargs
         self._ensure_params_initialized()
         self._ensure_continuous_search_supported()
+
+        search_params = params
+        if search_params is None:
+            search_params = self.self_play_params if use_self_play else self.params
 
         search_config = self._resolve_search_config()
         add_noise = not deterministic
@@ -243,17 +256,18 @@ class EfficientZeroPlanner(BatchedPlanner):
         self._rng_key, build_key, search_key = jax.random.split(self._rng_key, 3)
         root, root_candidates, extra_data = build_continuous_root_from_model(
             self.model,
-            self.params,
+            search_params,
             obs_batch,
             config=search_config,
             rng=build_key,
             add_noise=add_noise,
+            temperature=temperature,
         )
         pred_values = jnp.asarray(root.value, dtype=jnp.float32)
 
         if self._use_jit and self._jitted_search is not None:
             result = self._jitted_search(
-                self.params,
+                search_params,
                 search_key,
                 root,
                 extra_data,
@@ -261,7 +275,7 @@ class EfficientZeroPlanner(BatchedPlanner):
             )
         else:
             result = run_continuous_search(
-                params=self.params,
+                params=search_params,
                 rng_key=search_key,
                 root=root,
                 recurrent_fn=make_model_continuous_recurrent_fn(self.model, config=search_config),
