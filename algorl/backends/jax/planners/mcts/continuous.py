@@ -229,9 +229,12 @@ def sample_actions(
         n_policy = num_sampled
         n_random = 0
 
+    # HyperCEZ ``MCTS_base.sample_actions`` accepts ``temperature`` but never
+    # applies it to continuous sampling; the policy std is used as-is.
+    del temperature
     mean = policy[:, :action_dim]
     std = policy[:, action_dim:]
-    safe_std = jnp.maximum(std, 1e-6) * jnp.asarray(temperature, dtype=jnp.float32)
+    safe_std = jnp.maximum(std, 1e-6)
 
     rng, policy_key, random_key = jax.random.split(rng, 3)
     policy_eps = jax.random.normal(policy_key, (batch_size, n_policy, action_dim))

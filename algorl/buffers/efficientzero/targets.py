@@ -122,15 +122,13 @@ def adaptive_td_steps(
     return int(np.clip(base_td_steps - delta, 1, base_td_steps))
 
 
-def trajectory_padding_gap(config: object) -> int:
-    """Steps of tail context to pad across trajectory blocks (HyperCEZ ``gap_step``)."""
+def gae_extra_steps(config: object) -> int:
+    """HyperCEZ GAE lookahead beyond the unroll window (``extra`` in ``prepare_reward_value_gae``)."""
     from algorl.agents.configs import EfficientZeroConfig
 
     if not isinstance(config, EfficientZeroConfig):
-        raise TypeError("trajectory_padding_gap requires EfficientZeroConfig.")
-    if config.model_value_target == "bootstrapped":
-        return config.n_stack + config.td_steps
-    extra = max(
+        raise TypeError("gae_extra_steps requires EfficientZeroConfig.")
+    return max(
         0,
         min(
             int(1 / (1 - config.td_lambda)),
@@ -139,7 +137,34 @@ def trajectory_padding_gap(config: object) -> int:
         - config.unroll_steps
         - 1,
     )
-    return config.n_stack + 1 + extra + 1
+
+
+def trajectory_padding_gap(config: object) -> int:
+    """Steps of tail context to pad across trajectory blocks (HyperCEZ ``gap_step``)."""
+    from algorl.agents.configs import EfficientZeroConfig
+
+    if not isinstance(config, EfficientZeroConfig):
+        raise TypeError("trajectory_padding_gap requires EfficientZeroConfig.")
+    if config.model_value_target == "bootstrapped":
+        return config.n_stack + config.td_steps
+    return config.n_stack + 1 + gae_extra_steps(config) + 1
+
+
+def extended_target_window(config: object) -> int:
+    """Observation/reward window needed for full-horizon value targets.
+
+    HyperCEZ computes value targets on the stored trajectory, so every unroll
+    position can bootstrap ``td_steps`` (or GAE ``extra + 1``) transitions ahead.
+    The replay buffer must therefore expose that many steps beyond the
+    ``unroll_steps + 1`` training window.
+    """
+    from algorl.agents.configs import EfficientZeroConfig
+
+    if not isinstance(config, EfficientZeroConfig):
+        raise TypeError("extended_target_window requires EfficientZeroConfig.")
+    if config.model_value_target == "bootstrapped":
+        return config.unroll_steps + 1 + config.td_steps
+    return config.unroll_steps + gae_extra_steps(config) + 2
 
 
 def prepare_bootstrapped_batch_values(
@@ -147,11 +172,19 @@ def prepare_bootstrapped_batch_values(
     rewards: np.ndarray,
     sample_indices: np.ndarray,
     *,
+    valid_lengths: np.ndarray,
+    bootstrap_limits: np.ndarray | None = None,
     total_transitions: int,
     config: object,
     infer_values: Callable[[np.ndarray], np.ndarray],
 ) -> np.ndarray:
-    """HyperCEZ ``prepare_reward_value`` targets for a sampled training batch."""
+    """HyperCEZ ``prepare_reward_value`` targets for a sampled training batch.
+
+    ``observations``/``rewards`` cover the extended window
+    (:func:`extended_target_window`); ``valid_lengths[b]`` is the number of core
+    trajectory transitions remaining from the sampled position (HyperCEZ
+    ``traj_len - state_index``), which caps the TD horizon near trajectory ends.
+    """
     from algorl.agents.configs import EfficientZeroConfig
 
     if not isinstance(config, EfficientZeroConfig):
@@ -159,59 +192,51 @@ def prepare_bootstrapped_batch_values(
 
     batch_size, window, obs_dim = observations.shape
     unroll_positions = config.unroll_steps + 1
-    if window < unroll_positions:
-        raise ValueError(f"observation window {window} < unroll_positions {unroll_positions}.")
+    if window < unroll_positions + 1:
+        raise ValueError(f"observation window {window} < unroll_positions + 1.")
+    if bootstrap_limits is None:
+        bootstrap_limits = valid_lengths
 
-    zero_obs = np.zeros((obs_dim,), dtype=np.float32)
-    value_obs: list[np.ndarray] = []
-    td_steps_flat: list[int] = []
-    value_mask: list[float] = []
-    layout: list[tuple[int, int, int]] = []
+    inferred = np.asarray(
+        infer_values(observations.reshape(batch_size * window, obs_dim)),
+        dtype=np.float32,
+    ).reshape(batch_size, window)
 
+    targets = np.zeros((batch_size, unroll_positions), dtype=np.float32)
     for batch_index in range(batch_size):
+        valid_len = int(valid_lengths[batch_index])
+        limit = int(bootstrap_limits[batch_index])
         sample_index = int(sample_indices[batch_index])
-        td_steps = adaptive_td_steps(
-            config.td_steps,
-            sample_index=sample_index,
-            collected_transitions=total_transitions,
-            auto_td_steps=config.auto_td_steps,
-        )
+
+        # Off-policy correction: shorter horizon of td steps. Disabled for
+        # ``mixed``/``max`` value targets, exactly as in HyperCEZ.
         if config.value_target in ("mixed", "max"):
             td_steps = config.td_steps
+        else:
+            td_steps = adaptive_td_steps(
+                config.td_steps,
+                sample_index=sample_index,
+                collected_transitions=total_transitions,
+                auto_td_steps=config.auto_td_steps,
+            )
+        td_steps = int(np.clip(min(valid_len, td_steps), 1, config.td_steps))
 
         for position in range(unroll_positions):
-            local_td = min(window - 1 - position, td_steps)
-            local_td = max(1, int(local_td))
-            bootstrap_position = position + local_td
-            if bootstrap_position < window:
-                value_obs.append(observations[batch_index, bootstrap_position])
-                value_mask.append(1.0)
-            else:
-                value_obs.append(zero_obs)
-                value_mask.append(0.0)
-            td_steps_flat.append(local_td)
-            layout.append((batch_index, position, local_td))
+            td_steps = max(1, min(valid_len - position, td_steps))
+            bootstrap_position = position + td_steps
 
-    inferred = infer_values(np.stack(value_obs, axis=0).astype(np.float32))
-    inferred = np.asarray(inferred, dtype=np.float32).reshape(-1)
-    value_mask_arr = np.asarray(value_mask, dtype=np.float32)
-    discounted = inferred * (config.discount ** np.asarray(td_steps_flat, dtype=np.float32))
-    discounted = discounted * value_mask_arr
-
-    targets = np.zeros((batch_size, window), dtype=np.float32)
-    cursor = 0
-    for batch_index, position, local_td in layout:
-        bootstrap_position = position + local_td
-        target = float(discounted[cursor])
-        for step, reward in enumerate(
-            rewards[batch_index, position:bootstrap_position],
-            start=0,
-        ):
-            target += float(config.discount**step) * float(reward)
-        if position < window:
-            targets[batch_index, position] = target
-        cursor += 1
-    return targets[:, :unroll_positions]
+            target = 0.0
+            if bootstrap_position <= limit and bootstrap_position < window:
+                target = float(config.discount**td_steps) * float(
+                    inferred[batch_index, bootstrap_position]
+                )
+            for step in range(position, min(bootstrap_position, window)):
+                target += float(config.discount ** (step - position)) * float(
+                    rewards[batch_index, step]
+                )
+            # Positions past the trajectory end train against zero (masked out).
+            targets[batch_index, position] = target if position <= valid_len else 0.0
+    return targets
 
 
 def prepare_gae_batch_values(
@@ -219,6 +244,8 @@ def prepare_gae_batch_values(
     rewards: np.ndarray,
     sample_indices: np.ndarray,
     *,
+    valid_lengths: np.ndarray,
+    bootstrap_limits: np.ndarray | None = None,
     total_transitions: int,
     config: object,
     infer_values: Callable[[np.ndarray], np.ndarray],
@@ -230,21 +257,44 @@ def prepare_gae_batch_values(
         raise TypeError("prepare_gae_batch_values requires EfficientZeroConfig.")
 
     batch_size, window, obs_dim = observations.shape
-    flat_obs = observations.reshape(batch_size * window, obs_dim)
-    flat_values = np.asarray(infer_values(flat_obs), dtype=np.float32).reshape(batch_size, window)
+    unroll_positions = config.unroll_steps + 1
+    extra = gae_extra_steps(config)
+    span = config.unroll_steps + 1 + extra
+    if window < span + 1:
+        raise ValueError(f"observation window {window} < GAE span + 1 ({span + 1}).")
+    if bootstrap_limits is None:
+        bootstrap_limits = valid_lengths
 
-    targets = np.zeros((batch_size, window), dtype=np.float32)
+    inferred = np.asarray(
+        infer_values(observations.reshape(batch_size * window, obs_dim)),
+        dtype=np.float32,
+    ).reshape(batch_size, window)
+
+    targets = np.zeros((batch_size, unroll_positions), dtype=np.float32)
     for batch_index in range(batch_size):
-        gae = gae_values(
-            rewards[batch_index],
-            flat_values[batch_index],
-            discount=config.discount,
-            td_steps=config.td_steps,
-            td_lambda=config.td_lambda,
-            gae_max_steps=config.gae_max_steps,
-            index=int(sample_indices[batch_index]),
-            collected_transitions=total_transitions,
-            auto_td_steps=config.auto_td_steps,
-        )
-        targets[batch_index, : gae.shape[0]] = gae[:window]
-    return targets[:, : config.unroll_steps + 1]
+        valid_len = int(valid_lengths[batch_index])
+        limit = int(bootstrap_limits[batch_index])
+        sample_index = int(sample_indices[batch_index])
+
+        # HyperCEZ checks ``model["value_target"]`` (never 'mixed'/'max') here,
+        # so the lambda age-decay is always active on the GAE path.
+        delta_lambda = 0.1 * (total_transitions - sample_index) / float(config.auto_td_steps)
+        td_lambda = float(np.clip(config.td_lambda - delta_lambda, 0.65, config.td_lambda))
+
+        advantage = np.zeros((span + 1,), dtype=np.float32)
+        for position in reversed(range(span)):
+            bootstrap_position = position + 1
+            value = 0.0
+            if bootstrap_position <= limit:
+                value = float(config.discount) * float(inferred[batch_index, bootstrap_position])
+            if position < window:
+                value += float(rewards[batch_index, position])
+            current = float(inferred[batch_index, position]) if position < valid_len else 0.0
+            delta = value - current
+            advantage[position] = delta + float(config.discount) * td_lambda * advantage[position + 1]
+
+        for position in range(unroll_positions):
+            current = float(inferred[batch_index, position]) if position < valid_len else 0.0
+            target = advantage[position] + current
+            targets[batch_index, position] = target if position <= valid_len else 0.0
+    return targets

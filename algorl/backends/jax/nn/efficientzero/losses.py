@@ -16,7 +16,10 @@ def kl_categorical_loss(logits: jnp.ndarray, target: jnp.ndarray) -> jnp.ndarray
 
 
 def symlog_scalar_loss(prediction: jnp.ndarray, target: jnp.ndarray) -> jnp.ndarray:
-    pred = prediction[..., 0] if prediction.shape[-1] > 1 else prediction
+    pred = prediction
+    if pred.ndim == target.ndim + 1:
+        # Scalar heads emit a trailing singleton bin (HyperCEZ ``squeeze()``).
+        pred = pred[..., 0]
     target_symlog = jnp.sign(target) * jnp.log1p(jnp.abs(target))
     return 0.5 * (pred - target_symlog) ** 2
 
@@ -56,33 +59,33 @@ def value_loss(
     targets: jnp.ndarray,
     config: EfficientZeroConfig,
 ) -> jnp.ndarray:
-    if predictions.ndim == 3 and predictions.shape[0] == config.v_num:
-        predictions = predictions[0]
+    """HyperCEZ ``Value_loss``: targets repeat over the ensemble axis, every
+    value head is trained, per-head IQL weights, mean over heads."""
+    has_ensemble_axis = predictions.ndim == targets.ndim + 2
+    if not has_ensemble_axis:
+        predictions = predictions[None, ...]
+    ensemble_targets = jnp.broadcast_to(
+        targets,
+        (predictions.shape[0],) + targets.shape,
+    )
 
     if config.value_support_type == "symlog":
-        per_sample = symlog_scalar_loss(predictions, targets)
+        per_sample = symlog_scalar_loss(predictions, ensemble_targets)
     else:
         target_support = scalar_to_support(
-            targets,
+            ensemble_targets,
             support_range=config.value_support_range,
             support_bins=config.support_bins,
         )
         per_sample = kl_categorical_loss(predictions, target_support)
 
-    if config.use_IQL:
-        reformed = _reduce_value_logits(predictions, config)
-        error = reformed - targets
-        positive = (error > 0.0).astype(jnp.float32)
-        weight = (1.0 - positive) * config.IQL_weight + positive * (1.0 - config.IQL_weight)
-        return weight * per_sample
-
     # HyperCEZ Value_loss applies IQL_weight=0.5 asymmetry even when use_IQL=False.
+    iql_weight = config.IQL_weight if config.use_IQL else 0.5
     reformed = _reduce_value_logits(predictions, config)
-    error = reformed - targets
+    error = reformed - ensemble_targets
     positive = (error > 0.0).astype(jnp.float32)
-    iql_weight = 0.5
     weight = (1.0 - positive) * iql_weight + positive * (1.0 - iql_weight)
-    return weight * per_sample
+    return jnp.mean(weight * per_sample, axis=0)
 
 
 def reward_loss(
@@ -107,7 +110,7 @@ def continuous_policy_loss(
     candidates: jnp.ndarray | None = None,
     target_policy: jnp.ndarray | None = None,
     entropy_rng: jax.Array | None = None,
-    entropy_samples: int = 64,
+    entropy_samples: int = 1024,
 ) -> tuple[jnp.ndarray, jnp.ndarray]:
     """Squashed-Gaussian policy loss (Eq. 6 full pi or Eq. 7 simple pi).
 

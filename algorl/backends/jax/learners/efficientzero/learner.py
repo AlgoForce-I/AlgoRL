@@ -143,6 +143,11 @@ def _loss_from_batch(
         ) = step_inputs
 
         next_state = model.do_dynamics(params, state, action)
+        # HyperCEZ ``states.register_hook(grad * 0.5)``: the hook sits on the
+        # unrolled state tensor, so gradients from *every* consumer (reward,
+        # value, policy, projection, and the next dynamics step) are halved
+        # before flowing back through the dynamics network.
+        next_state = apply_half_gradient(next_state)
         value_prefix, next_reward_hidden = model.do_reward_prediction(
             params,
             next_state,
@@ -168,7 +173,6 @@ def _loss_from_batch(
         step_policy = step_policy * step_mask
         step_entropy = step_entropy * step_mask
 
-        next_state = apply_half_gradient(next_state)
         return (next_state, next_reward_hidden), {
             "consistency": step_consistency,
             "reward": step_reward,
@@ -277,6 +281,13 @@ class EfficientZeroLearner(Learner):
             raise NotImplementedError(
                 "EfficientZeroLearner discrete policy losses are not implemented yet."
             )
+        if self.config.value_prefix:
+            raise NotImplementedError(
+                "value_prefix=True (HyperCEZ reward-LSTM value prefix) is not "
+                "implemented: the LSTM hidden state is not carried through MCTS "
+                "or the learner unroll. Use per-step rewards (value_prefix=False), "
+                "as in the HyperCEZ DMC presets."
+            )
 
         self._rng_key = self.backend.random_key(self.config.seed + 2)
         # torch ``Adam(weight_decay=...)`` adds L2 to gradients before the Adam
@@ -332,6 +343,7 @@ class EfficientZeroLearner(Learner):
             self._opt_state,
             arrays,
             step_key,
+            jnp.asarray(self._learning_rate_scale(), dtype=jnp.float32),
         )
         self._sync_params()
         replay_buffer.update_priorities(
@@ -344,6 +356,17 @@ class EfficientZeroLearner(Learner):
             for key, value in metrics.items()
             if key != "priorities"
         }
+
+    def _learning_rate_scale(self) -> float:
+        """HyperCEZ ``adjust_lr``: linear warmup, then step decay (constant for
+        short runs since ``lr_decay_steps`` exceeds typical budgets)."""
+        total = max(1, self.config.total_training_steps)
+        warm_steps = int(total * self.config.lr_warm_up)
+        if warm_steps > 0 and self._train_steps < warm_steps:
+            return self._train_steps / warm_steps
+        decay_steps = max(1, self.config.lr_decay_steps)
+        exponent = (self._train_steps - warm_steps) // decay_steps
+        return float(self.config.lr_decay_rate**exponent)
 
     def _priority_beta(self) -> float:
         if not self.config.use_priority:
@@ -407,9 +430,19 @@ def _prepare_training_batch(
     on_reanalyze_progress: Callable[[int, int], None] | None = None,
 ) -> dict[str, jnp.ndarray]:
     arrays = _batch_to_arrays(batch)
+    window = config.unroll_steps + 1
     observations = np.asarray(batch.data["observations"], dtype=np.float32)
     rewards = np.asarray(batch.data["rewards"], dtype=np.float32)
     sample_indices = np.asarray(batch.data["indices"], dtype=np.int32)
+    batch_size = observations.shape[0]
+    valid_lengths = np.asarray(
+        batch.data.get("valid_lengths", np.full((batch_size,), observations.shape[1], dtype=np.int32)),
+        dtype=np.int32,
+    )
+    bootstrap_limits = np.asarray(
+        batch.data.get("bootstrap_limits", valid_lengths),
+        dtype=np.int32,
+    )
 
     def infer_values(obs: np.ndarray) -> np.ndarray:
         return batch_initial_values(
@@ -425,6 +458,8 @@ def _prepare_training_batch(
             observations,
             rewards,
             sample_indices,
+            valid_lengths=valid_lengths,
+            bootstrap_limits=bootstrap_limits,
             total_transitions=total_transitions,
             config=config,
             infer_values=infer_values,
@@ -434,11 +469,16 @@ def _prepare_training_batch(
             observations,
             rewards,
             sample_indices,
+            valid_lengths=valid_lengths,
+            bootstrap_limits=bootstrap_limits,
             total_transitions=total_transitions,
             config=config,
             infer_values=infer_values,
         )
 
+    # The unroll losses only consume the training window; the extended tail
+    # exists solely for full-horizon value targets above.
+    arrays["observations"] = arrays["observations"][:, :window]
     arrays["value_targets"] = jnp.asarray(bootstrapped, dtype=jnp.float32)
     arrays["search_values"] = jnp.asarray(batch.data["search_values"], dtype=jnp.float32)
 
@@ -448,7 +488,7 @@ def _prepare_training_batch(
         temperature = mcts_temperature(config, trained_steps)
         policy_targets, search_values, policy_candidates, best_actions = reanalyze_policy_batch(
             planner,
-            observations,
+            observations[:, :window],
             params=reanalyze_params,
             reanalyze_count=reanalyze_count,
             temperature=temperature,
@@ -515,6 +555,7 @@ def _optimizer_step(
     opt_state: optax.OptState,
     batch: dict[str, jnp.ndarray],
     rng: jax.Array,
+    lr_scale: jnp.ndarray,
     *,
     model: EfficientZeroNetwork,
     config: EfficientZeroConfig,
@@ -531,6 +572,9 @@ def _optimizer_step(
 
     (loss, metrics), grads = jax.value_and_grad(objective, has_aux=True)(params)
     updates, new_opt_state = optimizer.update(grads, opt_state, params)
+    # HyperCEZ mutates ``param_group['lr']`` per step; Adam updates scale
+    # linearly in the learning rate, so scaling the final update is identical.
+    updates = jax.tree.map(lambda update: update * lr_scale, updates)
     new_params = optax.apply_updates(params, updates)
     metrics = {**metrics, "loss": loss}
     return new_params, new_opt_state, metrics

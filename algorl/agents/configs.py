@@ -58,6 +58,11 @@ class EfficientZeroConfig(SearchAgentConfig):
     unroll_steps: int = 5
     trajectory_size: int = 100
     learning_rate: float = 3e-4
+    # HyperCEZ ``adjust_lr``: linear warmup over 1% of the online training steps
+    # (half the total gradient budget), then step decay every ``lr_decay_steps``.
+    lr_warm_up: float = 0.005
+    lr_decay_rate: float = 0.1
+    lr_decay_steps: int = 300_000
     weight_decay: float = 0.0
     reward_loss_coeff: float = 1.0
     value_loss_coeff: float = 0.5

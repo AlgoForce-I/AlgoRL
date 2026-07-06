@@ -208,6 +208,14 @@ class EfficientZeroPlanner(BatchedPlanner):
             self._jitted_search = None
             return
 
+        if self.config.value_prefix:
+            raise NotImplementedError(
+                "value_prefix=True (HyperCEZ reward-LSTM value prefix) is not "
+                "supported by the continuous MCTS: the LSTM hidden state is not "
+                "carried through the search tree. Use value_prefix=False, as in "
+                "the HyperCEZ DMC presets."
+            )
+
         self._recurrent_fn = make_model_continuous_recurrent_fn(
             self.model,
             config=self.search_config,

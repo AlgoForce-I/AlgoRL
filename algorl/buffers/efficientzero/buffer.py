@@ -11,6 +11,7 @@ import numpy as np
 from algorl.agents.configs import EfficientZeroConfig
 from algorl.buffers.efficientzero.targets import (
     bootstrapped_values,
+    extended_target_window,
     gae_values,
     mix_value_targets,
     trajectory_padding_gap,
@@ -50,10 +51,20 @@ class EfficientZeroStep:
 
 @dataclass
 class EfficientZeroTrajectory:
-    """Fixed-size trajectory block aligned with HyperCEZ ``GameTrajectory``."""
+    """Fixed-size trajectory block aligned with HyperCEZ ``GameTrajectory``.
+
+    ``core_len`` counts the block's own transitions (HyperCEZ ``len(traj)``);
+    steps past ``core_len`` are tail padding from the next block (``pad_over``)
+    used only as target context, never as sample positions. ``final_observation``
+    stores the observation after the last action for done-terminated blocks so
+    value bootstrapping can peek one step past the final transition, exactly as
+    HyperCEZ keeps ``obs_lst[traj_len]``.
+    """
 
     max_size: int
     steps: list[EfficientZeroStep] = field(default_factory=list)
+    core_len: int | None = None
+    final_observation: np.ndarray | None = None
     bootstrapped_values: np.ndarray | None = None
     gae_values: np.ndarray | None = None
 
@@ -67,6 +78,8 @@ class EfficientZeroTrajectory:
     def clear(self) -> list[EfficientZeroStep]:
         committed = self.steps
         self.steps = []
+        self.core_len = None
+        self.final_observation = None
         self.bootstrapped_values = None
         self.gae_values = None
         return committed
@@ -197,7 +210,10 @@ class EfficientZeroReplayBuffer(ReplayBuffer):
     def add(self, transition: Transition) -> None:
         step = step_from_transition(transition)
         if self._active.append(step):
-            self._commit_active(step.done)
+            final_observation = None
+            if step.done and transition.next_observation is not None:
+                final_observation = np.asarray(transition.next_observation, dtype=np.float32)
+            self._commit_active(step.done, final_observation=final_observation)
 
     def sample(
         self,
@@ -227,13 +243,16 @@ class EfficientZeroReplayBuffer(ReplayBuffer):
     def total_transitions(self) -> int:
         return len(self._lookup)
 
-    def _commit_active(self, done: bool) -> None:
+    def _commit_active(self, done: bool, *, final_observation: np.ndarray | None = None) -> None:
         steps = self._active.clear()
         if not steps:
             return
 
         current = EfficientZeroTrajectory(max_size=self.trajectory_size)
         current.steps = list(steps)
+        current.core_len = len(steps)
+        if done:
+            current.final_observation = final_observation
 
         if self._pending_commit is not None:
             gap = trajectory_padding_gap(self.config)
@@ -268,6 +287,7 @@ class EfficientZeroReplayBuffer(ReplayBuffer):
         traj_idx = self._base_traj_idx + len(self._stored_steps)
         self._stored_steps.append(steps)
         self._trajectories.append(traj_meta)
+        core_len = traj_meta.core_len if traj_meta.core_len is not None else len(steps)
         rewards = np.asarray([step.reward for step in steps], dtype=np.float32)
         pred_values = np.asarray([step.pred_value for step in steps], dtype=np.float32)
         bootstrapped = traj_meta.bootstrapped_values
@@ -284,7 +304,7 @@ class EfficientZeroReplayBuffer(ReplayBuffer):
         # priorities are refreshed once the samples pass through training.
         if self.config.use_priority:
             traj_priorities = (
-                np.abs(pred_values[: len(steps)] - np.asarray(bootstrapped[: len(steps)], dtype=np.float32))
+                np.abs(pred_values[:core_len] - np.asarray(bootstrapped[:core_len], dtype=np.float32))
                 + self.config.min_prior
             )
             max_prior = max(self._priorities) if self._priorities else 1.0
@@ -292,10 +312,12 @@ class EfficientZeroReplayBuffer(ReplayBuffer):
         else:
             new_priority = 1.0
 
-        for step_pos in range(len(steps)):
-            if step_pos + self.unroll_steps < len(steps):
-                self._lookup.append((traj_idx, step_pos))
-                self._priorities.append(new_priority)
+        # HyperCEZ ``save_trajectory``: every core transition is a valid sample
+        # position (tail padding is target context only); short windows near the
+        # trajectory end are handled by loss masks, not by dropping positions.
+        for step_pos in range(core_len):
+            self._lookup.append((traj_idx, step_pos))
+            self._priorities.append(new_priority)
 
         self._total_commits += 1
         self._trim_to_capacity()
@@ -330,6 +352,9 @@ class EfficientZeroReplayBuffer(ReplayBuffer):
 
     def _build_batch(self, indices: np.ndarray, *, trained_steps: int) -> Batch:
         window = self.unroll_steps + 1
+        # HyperCEZ computes value targets on the stored trajectory; expose the
+        # extra tail so every unroll position keeps its full TD / GAE horizon.
+        ext_window = max(window, extended_target_window(self.config))
         observations: list[np.ndarray] = []
         actions: list[np.ndarray] = []
         rewards: list[np.ndarray] = []
@@ -342,6 +367,8 @@ class EfficientZeroReplayBuffer(ReplayBuffer):
         dones: list[np.ndarray] = []
         masks: list[np.ndarray] = []
         mix_masks: list[np.ndarray] = []
+        valid_lengths: list[int] = []
+        bootstrap_limits: list[int] = []
         sample_indices: list[int] = []
         weights: list[float] = []
 
@@ -349,40 +376,93 @@ class EfficientZeroReplayBuffer(ReplayBuffer):
             traj_idx, step_idx = self._lookup[int(flat_index)]
             traj_steps = self._stored_steps[traj_idx - self._base_traj_idx]
             traj_meta = self._trajectories[traj_idx - self._base_traj_idx]
-            end = step_idx + window
-            if end > len(traj_steps):
+            core_len = traj_meta.core_len if traj_meta.core_len is not None else len(traj_steps)
+            if step_idx >= core_len:
                 raise RuntimeError(
                     "Invalid replay lookup while sampling an unroll window. "
-                    f"traj_len={len(traj_steps)}, step_idx={step_idx}, window={window}."
+                    f"core_len={core_len}, step_idx={step_idx}."
                 )
+            valid_len = core_len - step_idx
 
-            chunk = traj_steps[step_idx:end]
-            observations.append(
-                np.stack([step.observation for step in chunk], axis=0).astype(np.float32)
-            )
-            actions.append(
-                np.stack([step.action for step in chunk[:-1]], axis=0).astype(np.float32)
-            )
-            rewards.append(np.asarray([step.reward for step in chunk], dtype=np.float32))
-            policy_targets.append(
-                np.stack([step.policy_target for step in chunk], axis=0).astype(np.float32)
-            )
-            pred_values.append(
-                np.asarray([step.pred_value for step in chunk], dtype=np.float32)
-            )
-            search_values.append(
-                np.asarray([step.search_value for step in chunk], dtype=np.float32)
-            )
-            dones.append(np.asarray([step.done for step in chunk], dtype=np.bool_))
+            chunk = traj_steps[step_idx : step_idx + ext_window]
+
+            # --- extended observation / reward context (zero-padded past data) ---
+            obs_rows = [step.observation.astype(np.float32) for step in chunk]
+            has_terminal_obs = False
+            if (
+                len(obs_rows) < ext_window
+                and step_idx + len(chunk) == len(traj_steps)
+                and traj_meta.final_observation is not None
+            ):
+                obs_rows.append(traj_meta.final_observation.astype(np.float32))
+                has_terminal_obs = True
+            while len(obs_rows) < ext_window:
+                # HyperCEZ ``get_index_stacked_obs(padding=True)`` repeats the
+                # last frame; padded positions are masked in every loss/target.
+                obs_rows.append(obs_rows[-1])
+            observations.append(np.stack(obs_rows[:ext_window], axis=0))
+
+            reward_row = np.zeros((ext_window,), dtype=np.float32)
+            reward_row[: len(chunk)] = [step.reward for step in chunk]
+            rewards.append(reward_row)
+
+            # Observation one step past the last core transition: available from
+            # tail padding or the stored terminal observation (HyperCEZ always
+            # has ``obs_lst[traj_len]``, so ``bootstrap_index <= traj_len``).
+            if len(chunk) > valid_len or (len(chunk) == valid_len and has_terminal_obs):
+                bootstrap_limit = valid_len
+            else:
+                bootstrap_limit = valid_len - 1
+            valid_lengths.append(valid_len)
+            bootstrap_limits.append(bootstrap_limit)
+
+            # --- training window tensors (zero-padded past trajectory end) ---
+            window_chunk = chunk[:window]
+            n_window = len(window_chunk)
+
+            action_row = np.zeros((self.unroll_steps, window_chunk[0].action.shape[0]), dtype=np.float32)
+            for k, step in enumerate(chunk[: self.unroll_steps]):
+                action_row[k] = step.action
+            actions.append(action_row)
+
+            policy_row = np.zeros((window, window_chunk[0].policy_target.shape[0]), dtype=np.float32)
+            pred_row = np.zeros((window,), dtype=np.float32)
+            search_row = np.zeros((window,), dtype=np.float32)
+            done_row = np.zeros((window,), dtype=np.bool_)
+            best_row = np.zeros((window, window_chunk[0].best_action.shape[0]), dtype=np.float32)
+            for k, step in enumerate(window_chunk):
+                policy_row[k] = step.policy_target
+                pred_row[k] = step.pred_value
+                search_row[k] = step.search_value
+                done_row[k] = step.done
+                best_row[k] = step.best_action
+            for k in range(n_window, window):
+                best_row[k] = best_row[n_window - 1]
+            policy_targets.append(policy_row)
+            pred_values.append(pred_row)
+            search_values.append(search_row)
+            dones.append(done_row)
+            best_actions.append(best_row)
+
+            candidates = self._stack_candidates(window_chunk)
+            if candidates.shape[0] < window:
+                pad = np.repeat(candidates[-1:], window - candidates.shape[0], axis=0)
+                candidates = np.concatenate([candidates, pad], axis=0)
+            policy_candidates.append(candidates)
 
             if traj_meta.gae_values is not None:
-                bootstrapped = traj_meta.gae_values[step_idx:end]
+                stored = traj_meta.gae_values
             elif traj_meta.bootstrapped_values is not None:
-                bootstrapped = traj_meta.bootstrapped_values[step_idx:end]
+                stored = traj_meta.bootstrapped_values
             else:
-                bootstrapped = pred_values[-1]
+                stored = pred_row
+            bootstrapped = np.zeros((window,), dtype=np.float32)
+            source = np.asarray(stored, dtype=np.float32)[step_idx : step_idx + window]
+            bootstrapped[: source.shape[0]] = source
+            if 0 < source.shape[0] < window:
+                bootstrapped[source.shape[0] :] = source[-1]
 
-            search = search_values[-1]
+            search = search_row
             if self.config.value_target == "search":
                 targets = search
                 mix_mask = np.zeros((window,), dtype=np.float32)
@@ -396,19 +476,10 @@ class EfficientZeroReplayBuffer(ReplayBuffer):
             value_targets.append(np.asarray(targets, dtype=np.float32))
             mix_masks.append(mix_mask)
 
-            candidates = self._stack_candidates(chunk)
-            policy_candidates.append(candidates)
-            best_actions.append(
-                np.stack([step.best_action for step in chunk], axis=0).astype(np.float32)
-            )
-
-            valid_steps = min(self.unroll_steps, len(chunk) - 1)
+            # HyperCEZ ``make_batch``: unroll step k is trained only when the
+            # *next* position (its targets) is still inside the trajectory.
             mask = np.zeros((self.unroll_steps,), dtype=np.float32)
-            mask[:valid_steps] = 1.0
-            for step_i in range(valid_steps):
-                if chunk[step_i].done:
-                    mask[step_i:] = 0.0
-                    break
+            mask[: max(0, min(self.unroll_steps, valid_len - 1))] = 1.0
             masks.append(mask)
             sample_indices.append(int(flat_index))
             if hasattr(self, "_last_weights"):
@@ -429,6 +500,8 @@ class EfficientZeroReplayBuffer(ReplayBuffer):
             "dones": np.stack(dones, axis=0),
             "masks": np.stack(masks, axis=0),
             "mix_masks": np.stack(mix_masks, axis=0),
+            "valid_lengths": np.asarray(valid_lengths, dtype=np.int32),
+            "bootstrap_limits": np.asarray(bootstrap_limits, dtype=np.int32),
             "indices": np.asarray(sample_indices, dtype=np.int32),
             "weights": np.asarray(weights, dtype=np.float32),
         }

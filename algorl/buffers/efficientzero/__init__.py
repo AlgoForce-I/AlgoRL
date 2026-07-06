@@ -21,9 +21,12 @@ from algorl.buffers.efficientzero.schedule import (
 from algorl.buffers.efficientzero.targets import (
     adaptive_td_steps,
     bootstrapped_values,
+    extended_target_window,
+    gae_extra_steps,
     gae_values,
     mix_value_targets,
     prepare_bootstrapped_batch_values,
+    prepare_gae_batch_values,
     trajectory_padding_gap,
 )
 
@@ -39,9 +42,12 @@ __all__ = [
     "EfficientZeroTrajectory",
     "adaptive_td_steps",
     "bootstrapped_values",
+    "extended_target_window",
+    "gae_extra_steps",
     "gae_values",
     "mix_value_targets",
     "prepare_bootstrapped_batch_values",
+    "prepare_gae_batch_values",
     "trajectory_padding_gap",
     "estimate_gradient_step_budget",
     "resolve_efficient_zero_schedule",
