@@ -1,4 +1,4 @@
-"""Flax building blocks for EfficientZero subnetworks (HyperCEZ-aligned)."""
+"""Flax building blocks for EfficientZero subnetworks (EfficientZero-V2-aligned)."""
 
 from __future__ import annotations
 
@@ -56,7 +56,7 @@ class HyperMLP(nn.Module):
 
 
 class ImproveResidualBlock(nn.Module):
-    """Pre-LN residual block from HyperCEZ ``alt_model``."""
+    """Pre-LN residual block for vector models."""
 
     hidden_shape: int
     block_shape: int
@@ -86,7 +86,7 @@ def _to_nchw(x: jnp.ndarray) -> jnp.ndarray:
         return jnp.transpose(x, (0, 3, 1, 2))
     return x
 class ConvResBlock(nn.Module):
-    """Post-activation residual block from HyperCEZ ``base_model``."""
+    """Post-activation residual block for image models."""
 
     channels: int
 
@@ -103,7 +103,7 @@ class ConvResBlock(nn.Module):
 
 
 class DownSample(nn.Module):
-    """HyperCEZ downsampling tower (approx. /16 spatial reduction)."""
+    """EfficientZero-V2 downsampling tower (approx. /16 spatial reduction)."""
 
     out_channels: int
 
@@ -127,7 +127,7 @@ class DownSample(nn.Module):
 
 
 class VectorRepresentationNetwork(nn.Module):
-    """HyperCEZ ``AltRepresentationNetwork`` with online observation normalization."""
+    """Vector representation network with online observation normalization."""
 
     obs_dim: int
     n_stack: int
@@ -160,7 +160,7 @@ class VectorRepresentationNetwork(nn.Module):
 
 
 class VectorDynamicsNetwork(nn.Module):
-    """HyperCEZ ``AltDynamicsNetwork``."""
+    """Vector dynamics network."""
 
     hidden_shape: int
     action_dim: int
@@ -192,7 +192,7 @@ class VectorDynamicsNetwork(nn.Module):
 
 
 class VectorValuePolicyNetwork(nn.Module):
-    """HyperCEZ ``AltValuePolicyNetwork``."""
+    """Vector value-policy network."""
 
     hidden_shape: int
     val_net_shape: Sequence[int]
@@ -240,7 +240,7 @@ class VectorValuePolicyNetwork(nn.Module):
 
 
 class VectorRewardNetwork(nn.Module):
-    """HyperCEZ ``AltRewardNetwork``."""
+    """Vector reward network."""
 
     hidden_shape: int
     rew_net_shape: Sequence[int]
@@ -260,7 +260,7 @@ class VectorRewardNetwork(nn.Module):
 
 
 class VectorRewardLSTMNetwork(nn.Module):
-    """HyperCEZ ``AltRewardNetworkLSTM``."""
+    """Vector reward LSTM network."""
 
     hidden_shape: int
     rew_net_shape: Sequence[int]
@@ -323,7 +323,7 @@ class VectorProjectionHeadNetwork(nn.Module):
 
 
 class ConvRepresentationNetwork(nn.Module):
-    """HyperCEZ ``BaseRepresentationNetwork``."""
+    """Image representation network."""
 
     input_shape: tuple[int, int, int]
     num_blocks: int
@@ -345,7 +345,7 @@ class ConvRepresentationNetwork(nn.Module):
 
 
 class ConvDynamicsNetwork(nn.Module):
-    """HyperCEZ ``BaseDynamicsNetwork``."""
+    """Image dynamics network."""
 
     num_blocks: int
     num_channels: int
@@ -387,7 +387,7 @@ class ConvDynamicsNetwork(nn.Module):
 
 
 class ConvValuePolicyNetwork(nn.Module):
-    """HyperCEZ ``BaseValuePolicyNetwork``."""
+    """Image value-policy network."""
 
     num_blocks: int
     num_channels: int
@@ -527,7 +527,7 @@ class ConvSupportLSTMNetwork(nn.Module):
 
 
 class DenseProjectionNetwork(nn.Module):
-    """HyperCEZ ``BaseProjectionNetwork`` (image models)."""
+    """Image projection network."""
 
     state_dim: int
     hidden_dim: int
@@ -549,7 +549,7 @@ class DenseProjectionNetwork(nn.Module):
 
 
 class DenseProjectionHeadNetwork(nn.Module):
-    """HyperCEZ ``BaseProjectionHeadNetwork``."""
+    """Image projection head network."""
 
     in_dim: int
     hidden_dim: int

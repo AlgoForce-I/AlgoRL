@@ -41,7 +41,7 @@ def _num_actions_from_space(space: gym.Space) -> int:
 
 
 def _action_dim_from_space(space: gym.Space) -> int:
-    """HyperCEZ ``control_dim``: scalar discrete action or continuous vector size."""
+    """Scalar discrete action count or continuous action dimension."""
     if isinstance(space, gym.spaces.Discrete):
         return 1
     if isinstance(space, gym.spaces.Box):

@@ -8,7 +8,7 @@ from algorl.buffers.efficientzero.schedule import (
 )
 
 
-def test_dmc_state_schedule_ratios_match_hypercez_alt2() -> None:
+def test_dmc_state_schedule_ratios() -> None:
     config = EfficientZeroConfig.for_dmc_state(model_type="dmc_state")
     ratios = schedule_ratios(config)
     assert ratios["mix_start"] == 0.4

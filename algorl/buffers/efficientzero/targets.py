@@ -15,7 +15,7 @@ def bootstrapped_values(
     td_steps: int,
     episodic: bool = False,
 ) -> np.ndarray:
-    """HyperCEZ ``GameTrajectory.get_bootstrapped_value`` for vector trajectories."""
+    """N-step bootstrapped value targets for vector trajectories."""
     traj_len = int(rewards.shape[0])
     bt_values = np.zeros((traj_len,), dtype=np.float32)
     td_steps = max(1, int(td_steps))
@@ -50,7 +50,7 @@ def gae_values(
     collected_transitions: int | None = None,
     auto_td_steps: int = 30_000,
 ) -> np.ndarray:
-    """HyperCEZ ``GameTrajectory.get_gae_value`` (scalar trajectory)."""
+    """GAE value targets for a scalar trajectory."""
     traj_len = int(rewards.shape[0])
     if traj_len == 0:
         return np.zeros((0,), dtype=np.float32)
@@ -106,7 +106,7 @@ def mix_value_targets(
     *,
     use_search_mask: np.ndarray,
 ) -> np.ndarray:
-    """Blend bootstrapped and search targets (HyperCEZ ``mixed`` value target)."""
+    """Blend bootstrapped and search value targets."""
     mask = use_search_mask.astype(np.float32)
     return bootstrapped * mask + search * (1.0 - mask)
 
@@ -123,7 +123,7 @@ def adaptive_td_steps(
 
 
 def gae_extra_steps(config: object) -> int:
-    """HyperCEZ GAE lookahead beyond the unroll window (``extra`` in ``prepare_reward_value_gae``)."""
+    """GAE lookahead beyond the unroll window."""
     from algorl.agents.configs import EfficientZeroConfig
 
     if not isinstance(config, EfficientZeroConfig):
@@ -140,7 +140,7 @@ def gae_extra_steps(config: object) -> int:
 
 
 def trajectory_padding_gap(config: object) -> int:
-    """Steps of tail context to pad across trajectory blocks (HyperCEZ ``gap_step``)."""
+    """Tail context length when padding trajectory blocks."""
     from algorl.agents.configs import EfficientZeroConfig
 
     if not isinstance(config, EfficientZeroConfig):
@@ -153,7 +153,7 @@ def trajectory_padding_gap(config: object) -> int:
 def extended_target_window(config: object) -> int:
     """Observation/reward window needed for full-horizon value targets.
 
-    HyperCEZ computes value targets on the stored trajectory, so every unroll
+    EfficientZero-V2 computes value targets on the stored trajectory, so every unroll
     position can bootstrap ``td_steps`` (or GAE ``extra + 1``) transitions ahead.
     The replay buffer must therefore expose that many steps beyond the
     ``unroll_steps + 1`` training window.
@@ -178,12 +178,9 @@ def prepare_bootstrapped_batch_values(
     config: object,
     infer_values: Callable[[np.ndarray], np.ndarray],
 ) -> np.ndarray:
-    """HyperCEZ ``prepare_reward_value`` targets for a sampled training batch.
+    """Bootstrapped value targets for a sampled training batch.
 
-    ``observations``/``rewards`` cover the extended window
-    (:func:`extended_target_window`); ``valid_lengths[b]`` is the number of core
-    trajectory transitions remaining from the sampled position (HyperCEZ
-    ``traj_len - state_index``), which caps the TD horizon near trajectory ends.
+    ``valid_lengths`` caps the TD horizon near trajectory ends.
     """
     from algorl.agents.configs import EfficientZeroConfig
 
@@ -209,7 +206,7 @@ def prepare_bootstrapped_batch_values(
         sample_index = int(sample_indices[batch_index])
 
         # Off-policy correction: shorter horizon of td steps. Disabled for
-        # ``mixed``/``max`` value targets, exactly as in HyperCEZ.
+        # ``mixed``/``max`` value targets, exactly as in EfficientZero-V2.
         if config.value_target in ("mixed", "max"):
             td_steps = config.td_steps
         else:
@@ -250,7 +247,7 @@ def prepare_gae_batch_values(
     config: object,
     infer_values: Callable[[np.ndarray], np.ndarray],
 ) -> np.ndarray:
-    """GAE value targets with fresh reanalyze-model inference (HyperCEZ ``prepare_reward_value_gae``)."""
+    """GAE value targets with fresh reanalyze-model inference."""
     from algorl.agents.configs import EfficientZeroConfig
 
     if not isinstance(config, EfficientZeroConfig):
@@ -276,7 +273,7 @@ def prepare_gae_batch_values(
         limit = int(bootstrap_limits[batch_index])
         sample_index = int(sample_indices[batch_index])
 
-        # HyperCEZ checks ``model["value_target"]`` (never 'mixed'/'max') here,
+        # EfficientZero-V2 checks ``model["value_target"]`` (never 'mixed'/'max') here,
         # so the lambda age-decay is always active on the GAE path.
         delta_lambda = 0.1 * (total_transitions - sample_index) / float(config.auto_td_steps)
         td_lambda = float(np.clip(config.td_lambda - delta_lambda, 0.65, config.td_lambda))

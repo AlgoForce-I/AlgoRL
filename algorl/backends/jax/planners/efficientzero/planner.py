@@ -120,7 +120,7 @@ def uses_continuous_search(
 ) -> bool:
     """Return whether planning should use candidate-set ``search_continuous``.
 
-    HyperCEZ routes Atari through discrete Gumbel ``search``; DMC uses
+    EfficientZero-V2 routes Atari through discrete Gumbel ``search``; DMC uses
     ``search_continuous``. ``config.use_gumbel`` applies only to the discrete path.
     """
     model_type = config.model_type
@@ -142,7 +142,7 @@ def continuous_search_config_from_agent(
 ) -> ContinuousSearchConfig:
     """Map agent hyperparameters to :class:`ContinuousSearchConfig`.
 
-    Continuous search never enables gumbel halving noise (HyperCEZ
+    Continuous search never enables gumbel halving noise (EfficientZero-V2
     ``use_gumble_noise=False``). Root exploration uses ``add_noise`` at build time.
     ``config.use_gumbel`` is reserved for the discrete Atari search path.
     """
@@ -210,10 +210,10 @@ class EfficientZeroPlanner(BatchedPlanner):
 
         if self.config.value_prefix:
             raise NotImplementedError(
-                "value_prefix=True (HyperCEZ reward-LSTM value prefix) is not "
+                "value_prefix=True (reward-LSTM value prefix) is not "
                 "supported by the continuous MCTS: the LSTM hidden state is not "
-                "carried through the search tree. Use value_prefix=False, as in "
-                "the HyperCEZ DMC presets."
+                "carried through the search tree. Use value_prefix=False for "
+                "vector-control presets."
             )
 
         self._recurrent_fn = make_model_continuous_recurrent_fn(
@@ -342,7 +342,7 @@ class EfficientZeroPlanner(BatchedPlanner):
             "EfficientZeroPlanner currently implements candidate-set search_continuous "
             f"for continuous-control presets only. Model type "
             f"{self.world_model.resolved_model_type!r} requires discrete Gumbel search "
-            "(HyperCEZ ``mcts.search``), which is not wired yet."
+            "requires discrete Gumbel search, which is not wired yet."
         )
 
     @staticmethod

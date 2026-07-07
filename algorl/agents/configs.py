@@ -45,10 +45,11 @@ class SearchAgentConfig(BaseAgentConfig):
 
 @dataclass(frozen=True)
 class EfficientZeroConfig(SearchAgentConfig):
-    """EfficientZero settings aligned with HyperCEZ ``ez_hparams.json`` presets.
+    """EfficientZero-V2 hyperparameters.
 
-    Use :meth:`for_atari`, :meth:`for_dmc_image`, or :meth:`for_dmc_state` to load
-    the ``alt0`` / ``alt1`` / ``alt2`` architecture bundles from HyperCEZ.
+    Use :meth:`for_sequential` or :meth:`for_batched` for the common training
+    layouts. Lower-level presets (:meth:`for_dmc_state`, :meth:`for_atari`, …)
+    target specific observation modalities.
     """
 
     reanalyze_ratio: float = 0.5
@@ -58,8 +59,6 @@ class EfficientZeroConfig(SearchAgentConfig):
     unroll_steps: int = 5
     trajectory_size: int = 100
     learning_rate: float = 3e-4
-    # HyperCEZ ``adjust_lr``: linear warmup over 1% of the online training steps
-    # (half the total gradient budget), then step decay every ``lr_decay_steps``.
     lr_warm_up: float = 0.005
     lr_decay_rate: float = 0.1
     lr_decay_steps: int = 300_000
@@ -154,8 +153,57 @@ class EfficientZeroConfig(SearchAgentConfig):
         )
 
     @classmethod
+    def for_sequential(cls, **overrides: object) -> EfficientZeroConfig:
+        """Single-env vector control (Gymnasium / DMC state).
+
+        Rollout MCTS uses ``search_batch_size=1``; training-time reanalyze
+        batches ``reanalyze_search_batch_size`` roots per JIT search.
+        """
+        config = cls.for_dmc_state(
+            search_batch_size=1,
+            reanalyze_search_batch_size=2048,
+            jax_rollout_chunk=10,
+            gradient_steps_per_rollout=1,
+            batch_size=256,
+            reanalyze_ratio=1.0,
+            seed=42,
+            learning_starts=2_000,
+        )
+        return config.with_overrides(**overrides) if overrides else config
+
+    @classmethod
+    def for_batched(
+        cls,
+        *,
+        num_envs: int,
+        **overrides: object,
+    ) -> EfficientZeroConfig:
+        """Parallel vector-control envs with wide rollout MCTS.
+
+        ``jax_rollout_chunk`` is chosen so ``chunk * num_envs`` matches
+        ``dynamics_update_every`` (one learner update per rollout chunk).
+        """
+        dynamics_every = 10
+        if overrides and "dynamics_update_every" in overrides:
+            dynamics_every = int(overrides["dynamics_update_every"])  # type: ignore[arg-type]
+        rollout_chunk = max(1, dynamics_every // max(1, num_envs))
+        config = cls.for_dmc_state(
+            batch_size=256,
+            mcts_simulations=32,
+            jax_rollout_chunk=rollout_chunk,
+            search_batch_size=num_envs,
+            reanalyze_ratio=1.0,
+            gradient_steps_per_rollout=1,
+            dynamics_update_every=dynamics_every,
+            seed=0,
+            buffer_capacity=10_000,
+            learning_starts=1_000,
+        )
+        return config.with_overrides(**overrides) if overrides else config
+
+    @classmethod
     def for_atari(cls, **overrides: object) -> EfficientZeroConfig:
-        """HyperCEZ ``alt0`` preset (``AgentType.ATARI``)."""
+        """EfficientZero-V2 Atari preset (discrete actions, image observations)."""
         config = cls(
             model_type="atari",
             value_prefix=True,
@@ -177,7 +225,7 @@ class EfficientZeroConfig(SearchAgentConfig):
 
     @classmethod
     def for_dmc_image(cls, **overrides: object) -> EfficientZeroConfig:
-        """HyperCEZ ``alt1`` preset (``AgentType.DMC_IMAGE``)."""
+        """EfficientZero-V2 DMC image preset."""
         config = cls(
             model_type="dmc_image",
             value_prefix=False,
@@ -198,7 +246,7 @@ class EfficientZeroConfig(SearchAgentConfig):
 
     @classmethod
     def for_dmc_state(cls, **overrides: object) -> EfficientZeroConfig:
-        """HyperCEZ ``alt2`` preset (``AgentType.DMC_STATE``)."""
+        """EfficientZero-V2 vector-control base preset."""
         config = cls(
             model_type="dmc_state",
             value_prefix=False,
@@ -254,26 +302,8 @@ class EfficientZeroConfig(SearchAgentConfig):
         num_envs: int,
         **overrides: object,
     ) -> EfficientZeroConfig:
-        """Balanced batched continual-learning preset (HyperCEZ-style cadence).
-
-        Collects ``jax_rollout_chunk * num_envs`` env steps in parallel, then runs
-        one learner update per rollout chunk. ``jax_rollout_chunk`` is chosen so
-        ``chunk * num_envs ≈ dynamics_update_every`` (HyperCEZ trainer cadence).
-        """
-        dynamics_every = 10
-        if overrides and "dynamics_update_every" in overrides:
-            dynamics_every = int(overrides["dynamics_update_every"])  # type: ignore[arg-type]
-        rollout_chunk = max(1, dynamics_every // max(1, num_envs))
-        config = cls.for_dmc_state(
-            batch_size=256,
-            mcts_simulations=32,
-            jax_rollout_chunk=rollout_chunk,
-            search_batch_size=num_envs,
-            reanalyze_ratio=1.0,
-            gradient_steps_per_rollout=1,
-            dynamics_update_every=dynamics_every,
-        )
-        return config.with_overrides(**overrides) if overrides else config
+        """Alias for :meth:`for_batched`."""
+        return cls.for_batched(num_envs=num_envs, **overrides)
 
     @classmethod
     def for_dmc_state_batched_cl_gpu(
@@ -282,51 +312,20 @@ class EfficientZeroConfig(SearchAgentConfig):
         num_envs: int,
         **overrides: object,
     ) -> EfficientZeroConfig:
-        """GPU-friendly batched CW preset with full env/MCTS parallelism.
-
-        Keeps ``search_batch_size=num_envs`` and rollout chunk size at the balanced
-        preset so you can run 32 (or more) parallel actors and wide JIT MCTS.
-        Memory is saved on the learner side (smaller replay batch, partial reanalyze)
-        and by dropping MCTS trees after each search (see planner/training loop).
-        """
-        config = cls.for_dmc_state_batched_cl(
-            num_envs=num_envs,
-            batch_size=128,
-            reanalyze_ratio=0.5,
-            gradient_steps_per_rollout=1,
-            dynamics_update_every=10,
-        )
-        return config.with_overrides(**overrides) if overrides else config
+        """Alias for :meth:`for_batched`."""
+        return cls.for_batched(num_envs=num_envs, **overrides)
 
     @classmethod
     def for_dmc_state_sequential_gpu(
         cls,
-        *,
-        reanalyze_search_batch_size: int = 128,
         **overrides: object,
     ) -> EfficientZeroConfig:
-        """Single-env Gymnasium/DMC preset with wide reanalyze MCTS batches.
-
-        Rollout MCTS stays at ``search_batch_size=1`` while reanalyze runs
-        ``reanalyze_search_batch_size`` roots per JIT search (HyperCEZ batches
-        all reanalyze roots; this exposes that knob without batched env rollouts).
-        """
-        config = cls.for_dmc_state(
-            search_batch_size=1,
-            reanalyze_search_batch_size=reanalyze_search_batch_size,
-            jax_rollout_chunk=10,
-            gradient_steps_per_rollout=1,
-        )
-        return config.with_overrides(**overrides) if overrides else config
+        """Alias for :meth:`for_sequential`."""
+        return cls.for_sequential(**overrides)
 
     @classmethod
     def for_dmc_state_throughput(cls, **overrides: object) -> EfficientZeroConfig:
-        """HyperCEZ ``alt2`` preset tuned for maximum JAX throughput.
-
-        Uses larger learner batches and HyperCEZ simulation count. Reanalyze is
-        disabled by default because training-time reanalyze is a sequential
-        Python loop outside the JIT-compiled planner/learner path.
-        """
+        """Vector-control preset tuned for maximum JAX throughput (no reanalyze)."""
         config = cls.for_dmc_state(
             reanalyze_ratio=0.0,
             batch_size=256,

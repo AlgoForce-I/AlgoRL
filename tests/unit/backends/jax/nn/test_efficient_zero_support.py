@@ -36,7 +36,7 @@ def test_support_round_trip_is_close(
   np.testing.assert_allclose(np.asarray(decoded), np.asarray(values), rtol=0.05, atol=0.15)
 
 
-def test_buffer_priority_zeroing_matches_hypercez_window() -> None:
+def test_buffer_priority_zeroing_matches_efficientzero_v2_window() -> None:
     from algorl.agents.configs import EfficientZeroConfig
     from algorl.buffers.efficientzero import EfficientZeroReplayBuffer
     from algorl.core.types import Transition

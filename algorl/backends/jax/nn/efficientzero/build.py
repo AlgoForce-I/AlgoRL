@@ -33,7 +33,7 @@ from algorl.backends.jax.nn.efficientzero.model import EfficientZero
 
 
 def infer_model_type(observation_shape: int | tuple[int, ...]) -> str:
-    """Infer HyperCEZ model family from observation dimensionality."""
+    """Infer EfficientZero-V2 model family from observation dimensionality."""
     if isinstance(observation_shape, int) or len(observation_shape) == 1:
         return "dmc_state"
     if len(observation_shape) == 3:
@@ -263,7 +263,7 @@ def build_efficient_zero_model(
     *,
     action_dim: int | None = None,
 ) -> EfficientZero:
-    """Build an EfficientZero model using the HyperCEZ ``EZAgent`` layout."""
+    """Build an EfficientZero-V2 model."""
     resolved_action_dim = action_dim if action_dim is not None else num_actions
     model_type = config.model_type
     if model_type == "auto":

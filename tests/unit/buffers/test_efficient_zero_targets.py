@@ -32,12 +32,12 @@ def test_mix_value_targets_blends_search_and_bootstrapped() -> None:
 
 
 def test_prepare_bootstrapped_values_uses_full_td_horizon_at_every_position() -> None:
-    """Regression: HyperCEZ bootstraps ``td_steps`` beyond the unroll window."""
+    """Bootstrapped targets use the full TD horizon beyond the unroll window."""
     config = EfficientZeroConfig(
         unroll_steps=2,
         td_steps=3,
         discount=0.9,
-        value_target="mixed",  # disables the off-policy td shrink, as in HyperCEZ
+        value_target="mixed",  # disables off-policy TD shrink for mixed/max value targets
         model_value_target="bootstrapped",
     )
     ext_window = extended_target_window(config)

@@ -1,4 +1,4 @@
-"""DMC categorical support encoding/decoding (HyperCEZ ``DiscreteSupport``)."""
+"""DMC categorical support encoding and decoding."""
 
 from __future__ import annotations
 
@@ -9,7 +9,7 @@ _SUPPORT_EPSILON = 0.001
 
 
 def dmc_transform(x: jnp.ndarray) -> jnp.ndarray:
-    """HyperCEZ ``transform_one`` for DMC/Gym scalar support."""
+    """DMC/Gym scalar support transform."""
     sign = jnp.where(x < 0.0, -1.0, 1.0)
     return sign * (jnp.sqrt(jnp.abs(x) + 1.0) - 1.0) + _SUPPORT_EPSILON * x
 
@@ -88,7 +88,7 @@ def vector_to_scalar(
     support_bins: int,
     support_range: tuple[float, float],
 ) -> jnp.ndarray:
-    """Decode value/reward logits to scalars (HyperCEZ DMC ``vector_to_scalar``)."""
+    """Decode value/reward logits to scalars (EfficientZero-V2 DMC ``vector_to_scalar``)."""
     if support_type not in {"symlog", "support", "discrete"}:
         raise ValueError(f"Unknown support type {support_type!r}")
 

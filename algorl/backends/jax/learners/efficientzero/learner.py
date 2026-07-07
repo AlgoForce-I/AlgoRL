@@ -1,4 +1,4 @@
-"""EfficientZero learner with HyperCEZ sample-efficiency features."""
+"""EfficientZero-V2 learner."""
 
 from __future__ import annotations
 
@@ -143,10 +143,7 @@ def _loss_from_batch(
         ) = step_inputs
 
         next_state = model.do_dynamics(params, state, action)
-        # HyperCEZ ``states.register_hook(grad * 0.5)``: the hook sits on the
-        # unrolled state tensor, so gradients from *every* consumer (reward,
-        # value, policy, projection, and the next dynamics step) are halved
-        # before flowing back through the dynamics network.
+        # Halve gradients on the unrolled state (reward, value, policy, projection, dynamics).
         next_state = apply_half_gradient(next_state)
         value_prefix, next_reward_hidden = model.do_reward_prediction(
             params,
@@ -223,10 +220,10 @@ def _loss_from_batch(
         - entropy_total * config.entropy_coeff
     )
     weighted = total * weights
-    # HyperCEZ: ``(weights * loss).mean()`` with a 1/unroll_steps gradient hook.
+    # EfficientZero-V2: ``(weights * loss).mean()`` with a 1/unroll_steps gradient hook.
     loss = jnp.mean(weighted) / float(unroll_steps)
 
-    # HyperCEZ fresh priority: |min-ensemble value - target| on the first step,
+    # EfficientZero-V2 fresh priority: |min-ensemble value - target| on the first step,
     # clipped to [0, 1e5] for continuous control.
     pred_priority_values = pred_scalars
     if pred_priority_values.ndim == 2:
@@ -248,7 +245,7 @@ def _loss_from_batch(
 
 
 class EfficientZeroLearner(Learner):
-    """HyperCEZ-style EfficientZero learner with reanalyze and priority replay."""
+    """EfficientZero-V2 EfficientZero learner with reanalyze and priority replay."""
 
     def __init__(self, context: ComponentContext) -> None:
         if not isinstance(context.config, EfficientZeroConfig):
@@ -283,10 +280,9 @@ class EfficientZeroLearner(Learner):
             )
         if self.config.value_prefix:
             raise NotImplementedError(
-                "value_prefix=True (HyperCEZ reward-LSTM value prefix) is not "
+                "value_prefix=True (reward-LSTM value prefix) is not "
                 "implemented: the LSTM hidden state is not carried through MCTS "
-                "or the learner unroll. Use per-step rewards (value_prefix=False), "
-                "as in the HyperCEZ DMC presets."
+                "or the learner unroll. Use value_prefix=False for vector-control."
             )
 
         self._rng_key = self.backend.random_key(self.config.seed + 2)
@@ -358,8 +354,7 @@ class EfficientZeroLearner(Learner):
         }
 
     def _learning_rate_scale(self) -> float:
-        """HyperCEZ ``adjust_lr``: linear warmup, then step decay (constant for
-        short runs since ``lr_decay_steps`` exceeds typical budgets)."""
+        """Linear LR warmup, then step decay."""
         total = max(1, self.config.total_training_steps)
         warm_steps = int(total * self.config.lr_warm_up)
         if warm_steps > 0 and self._train_steps < warm_steps:
@@ -572,7 +567,7 @@ def _optimizer_step(
 
     (loss, metrics), grads = jax.value_and_grad(objective, has_aux=True)(params)
     updates, new_opt_state = optimizer.update(grads, opt_state, params)
-    # HyperCEZ mutates ``param_group['lr']`` per step; Adam updates scale
+    # EfficientZero-V2 mutates ``param_group['lr']`` per step; Adam updates scale
     # linearly in the learning rate, so scaling the final update is identical.
     updates = jax.tree.map(lambda update: update * lr_scale, updates)
     new_params = optax.apply_updates(params, updates)

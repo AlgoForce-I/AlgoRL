@@ -1,4 +1,4 @@
-"""Training schedule resolution for EfficientZero (HyperCEZ-aligned ratios)."""
+"""Training schedule resolution for EfficientZero-V2."""
 
 from __future__ import annotations
 
@@ -6,9 +6,8 @@ import math
 
 from algorl.agents.configs import EfficientZeroConfig
 
-# HyperCEZ ``ez_hparams.json`` schedule ratios (gradient-step budget =
-# ``training_steps + offline_training_steps``; mixed-value window vs ``buffer_size``).
-_HYPERCEZ_SCHEDULE_RATIOS: dict[str, dict[str, float]] = {
+# Reference schedule ratios from the EfficientZero-V2 vector-control preset.
+_EZV2_SCHEDULE_RATIOS: dict[str, dict[str, float]] = {
     "atari": {
         "mix_start": 30_000 / 100_000,
         "auto_td": 30_000 / 100_000,
@@ -31,14 +30,14 @@ def _schedule_preset_key(config: EfficientZeroConfig) -> str:
     model_type = config.model_type
     if model_type == "auto":
         return "dmc_state"
-    if model_type not in _HYPERCEZ_SCHEDULE_RATIOS:
+    if model_type not in _EZV2_SCHEDULE_RATIOS:
         return "dmc_state"
     return model_type
 
 
 def schedule_ratios(config: EfficientZeroConfig) -> dict[str, float]:
     """Return effective schedule ratios for ``config`` (preset or explicit overrides)."""
-    preset = _HYPERCEZ_SCHEDULE_RATIOS[_schedule_preset_key(config)]
+    preset = _EZV2_SCHEDULE_RATIOS[_schedule_preset_key(config)]
     mix_start = (
         config.schedule_mix_start_fraction
         if config.schedule_mix_start_fraction is not None

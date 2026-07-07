@@ -14,7 +14,7 @@ def configure_jax_gpu_memory(
     preallocate: bool = False,
     memory_fraction: float | None = 0.85,
 ) -> None:
-    """Tune XLA GPU allocator for long EZ runs (HyperCEZ-like PyTorch footprint).
+    """Tune XLA GPU allocator for long EZ runs (EfficientZero-V2-like PyTorch footprint).
 
     JAX defaults to preallocating nearly all GPU memory, which makes OOM look
     sudden and leaves little room for MJX + MCTS + backward peaks.

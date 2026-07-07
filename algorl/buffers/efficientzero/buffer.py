@@ -51,14 +51,11 @@ class EfficientZeroStep:
 
 @dataclass
 class EfficientZeroTrajectory:
-    """Fixed-size trajectory block aligned with HyperCEZ ``GameTrajectory``.
+    """Fixed-size trajectory block with optional tail padding for value targets.
 
-    ``core_len`` counts the block's own transitions (HyperCEZ ``len(traj)``);
-    steps past ``core_len`` are tail padding from the next block (``pad_over``)
-    used only as target context, never as sample positions. ``final_observation``
-    stores the observation after the last action for done-terminated blocks so
-    value bootstrapping can peek one step past the final transition, exactly as
-    HyperCEZ keeps ``obs_lst[traj_len]``.
+    ``core_len`` is the number of transitions in this block; tail steps after
+    ``core_len`` are context from the next block. ``final_observation`` is the
+    terminal next-observation for done episodes (used when bootstrapping values).
     """
 
     max_size: int
@@ -88,7 +85,7 @@ class EfficientZeroTrajectory:
         self,
         tail_steps: list[EfficientZeroStep],
     ) -> None:
-        """Append tail context from the next trajectory block (HyperCEZ ``pad_over``)."""
+        """Append tail context from the next trajectory block."""
         for step in tail_steps:
             self.steps.append(step)
 
@@ -299,9 +296,7 @@ class EfficientZeroReplayBuffer(ReplayBuffer):
                 td_steps=self.config.td_steps,
             )
 
-        # HyperCEZ ``save_trajectory``: new transitions all get the buffer-wide max
-        # priority (optimistic init) so fresh data is sampled promptly; per-step
-        # priorities are refreshed once the samples pass through training.
+        # New transitions inherit the buffer-wide max priority (optimistic PER init).
         if self.config.use_priority:
             traj_priorities = (
                 np.abs(pred_values[:core_len] - np.asarray(bootstrapped[:core_len], dtype=np.float32))
@@ -312,9 +307,7 @@ class EfficientZeroReplayBuffer(ReplayBuffer):
         else:
             new_priority = 1.0
 
-        # HyperCEZ ``save_trajectory``: every core transition is a valid sample
-        # position (tail padding is target context only); short windows near the
-        # trajectory end are handled by loss masks, not by dropping positions.
+        # Every core transition is a valid sample position.
         for step_pos in range(core_len):
             self._lookup.append((traj_idx, step_pos))
             self._priorities.append(new_priority)
@@ -328,7 +321,7 @@ class EfficientZeroReplayBuffer(ReplayBuffer):
             rng = np.random.default_rng()
             return rng.choice(total, size=batch_size, replace=False)
 
-        # HyperCEZ: permanently zero priorities outside the top-transitions window.
+        # EfficientZero-V2: permanently zero priorities outside the top-transitions window.
         if total > int(self.config.top_transitions):
             cutoff = total - int(self.config.top_transitions)
             for index in range(cutoff):
@@ -352,7 +345,7 @@ class EfficientZeroReplayBuffer(ReplayBuffer):
 
     def _build_batch(self, indices: np.ndarray, *, trained_steps: int) -> Batch:
         window = self.unroll_steps + 1
-        # HyperCEZ computes value targets on the stored trajectory; expose the
+        # EfficientZero-V2 computes value targets on the stored trajectory; expose the
         # extra tail so every unroll position keeps its full TD / GAE horizon.
         ext_window = max(window, extended_target_window(self.config))
         observations: list[np.ndarray] = []
@@ -397,8 +390,7 @@ class EfficientZeroReplayBuffer(ReplayBuffer):
                 obs_rows.append(traj_meta.final_observation.astype(np.float32))
                 has_terminal_obs = True
             while len(obs_rows) < ext_window:
-                # HyperCEZ ``get_index_stacked_obs(padding=True)`` repeats the
-                # last frame; padded positions are masked in every loss/target.
+                # Repeat the last frame when padding observations.
                 obs_rows.append(obs_rows[-1])
             observations.append(np.stack(obs_rows[:ext_window], axis=0))
 
@@ -407,7 +399,7 @@ class EfficientZeroReplayBuffer(ReplayBuffer):
             rewards.append(reward_row)
 
             # Observation one step past the last core transition: available from
-            # tail padding or the stored terminal observation (HyperCEZ always
+            # tail padding or the stored terminal observation (EfficientZero-V2 always
             # has ``obs_lst[traj_len]``, so ``bootstrap_index <= traj_len``).
             if len(chunk) > valid_len or (len(chunk) == valid_len and has_terminal_obs):
                 bootstrap_limit = valid_len
@@ -476,8 +468,7 @@ class EfficientZeroReplayBuffer(ReplayBuffer):
             value_targets.append(np.asarray(targets, dtype=np.float32))
             mix_masks.append(mix_mask)
 
-            # HyperCEZ ``make_batch``: unroll step k is trained only when the
-            # *next* position (its targets) is still inside the trajectory.
+            # Train unroll step k only while the next position is inside the trajectory.
             mask = np.zeros((self.unroll_steps,), dtype=np.float32)
             mask[: max(0, min(self.unroll_steps, valid_len - 1))] = 1.0
             masks.append(mask)

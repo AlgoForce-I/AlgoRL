@@ -1,4 +1,4 @@
-"""Running observation statistics for HyperCEZ-aligned representation nets."""
+"""Running observation statistics for EfficientZero-V2-aligned representation nets."""
 
 from __future__ import annotations
 
@@ -15,7 +15,7 @@ def update_mean_var_count_from_moments(
     batch_var: np.ndarray,
     batch_count: int,
 ) -> tuple[np.ndarray, np.ndarray, float]:
-    """HyperCEZ ``update_mean_var_count_from_moments`` (Welford merge)."""
+    """Online observation mean/variance update (Welford merge)."""
     delta = batch_mean - mean
     tot_count = count + batch_count
     new_mean = mean + delta * batch_count / tot_count

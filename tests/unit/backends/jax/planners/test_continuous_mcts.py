@@ -136,7 +136,7 @@ def world_model(cartpole_training_env: TrainingEnv):
     return build_efficient_zero_world_model(context)
 
 
-def test_sample_actions_matches_hypercez_shapes() -> None:
+def test_sample_actions_matches_efficientzero_v2_shapes() -> None:
     config = ContinuousSearchConfig(
         num_sampled_actions=8,
         policy_action_num=4,

@@ -18,7 +18,7 @@ def kl_categorical_loss(logits: jnp.ndarray, target: jnp.ndarray) -> jnp.ndarray
 def symlog_scalar_loss(prediction: jnp.ndarray, target: jnp.ndarray) -> jnp.ndarray:
     pred = prediction
     if pred.ndim == target.ndim + 1:
-        # Scalar heads emit a trailing singleton bin (HyperCEZ ``squeeze()``).
+        # Scalar heads emit a trailing singleton bin.
         pred = pred[..., 0]
     target_symlog = jnp.sign(target) * jnp.log1p(jnp.abs(target))
     return 0.5 * (pred - target_symlog) ** 2
@@ -59,8 +59,7 @@ def value_loss(
     targets: jnp.ndarray,
     config: EfficientZeroConfig,
 ) -> jnp.ndarray:
-    """HyperCEZ ``Value_loss``: targets repeat over the ensemble axis, every
-    value head is trained, per-head IQL weights, mean over heads."""
+    """Value loss over all ensemble heads with per-head IQL weighting."""
     has_ensemble_axis = predictions.ndim == targets.ndim + 2
     if not has_ensemble_axis:
         predictions = predictions[None, ...]
@@ -79,7 +78,7 @@ def value_loss(
         )
         per_sample = kl_categorical_loss(predictions, target_support)
 
-    # HyperCEZ Value_loss applies IQL_weight=0.5 asymmetry even when use_IQL=False.
+    # EfficientZero-V2 Value_loss applies IQL_weight=0.5 asymmetry even when use_IQL=False.
     iql_weight = config.IQL_weight if config.use_IQL else 0.5
     reformed = _reduce_value_logits(predictions, config)
     error = reformed - ensemble_targets
@@ -114,9 +113,7 @@ def continuous_policy_loss(
 ) -> tuple[jnp.ndarray, jnp.ndarray]:
     """Squashed-Gaussian policy loss (Eq. 6 full pi or Eq. 7 simple pi).
 
-    HyperCEZ ``continuous_loss``: ``action_dim == 1`` uses full candidate distribution
-    loss; multi-dimensional control uses best-action log-prob only. Trajectory
-    ``mask`` (padding) may scale the loss.
+    Squashed-Gaussian policy loss (full pi for 1-D actions, simple pi otherwise).
     """
     action_dim = policy.shape[-1] // 2
     mean = policy[..., :action_dim]

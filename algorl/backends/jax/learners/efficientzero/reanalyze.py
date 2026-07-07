@@ -23,7 +23,7 @@ def effective_reanalyze_search_batch_size(config: EfficientZeroConfig) -> int:
 
 
 def mcts_temperature(config: EfficientZeroConfig, trained_steps: int) -> float:
-    """HyperCEZ ``EZAgent.get_temperature`` for reanalyze MCTS."""
+    """MCTS temperature schedule for reanalyze."""
     if not config.change_temperature:
         return 1.0
     total = max(1, config.total_training_steps)
@@ -42,7 +42,7 @@ def batch_initial_values(
     rng_key: jax.Array,
     mini_batch_size: int = 256,
 ) -> np.ndarray:
-    """Batched ``initial_inference`` value extraction (HyperCEZ ``efficient_inference_reanalyze``)."""
+    """Batched initial-inference value extraction for reanalyze."""
     obs = np.asarray(observations, dtype=np.float32)
     if obs.ndim == 1:
         obs = obs.reshape(1, -1)

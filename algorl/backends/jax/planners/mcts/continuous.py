@@ -44,7 +44,7 @@ RecurrentStepFn = Callable[
 
 @dataclass(frozen=True)
 class ContinuousSearchConfig:
-    """EfficientZero-V2 ``search_continuous`` settings from ``ez_hparams.json``."""
+    """Continuous candidate-set MCTS settings."""
 
     num_simulations: int = 32
     num_sampled_actions: int = 16
@@ -73,7 +73,7 @@ class ContinuousSearchState:
 
 @dataclass(frozen=True)
 class ContinuousSearchExtraData:
-    """Per-batch search state mirroring EfficientZero-V2 ``ptree`` sequential halving."""
+    """Per-batch search state for sequential halving."""
 
     gumbel: Array
     min_max_maximum: Array
@@ -215,7 +215,7 @@ def sample_actions(
     sample_nums: int | None = None,
     temperature: float = 1.0,
 ) -> tuple[Array, Array]:
-    """Sample candidate continuous actions (EfficientZero-V2 ``MCTS_base.sample_actions``)."""
+    """Sample candidate continuous actions for tree expansion."""
     batch_size, policy_dim = policy.shape
     action_dim = policy_dim // 2
     num_sampled = config.num_sampled_actions if sample_nums is None else sample_nums
@@ -229,8 +229,7 @@ def sample_actions(
         n_policy = num_sampled
         n_random = 0
 
-    # HyperCEZ ``MCTS_base.sample_actions`` accepts ``temperature`` but never
-    # applies it to continuous sampling; the policy std is used as-is.
+    # Continuous action sampling ignores temperature (policy std is used as-is).
     del temperature
     mean = policy[:, :action_dim]
     std = policy[:, action_dim:]
@@ -797,7 +796,7 @@ def run_continuous_search(
     extra_data: ContinuousSearchExtraData,
     root_candidates: Array,
 ) -> ContinuousSearchResult:
-    """Run EfficientZero-V2 ``search_continuous`` using MCTX tree primitives."""
+    """Run continuous candidate-set MCTS using MCTX tree primitives."""
     action_selection_fn = ContinuousActionSelection(config).as_mctx()
     simulation_step = _make_jitted_simulation_step(
         recurrent_fn=recurrent_fn,
@@ -988,7 +987,7 @@ def _update_min_max_stats_unbatched(
     extra: ContinuousSearchExtraData,
     leaf_index: Array,
 ) -> ContinuousSearchExtraData:
-    """Mirror HyperCEZ ``back_propagate`` min-max updates along the backup path."""
+    """Min-max value normalization along the MCTS backup path."""
 
     def cond_fun(state: tuple[ContinuousSearchExtraData, Array, Array]) -> Array:
         _, index, _ = state
