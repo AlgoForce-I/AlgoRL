@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from algorl.buffers.efficient_zero import EfficientZeroReplayBuffer
+from algorl.buffers.efficientzero import EfficientZeroReplayBuffer
 from algorl.buffers.episode import EpisodeReplayBuffer
 from algorl.buffers.replay import UniformReplayBuffer
 from algorl.buffers.search import SearchReplayBuffer
@@ -18,7 +18,20 @@ def _build_uniform(context: ComponentContext) -> ReplayBuffer:
 
 
 def _build_efficient_zero(context: ComponentContext) -> ReplayBuffer:
-    return EfficientZeroReplayBuffer(capacity=context.config.buffer_capacity)
+    from algorl.agents.configs import EfficientZeroConfig
+
+    if not isinstance(context.config, EfficientZeroConfig):
+        raise TypeError(
+            "EfficientZero replay buffer requires EfficientZeroConfig, "
+            f"got {type(context.config)!r}."
+        )
+    trajectory_size = int(getattr(context.config, "trajectory_size", 100))
+    return EfficientZeroReplayBuffer(
+        capacity=context.config.buffer_capacity,
+        config=context.config,
+        unroll_steps=context.config.unroll_steps,
+        trajectory_size=trajectory_size,
+    )
 
 
 def _build_search(context: ComponentContext) -> ReplayBuffer:
@@ -32,4 +45,4 @@ def _build_episode(context: ComponentContext) -> ReplayBuffer:
 registry.register("uniform", _build_uniform)
 registry.register("search", _build_search, stub=True)
 registry.register("episode", _build_episode, stub=True)
-registry.register("efficient_zero", _build_efficient_zero, stub=True)
+registry.register("efficient_zero", _build_efficient_zero, stub=False)

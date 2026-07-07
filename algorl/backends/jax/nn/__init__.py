@@ -1,9 +1,24 @@
-"""Flax NNX modules for the JAX backend.
+"""Flax network modules for the JAX backend.
 
-Implement one module file per algorithm family, for example:
-- ``efficient_zero.py``: representation, dynamics, and prediction networks
-- ``rssm.py``: recurrent state-space model for Dreamer / PlaNet
-- ``td_mpc.py``: latent encoder and task-oriented heads for TD-MPC
-
-Networks live here. World models in ``world_models/`` should call into these modules.
+Each algorithm family lives in its own subpackage under ``nn/``.
 """
+
+from algorl.backends.jax.nn.efficientzero import (
+    EfficientZero,
+    build_efficient_zero_model,
+    build_efficient_zero_model_from_env,
+    init_efficient_zero_params,
+    init_efficient_zero_params_from_env,
+    init_efficient_zero_params_from_model,
+    infer_model_type,
+)
+
+__all__ = [
+    "EfficientZero",
+    "build_efficient_zero_model",
+    "build_efficient_zero_model_from_env",
+    "init_efficient_zero_params",
+    "init_efficient_zero_params_from_env",
+    "init_efficient_zero_params_from_model",
+    "infer_model_type",
+]

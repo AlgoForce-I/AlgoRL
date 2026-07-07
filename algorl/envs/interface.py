@@ -1,18 +1,17 @@
-"""Gymnasium environment utilities."""
+"""Gymnasium and JAX environment utilities."""
 
 from __future__ import annotations
 
 import gymnasium as gym
 from gymnasium import Env
 
-__all__ = ["Env", "check_gymnasium_env", "gym"]
+from algorl.envs.jax_env import BatchedJaxEnv, JaxEnv
+from algorl.envs.resolve import resolve_env
+from algorl.envs.training_env import TrainingEnv
+
+__all__ = ["Env", "JaxEnv", "BatchedJaxEnv", "TrainingEnv", "check_env", "gym", "resolve_env"]
 
 
-def check_gymnasium_env(env: object) -> Env:
-    """Validate that ``env`` is a Gymnasium environment."""
-    if not isinstance(env, gym.Env):
-        raise TypeError(
-            f"Expected a gymnasium.Env instance, got {type(env)!r}. "
-            "Create environments with gymnasium.make() or subclass gymnasium.Env."
-        )
-    return env
+def check_env(env: object) -> TrainingEnv:
+    """Validate and normalize an environment for AlgoRL agents."""
+    return resolve_env(env)

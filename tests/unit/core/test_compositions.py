@@ -43,7 +43,7 @@ def test_all_compositions_resolve_on_jax(cartpole_env: gym.Env) -> None:
 def test_compose_agent_rejects_stubs_when_required(cartpole_env: gym.Env) -> None:
     config = BaseAgentConfig(require_implemented=True)
     with pytest.raises(NotImplementedError, match="Stub component"):
-        compose_agent("efficient_zero", env=cartpole_env, config=config)
+        compose_agent("dreamer_v3", env=cartpole_env, config=config)
 
 
 def test_planner_receives_world_model(cartpole_env: gym.Env) -> None:

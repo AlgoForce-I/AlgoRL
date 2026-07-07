@@ -1,7 +1,7 @@
 """JAX world model registry.
 
 Implement concrete world models in this package, e.g.:
-- ``efficient_zero.py`` for EfficientZero / MuZero-style latent dynamics
+- ``efficientzero/`` for EfficientZero / MuZero-style latent dynamics
 - ``rssm.py`` for Dreamer / PlaNet
 - ``td_mpc.py`` for TD-MPC
 
@@ -70,5 +70,9 @@ def _register_stub(kind: str) -> None:
 
 registry.register("none", _NullWorldModel, stub=False)
 
-for _kind in ("efficient_zero", "muzero", "rssm", "td_mpc"):
+from algorl.backends.jax.world_models.efficientzero import build_efficient_zero_world_model
+
+registry.register("efficient_zero", build_efficient_zero_world_model, stub=False)
+
+for _kind in ("muzero", "rssm", "td_mpc"):
     _register_stub(_kind)

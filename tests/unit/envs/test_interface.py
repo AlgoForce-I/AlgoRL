@@ -1,17 +1,28 @@
-"""Gymnasium environment validation tests."""
+"""Gymnasium and JAX environment validation tests."""
 
 import gymnasium as gym
 import pytest
 
-from algorl.envs import check_gymnasium_env
+from algorl.envs import check_env, resolve_env
 
 
-def test_check_gymnasium_env_accepts_gymnasium_env() -> None:
+def test_check_env_accepts_gymnasium_env() -> None:
     env = gym.make("CartPole-v1")
-    assert check_gymnasium_env(env) is env
+    training_env = check_env(env)
+    assert training_env.observation_space == env.observation_space
+    assert training_env.observation_shape == 4
+    assert training_env.num_actions == 2
+    assert training_env.action_dim == 1
     env.close()
 
 
-def test_check_gymnasium_env_rejects_non_gymnasium_object() -> None:
-    with pytest.raises(TypeError, match="gymnasium.Env"):
-        check_gymnasium_env(object())
+def test_resolve_env_wraps_gymnasium_env() -> None:
+    env = gym.make("CartPole-v1")
+    training_env = resolve_env(env)
+    assert not training_env.is_batched
+    env.close()
+
+
+def test_check_env_rejects_invalid_object() -> None:
+    with pytest.raises(TypeError, match="Expected gymnasium.Env"):
+        check_env(object())

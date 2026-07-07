@@ -1,4 +1,4 @@
-"""Minimal AlgoRL usage example.
+"""Minimal AlgoRL usage example — batched CW continual learning.
 
 Run from the project root::
 
@@ -11,46 +11,36 @@ Install the package and JAX backend first::
 
 from __future__ import annotations
 
-import gymnasium as gym
+from algorl.backends.jax.memory import configure_jax_gpu_memory
+
+configure_jax_gpu_memory(preallocate=False, memory_fraction=0.85)
 
 import algorl as arl
 from algorl.agents.configs import EfficientZeroConfig
+from algorl.backends.jax.envs import make_batched_cw_train_env
+from algorl.envs import resolve_env
+from MTCWorldMJX import CWConfig
+
+NUM_ENVS = 32
 
 
 def main() -> None:
-    env = gym.make("CartPole-v1")
-
-    config = EfficientZeroConfig(
-        backend="jax",
-        seed=0,
-        buffer_capacity=10_000,
-        learning_starts=1_000,
-        require_implemented=False,  # allow stub components during development
+    jax_env = make_batched_cw_train_env(
+        "CW10",
+        num_envs=NUM_ENVS,
+        seed=42,
+        config=CWConfig(seed=42, steps_per_task=1_000_000),
     )
-
-    agent = arl.EfficientZero(env, config=config)
-
-    # The agent composes its world model, planner, learner, and replay buffer.
-    print(f"AlgoRL {arl.__version__}")
-    print(f"Environment: {env.spec.id if env.spec else 'unknown'}")
-    print(f"Backend: {agent.backend.name}")
-    print(f"World model: {type(agent.world_model).__name__}")
-    print(f"Planner: {type(agent.planner).__name__}")
-    print(f"Learner: {type(agent.learner).__name__}")
-    print(f"Replay buffer: {type(agent.replay_buffer).__name__}")
-
-    # Typical usage once implementations are complete:
-    #
-    #   observation, _ = env.reset()
-    #   action = agent.predict(observation)
-    #   agent.learn(total_timesteps=10_000)
-    #
-    # Other agents follow the same pattern, e.g.:
-    #
-    #   from algorl.agents.configs import DreamerV3Config
-    #   agent = arl.DreamerV3(env, config=DreamerV3Config(require_implemented=False))
-
-    env.close()
+    env = resolve_env(jax_env, seed=42)
+    agent = arl.EfficientZero(
+        env,
+        config=EfficientZeroConfig.for_batched(num_envs=NUM_ENVS),
+    )
+    agent.learn(
+        total_timesteps=10_000_000,
+        tensorboard_log_dir="runs/cw10_ez_batched_cl",
+        progress_bar=True,
+    )
 
 
 if __name__ == "__main__":

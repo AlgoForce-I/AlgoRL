@@ -9,13 +9,14 @@ from typing import Any, Iterator
 import jax
 import jax.numpy as jnp
 import mctx
+import numpy as np
 
 from algorl.agents.configs import BaseAgentConfig, SearchAgentConfig
 from algorl.core.component_context import ComponentContext
 from algorl.core.planner import BatchedPlanner
 from algorl.core.types import Action, Observation, PolicyTarget, ValueTarget
 
-ObservationBatch = Observation | jnp.ndarray | list[Observation]
+ObservationBatch = Observation | jnp.ndarray | np.ndarray | list[Observation]
 InvalidActionsMask = jnp.ndarray | None
 
 
@@ -153,10 +154,11 @@ def normalize_observation_batch(observations: ObservationBatch) -> NormalizedObs
     """Normalize single, list, or pre-stacked observations into one batch object."""
     if isinstance(observations, list):
         return NormalizedObservationBatch(items=observations, is_stacked=False)
-    if isinstance(observations, jnp.ndarray):
-        if observations.ndim >= 2:
-            return NormalizedObservationBatch(items=observations, is_stacked=True)
-        return NormalizedObservationBatch(items=[observations], is_stacked=False)
+    if isinstance(observations, (jnp.ndarray, np.ndarray)):
+        array = jnp.asarray(observations, dtype=jnp.float32)
+        if array.ndim >= 2:
+            return NormalizedObservationBatch(items=array, is_stacked=True)
+        return NormalizedObservationBatch(items=[array], is_stacked=False)
     return NormalizedObservationBatch(items=[observations], is_stacked=False)
 
 

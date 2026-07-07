@@ -3,10 +3,12 @@ from __future__ import annotations
 import gymnasium as gym
 import pgx
 
-from algorl.backends.jax.envs.gymnasium_env import GymnasiumSearchEnvironment, GymnasiumSearchEnv
-from algorl.backends.jax.envs.pgx import PgxGymEnv, PgxSearchEnvironment
 from algorl.backends.jax.envs.core import SearchEnvironment
+from algorl.backends.jax.envs.gymnasium_env import GymnasiumSearchEnvironment
+from algorl.backends.jax.envs.pgx import PgxSearchEnvironment
 from algorl.core.component_context import ComponentContext
+from algorl.envs.resolve import resolve_env
+from algorl.envs.training_env import TrainingEnv
 
 _PGX_ENV_IDS = frozenset(pgx.available_envs())
 
@@ -17,31 +19,29 @@ def _supports_gymnasium_search(action_space: gym.Space) -> bool:
 
 def search_env_from_context(context: ComponentContext) -> SearchEnvironment:
     """Resolve a :class:`SearchEnvironment` from the agent build context."""
-    env = context.env
+    training_env = (
+        context.env if isinstance(context.env, TrainingEnv) else resolve_env(context.env)
+    )
 
-    if hasattr(env, "search_environment"):
-        return env.search_environment()
+    if training_env.is_batched:
+        raise NotImplementedError(
+            "Batched environments do not support search-based planners. "
+            "Use a single-lane environment instead."
+        )
 
-    unwrapped = env.unwrapped
-    if isinstance(unwrapped, PgxSearchEnvironment):
-        return unwrapped
+    search_env = training_env.search_environment()
+    if search_env is not None:
+        return search_env
 
-    if isinstance(unwrapped, PgxGymEnv):
-        return unwrapped.search_environment()
-
-    if isinstance(unwrapped, GymnasiumSearchEnv):
-        return unwrapped.search_environment()
-
-    env_id = env.spec.id if env.spec is not None else None
-    if env_id in _PGX_ENV_IDS:
-        pgx_env = pgx.make(env_id)
-        return PgxSearchEnvironment(pgx_env)
-
-    if _supports_gymnasium_search(env.action_space):
-        return GymnasiumSearchEnvironment(env)
+    raw = training_env.raw
+    if isinstance(raw, gym.Env):
+        env_id = getattr(getattr(raw, "spec", None), "id", None)
+        if env_id in _PGX_ENV_IDS:
+            return PgxSearchEnvironment(pgx.make(env_id))
+        if _supports_gymnasium_search(raw.action_space):
+            return GymnasiumSearchEnvironment(raw)
 
     raise NotImplementedError(
-        f"No JAX SearchEnvironment adapter for {type(unwrapped)!r} "
-        f"(spec={env_id!r}, action_space={env.action_space!r}). "
-        "Use a discrete or Box Gymnasium env, PgxGymEnv, or implement search_environment()."
+        f"No JAX SearchEnvironment adapter for {type(raw)!r}. "
+        "Use a Gymnasium env, JAX-native MTCWorld env, or implement search_environment()."
     )

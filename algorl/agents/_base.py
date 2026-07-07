@@ -1,23 +1,28 @@
-"""Shared Gymnasium-based agent base class."""
+"""Shared agent base class."""
 
 from __future__ import annotations
 
-import gymnasium as gym
+from typing import Any
 
 from algorl.core.agent import BaseAgent
-from algorl.envs import check_gymnasium_env
+from algorl.envs import resolve_env
+from algorl.envs.training_env import TrainingEnv
 
 
-class GymnasiumAgent(BaseAgent):
-    """Base agent that operates on a Gymnasium environment."""
+class Agent(BaseAgent):
+    """Base agent that operates on a Gymnasium or JAX-native environment."""
 
-    def __init__(self, env: gym.Env) -> None:
-        self.env = check_gymnasium_env(env)
+    def __init__(self, env: object) -> None:
+        self.env = resolve_env(env)
 
     @property
-    def observation_space(self) -> gym.Space:
+    def observation_space(self):
         return self.env.observation_space
 
     @property
-    def action_space(self) -> gym.Space:
+    def action_space(self):
         return self.env.action_space
+
+
+# Backward-compatible alias.
+GymnasiumAgent = Agent

@@ -19,6 +19,7 @@ from algorl.backends.jax.planners.mcts.alphazero import (
 )
 from algorl.backends.jax.planners.mcts.core import NormalizedObservationBatch, RecurrentFn
 from algorl.core.component_context import ComponentContext
+from algorl.envs import resolve_env
 
 
 class FakeState(NamedTuple):
@@ -67,7 +68,7 @@ def fake_planner(cartpole_env) -> AlphaZeroPlanner:
     context = ComponentContext(
         backend=JAXBackend(),
         config=AlphaZeroConfig(require_implemented=False),
-        env=cartpole_env,
+        env=resolve_env(cartpole_env),
     )
     return AlphaZeroPlanner(
         context,
@@ -80,7 +81,7 @@ def test_build_alphazero_planner_factory(cartpole_env) -> None:
     context = ComponentContext(
         backend=JAXBackend(),
         config=AlphaZeroConfig(require_implemented=False),
-        env=cartpole_env,
+        env=resolve_env(cartpole_env),
     )
     planner = build_alphazero_planner(context)
     assert isinstance(planner, AlphaZeroPlanner)
@@ -132,7 +133,7 @@ def test_search_env_resolves_from_pgx_gym_env() -> None:
     context = ComponentContext(
         backend=JAXBackend(),
         config=AlphaZeroConfig(require_implemented=False),
-        env=env,
+        env=resolve_env(env),
     )
     planner = AlphaZeroPlanner(context, evaluate=_fake_evaluate)
     planner.params = {"num_actions": env.action_space.n}
