@@ -197,6 +197,51 @@ def test_efficient_zero_learner_train_burst_reanalyze_once(learner_context: Comp
     assert len(mock_reanalyze.call_args.args[1]) == 3
 
 
+def test_efficient_zero_learner_train_burst_reanalyze_once_when_scan_chunks(
+    learner_context: ComponentContext,
+) -> None:
+    """Reanalyze stays fused across the full burst even when the scan is chunked."""
+    config = learner_context.config.with_overrides(
+        batch_size=2,
+        reanalyze_ratio=1.0,
+        gradient_steps_per_rollout=6,
+        burst_compile_steps=2,
+    )
+    context = ComponentContext(
+        backend=learner_context.backend,
+        config=config,
+        env=learner_context.env,
+    )
+    context.world_model = build_efficient_zero_world_model(context)
+    context.planner = build_efficient_zero_planner(context)
+    learner = build_efficient_zero_learner(context)
+    buffer = EfficientZeroReplayBuffer(
+        capacity=100,
+        config=config,
+        unroll_steps=config.unroll_steps,
+        trajectory_size=config.trajectory_size,
+    )
+    _fill_buffer(buffer)
+
+    with mock.patch(
+        "algorl.backends.jax.learners.efficientzero.learner.reanalyze_fused_policy_batches",
+        return_value=[
+            (
+                np.zeros((2, config.unroll_steps + 1, 4), dtype=np.float32),
+                np.zeros((2, config.unroll_steps + 1), dtype=np.float32),
+                np.zeros((2, config.unroll_steps + 1, 4, 1), dtype=np.float32),
+                np.zeros((2, config.unroll_steps + 1, 1), dtype=np.float32),
+            )
+        ]
+        * 6,
+    ) as mock_reanalyze:
+        metrics = learner.train_burst(buffer, 6)
+
+    assert np.isfinite(metrics["loss"])
+    assert mock_reanalyze.call_count == 1
+    assert len(mock_reanalyze.call_args.args[1]) == 6
+
+
 def test_as_candidate_matrix_normalizes_mcts_shapes() -> None:
     from algorl.backends.jax.learners.efficientzero.reanalyze import _as_candidate_matrix
 

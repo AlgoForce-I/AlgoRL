@@ -16,6 +16,7 @@ class BaseAgentConfig:
     train_freq: int = 1
     learning_starts: int = 1_000
     gradient_steps_per_rollout: int | None = None
+    burst_compile_steps: int | None = None
     checkpoint_freq: int | None = None
     jax_rollout_chunk: int = 64
     require_implemented: bool = True
@@ -185,10 +186,11 @@ class EfficientZeroConfig(SearchAgentConfig):
         for all lanes at once; ``jax_rollout_chunk`` stays at the sequential
         value so a chunk still runs multiple batched MCTS steps before training.
 
-        Training runs as a post-rollout burst of ``num_envs`` gradient steps
-        (same env-step / grad-step ratio as sequential) instead of interleaving
-        one update per transition. Set ``gradient_steps_per_rollout=None`` to
-        restore interleaved training for learning-curve parity with sequential.
+        Training runs as a post-rollout burst of ``num_envs * jax_rollout_chunk``
+        gradient steps (one update per collected env step, matching sequential).
+        Reanalyze is fused across the full burst; the scanned optimizer compiles
+        to the same width unless ``burst_compile_steps`` is set lower for
+        memory. Set ``gradient_steps_per_rollout=None`` for interleaved training.
         """
         dynamics_every = 10
         if overrides and "dynamics_update_every" in overrides:
@@ -197,7 +199,7 @@ class EfficientZeroConfig(SearchAgentConfig):
             search_batch_size=num_envs,
             jax_rollout_chunk=dynamics_every,
             dynamics_update_every=dynamics_every,
-            gradient_steps_per_rollout=num_envs,
+            gradient_steps_per_rollout=num_envs * dynamics_every,
         )
         return config.with_overrides(**overrides) if overrides else config
 

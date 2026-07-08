@@ -84,9 +84,12 @@ def training_burst_spec(config: EfficientZeroConfig, env: TrainingEnv) -> Traini
     else:
         raise TypeError(f"Unsupported action space for burst compile: {type(action_space)!r}")
 
+    compile_steps = config.burst_compile_steps
+    if compile_steps is None:
+        compile_steps = max(1, int(config.gradient_steps_per_rollout or 1))
     search_cfg = continuous_search_config_from_agent(config)
     return TrainingBurstSpec(
-        burst_steps=max(1, int(config.gradient_steps_per_rollout or 1)),
+        burst_steps=max(1, int(compile_steps)),
         batch_size=config.batch_size,
         window=config.unroll_steps + 1,
         unroll_steps=config.unroll_steps,
@@ -431,31 +434,6 @@ class EfficientZeroLearner(Learner):
         """Run several gradient updates with fused reanalyze and a scanned optimizer."""
         if steps <= 0:
             return {}
-        metrics: dict[str, float] = {}
-        completed = 0
-        while completed < steps:
-            chunk_steps = min(steps - completed, self._burst_spec.burst_steps)
-            metrics = self._run_train_burst_chunk(
-                replay_buffer,
-                chunk_steps=chunk_steps,
-                global_offset=completed,
-                on_progress=on_progress,
-                completed_steps=completed,
-                total_steps=steps,
-            )
-            completed += chunk_steps
-        return metrics
-
-    def _run_train_burst_chunk(
-        self,
-        replay_buffer: EfficientZeroReplayBuffer,
-        *,
-        chunk_steps: int,
-        global_offset: int,
-        on_progress: Callable[[int, int], None] | None,
-        completed_steps: int,
-        total_steps: int,
-    ) -> dict[str, float]:
         if not isinstance(replay_buffer, EfficientZeroReplayBuffer):
             raise TypeError(
                 "EfficientZeroLearner requires EfficientZeroReplayBuffer, "
@@ -465,7 +443,7 @@ class EfficientZeroLearner(Learner):
         beta = self._priority_beta()
         start_step = self._train_steps
         batches: list[Batch] = []
-        for offset in range(chunk_steps):
+        for offset in range(steps):
             batches.append(
                 replay_buffer.sample(
                     self.config.batch_size,
@@ -475,7 +453,7 @@ class EfficientZeroLearner(Learner):
             )
 
         self._rng_key, burst_key = jax.random.split(self._rng_key)
-        step_keys = jax.random.split(burst_key, chunk_steps)
+        step_keys = jax.random.split(burst_key, steps)
         prepared_batches: list[dict[str, jnp.ndarray]] = []
         observation_windows: list[np.ndarray] = []
         window = self.config.unroll_steps + 1
@@ -527,7 +505,7 @@ class EfficientZeroLearner(Learner):
                     trained_steps=start_step + offset,
                 )
         else:
-            for offset in range(chunk_steps):
+            for offset in range(steps):
                 prepared_batches[offset] = _finalize_value_targets(
                     prepared_batches[offset],
                     batches[offset],
@@ -535,6 +513,36 @@ class EfficientZeroLearner(Learner):
                     trained_steps=start_step + offset,
                 )
 
+        metrics: dict[str, float] = {}
+        completed = 0
+        scan_width = self._burst_spec.burst_steps
+        while completed < steps:
+            chunk_steps = min(steps - completed, scan_width)
+            metrics = self._run_burst_scan_chunk(
+                replay_buffer,
+                prepared_batches=prepared_batches[completed : completed + chunk_steps],
+                step_keys=step_keys[completed : completed + chunk_steps],
+                start_step=start_step + completed,
+                chunk_steps=chunk_steps,
+                on_progress=on_progress,
+                completed_steps=completed,
+                total_steps=steps,
+            )
+            completed += chunk_steps
+        return metrics
+
+    def _run_burst_scan_chunk(
+        self,
+        replay_buffer: EfficientZeroReplayBuffer,
+        *,
+        prepared_batches: list[dict[str, jnp.ndarray]],
+        step_keys: jax.Array,
+        start_step: int,
+        chunk_steps: int,
+        on_progress: Callable[[int, int], None] | None,
+        completed_steps: int,
+        total_steps: int,
+    ) -> dict[str, float]:
         padded_batches, active_mask = _pad_burst_batches(
             prepared_batches,
             self._burst_spec,
