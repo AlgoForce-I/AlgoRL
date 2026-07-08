@@ -161,7 +161,7 @@ class EfficientZeroConfig(SearchAgentConfig):
         """
         config = cls.for_dmc_state(
             search_batch_size=1,
-            reanalyze_search_batch_size=2048,
+            reanalyze_search_batch_size=10_240,
             jax_rollout_chunk=10,
             gradient_steps_per_rollout=1,
             batch_size=256,
@@ -180,24 +180,24 @@ class EfficientZeroConfig(SearchAgentConfig):
     ) -> EfficientZeroConfig:
         """Parallel vector-control envs with wide rollout MCTS.
 
-        ``jax_rollout_chunk`` is chosen so ``chunk * num_envs`` matches
-        ``dynamics_update_every`` (one learner update per rollout chunk).
+        Learner and reanalyze settings match :meth:`for_sequential`. Rollout
+        parallelism uses ``search_batch_size=num_envs`` so each MCTS call plans
+        for all lanes at once; ``jax_rollout_chunk`` stays at the sequential
+        value so a chunk still runs multiple batched MCTS steps before training.
+
+        Training runs as a post-rollout burst of ``num_envs`` gradient steps
+        (same env-step / grad-step ratio as sequential) instead of interleaving
+        one update per transition. Set ``gradient_steps_per_rollout=None`` to
+        restore interleaved training for learning-curve parity with sequential.
         """
         dynamics_every = 10
         if overrides and "dynamics_update_every" in overrides:
             dynamics_every = int(overrides["dynamics_update_every"])  # type: ignore[arg-type]
-        rollout_chunk = max(1, dynamics_every // max(1, num_envs))
-        config = cls.for_dmc_state(
-            batch_size=256,
-            mcts_simulations=32,
-            jax_rollout_chunk=rollout_chunk,
+        config = cls.for_sequential(
             search_batch_size=num_envs,
-            reanalyze_ratio=1.0,
-            gradient_steps_per_rollout=1,
+            jax_rollout_chunk=dynamics_every,
             dynamics_update_every=dynamics_every,
-            seed=0,
-            buffer_capacity=10_000,
-            learning_starts=1_000,
+            gradient_steps_per_rollout=num_envs,
         )
         return config.with_overrides(**overrides) if overrides else config
 

@@ -16,7 +16,13 @@ class TqdmProgressBar:
     def start(self, total: int, **kwargs: Any) -> None:
         from tqdm import tqdm
 
-        merged = {**self._kwargs, **kwargs}
+        merged = {
+            "mininterval": 0,
+            "miniters": 1,
+            "smoothing": 0,
+            **self._kwargs,
+            **kwargs,
+        }
         self._bar = tqdm(total=total, desc=self._desc, **merged)
 
     def update(self, step_info: dict[str, Any] | None = None, *, n: int = 1) -> None:
@@ -27,8 +33,9 @@ class TqdmProgressBar:
             return
         postfix = _postfix_from_step_info(step_info)
         if postfix:
-            self._bar.set_postfix(postfix, refresh=True)
+            self._bar.set_postfix(postfix, refresh=False)
         self._bar.update(increment)
+        self._bar.refresh()
 
     def pulse(self, step_info: dict[str, Any] | None = None) -> None:
         """Refresh postfix without advancing the timestep counter."""
@@ -36,7 +43,8 @@ class TqdmProgressBar:
             return
         postfix = _postfix_from_step_info(step_info)
         if postfix:
-            self._bar.set_postfix(postfix, refresh=True)
+            self._bar.set_postfix(postfix, refresh=False)
+        self._bar.refresh()
 
     def close(self) -> None:
         if self._bar is not None:
@@ -66,6 +74,9 @@ def _postfix_from_step_info(step_info: dict[str, Any] | None) -> dict[str, str]:
     reanalyze = step_info.get("reanalyze")
     if isinstance(reanalyze, str) and reanalyze:
         postfix["reanalyze"] = reanalyze
+    train_burst = step_info.get("train_burst")
+    if isinstance(train_burst, str) and train_burst:
+        postfix["train"] = train_burst
     for key, label in labels.items():
         value = step_info.get(key)
         if isinstance(value, (int, float)) and not isinstance(value, bool):

@@ -11,7 +11,11 @@ import numpy as np
 from algorl.agents.configs import BaseAgentConfig
 from algorl.common.callbacks import Callback, CallbackList
 from algorl.common.checkpoints import save_checkpoint
-from algorl.common.episode_metrics import EpisodeMetricsTracker
+from algorl.common.episode_metrics import (
+    BatchedEpisodeMetricsTracker,
+    EpisodeMetricsTracker,
+    batched_episode_summary_metrics,
+)
 from algorl.common.logger import Logger
 from algorl.common.progress_bar import TqdmProgressBar
 from algorl.common.tensorboard_logger import TensorboardLogger
@@ -46,8 +50,14 @@ class TrainingLoop:
             [callbacks] if callbacks is not None else []
         )
         self.logger = logger or Logger()
-        self._episode_tracker = EpisodeMetricsTracker()
+        if env.is_batched:
+            self._episode_tracker: EpisodeMetricsTracker | BatchedEpisodeMetricsTracker = (
+                BatchedEpisodeMetricsTracker(env.num_envs)
+            )
+        else:
+            self._episode_tracker = EpisodeMetricsTracker()
         self._key = jax.random.PRNGKey(config.seed)
+        self._progress_bar: TqdmProgressBar | None = None
 
     def run(
         self,
@@ -58,9 +68,9 @@ class TrainingLoop:
         progress_bar: TqdmProgressBar | None = None,
     ) -> None:
         """Interact with the environment and call ``learner.train_step`` on schedule."""
+        self._progress_bar = progress_bar
         if progress_bar is not None:
-            bar_kwargs = {"mininterval": 0} if self.env.is_batched else {}
-            progress_bar.start(total_timesteps, **bar_kwargs)
+            progress_bar.start(total_timesteps)
         try:
             if self.env.is_batched:
                 self._run_batched(
@@ -77,6 +87,7 @@ class TrainingLoop:
                 progress_bar=progress_bar,
             )
         finally:
+            self._progress_bar = None
             if progress_bar is not None:
                 progress_bar.close()
             self._close_logger()
@@ -174,20 +185,45 @@ class TrainingLoop:
             )
             transitions = self._transitions_from_rollout(batch, search_results)
             self._release_rollout_search_cache(search_results)
-            num_added = 0
-            for transition in transitions:
-                self.replay_buffer.add(transition)
-                steps_collected += 1
-                num_added += 1
-                if steps_collected >= total_timesteps:
-                    break
+            if self.config.gradient_steps_per_rollout is None:
+                # Sequential-parity: add transitions and train immediately, so the
+                # replay-buffer warmup within the chunk matches the sequential
+                # loop's timing (affects PER sampling and learning curve shape).
+                num_added = 0
+                for transition in transitions:
+                    if steps_collected >= total_timesteps:
+                        break
+                    self.replay_buffer.add(transition)
+                    steps_collected += 1
+                    num_added += 1
+                    current_step = chunk_start_step + num_added - 1
+                    metrics = self._maybe_train(
+                        current_step,
+                        metrics,
+                        progress_bar=progress_bar,
+                    )
+                    self._maybe_checkpoint(current_step, metrics, checkpoint_path)
+                if num_added == 0:
+                    continue
+            else:
+                num_added = 0
+                for transition in transitions:
+                    self.replay_buffer.add(transition)
+                    steps_collected += 1
+                    num_added += 1
+                    if steps_collected >= total_timesteps:
+                        break
 
-            if num_added == 0:
-                continue
-            chunk_end_step = chunk_start_step + num_added - 1
-            for train_step in self._batched_gradient_steps(chunk_start_step, chunk_end_step):
-                metrics = self._maybe_train(train_step, metrics, progress_bar=progress_bar)
-                self._maybe_checkpoint(train_step, metrics, checkpoint_path)
+                if num_added == 0:
+                    continue
+                chunk_end_step = chunk_start_step + num_added - 1
+                train_steps = self._batched_gradient_steps(chunk_start_step, chunk_end_step)
+                metrics = self._run_gradient_burst(
+                    train_steps,
+                    metrics,
+                    checkpoint_path=checkpoint_path,
+                    progress_bar=progress_bar,
+                )
 
     def _batched_gradient_steps(self, chunk_start: int, chunk_end: int) -> list[int]:
         """Return global env steps that should trigger ``train_step`` after one rollout chunk."""
@@ -215,6 +251,71 @@ class TrainingLoop:
         if len(scheduled) > capped:
             scheduled = scheduled[-capped:]
         return scheduled
+
+    def _run_gradient_burst(
+        self,
+        train_steps: list[int],
+        metrics: dict[str, Any],
+        *,
+        checkpoint_path: str | None,
+        progress_bar: TqdmProgressBar | None,
+    ) -> dict[str, Any]:
+        """Run a capped post-rollout training burst (batched throughput path)."""
+        if not train_steps:
+            return metrics
+
+        num_steps = len(train_steps)
+        if progress_bar is not None:
+            progress_bar.pulse({"phase": "training", "train_burst": f"0/{num_steps}"})
+            setattr(
+                self.learner,
+                "_on_reanalyze_progress",
+                lambda done, total: progress_bar.pulse(
+                    {
+                        "phase": "reanalyze",
+                        "reanalyze": f"{done}/{total}",
+                    }
+                ),
+            )
+        try:
+            train_burst = getattr(self.learner, "train_burst", None)
+            if callable(train_burst):
+                trained_metrics = train_burst(
+                    self.replay_buffer,
+                    num_steps,
+                    on_progress=lambda done, total: (
+                        progress_bar.pulse(
+                            {
+                                "phase": "training",
+                                "train_burst": f"{done}/{total}",
+                            }
+                        )
+                        if progress_bar is not None
+                        else None
+                    ),
+                )
+            else:
+                trained_metrics: dict[str, float] = {}
+                for index, train_step in enumerate(train_steps):
+                    if progress_bar is not None:
+                        progress_bar.pulse(
+                            {
+                                "phase": "training",
+                                "train_burst": f"{index + 1}/{num_steps}",
+                            }
+                        )
+                    trained_metrics = self.learner.train_step(self.replay_buffer)
+                    self._maybe_checkpoint(train_step, {**metrics, **trained_metrics}, checkpoint_path)
+        finally:
+            if progress_bar is not None and hasattr(self.learner, "_on_reanalyze_progress"):
+                delattr(self.learner, "_on_reanalyze_progress")
+            self._release_rollout_search_cache([])
+
+        merged = {**metrics, **trained_metrics}
+        self._maybe_checkpoint(train_steps[-1], merged, checkpoint_path)
+        if progress_bar is not None:
+            progress_bar.pulse({**trained_metrics, "phase": "buffer"})
+        return merged
 
     def _consume_rollout_vector_step(
         self,
@@ -245,6 +346,7 @@ class TrainingLoop:
         lane_infos = list(infos)
         processed = 0
         success_values: list[float] = []
+        completed_episodes: list = []
 
         for lane in range(min(int(env_steps), reward_array.shape[0], len(lane_infos))):
             if steps_collected + rollout_progress >= total_timesteps:
@@ -255,10 +357,13 @@ class TrainingLoop:
             if "success" in info:
                 success_values.append(float(info["success"]))
 
-            episode_event = self._episode_tracker.observe_step(reward, done, info)
+            if isinstance(self._episode_tracker, BatchedEpisodeMetricsTracker):
+                episode_event = self._episode_tracker.observe_step(lane, reward, done, info)
+            else:
+                episode_event = self._episode_tracker.observe_step(reward, done, info)
             if episode_event is not None:
                 metrics = self._record_episode(step_counter, episode_event, metrics)
-                self._episode_tracker.begin_episode(info)
+                completed_episodes.append(episode_event)
 
             self._log_step(
                 step_counter,
@@ -277,6 +382,8 @@ class TrainingLoop:
             }
             if success_values:
                 batched_metrics["train/batched/success_frac"] = float(np.mean(success_values))
+            if completed_episodes:
+                batched_metrics.update(batched_episode_summary_metrics(completed_episodes))
             task_name = rollout_step_info.get("task_name")
             if isinstance(task_name, str) and task_name:
                 from algorl.common.episode_metrics import sanitize_task_name
@@ -298,10 +405,13 @@ class TrainingLoop:
 
     def _batched_policy(self, search_results: list[Any] | None = None) -> PolicyFn:
         planner = self.planner
+        progress_bar = self._progress_bar
 
         if isinstance(planner, BatchedPlanner):
             def policy(observations: jnp.ndarray | np.ndarray, key: jnp.ndarray) -> jnp.ndarray:
                 del key
+                if progress_bar is not None:
+                    progress_bar.pulse({"phase": "search"})
                 obs_array = np.asarray(observations, dtype=np.float32)
                 obs_batch = [obs_array[lane] for lane in range(obs_array.shape[0])]
                 result = planner.search_batch(obs_batch, deterministic=False)
@@ -354,14 +464,14 @@ class TrainingLoop:
         event: object,
         metrics: dict[str, Any],
     ) -> dict[str, Any]:
-        from algorl.common.episode_metrics import EpisodeEndEvent
+        from algorl.common.episode_metrics import EpisodeEndEvent, episode_metrics_from_event
 
         if not isinstance(event, EpisodeEndEvent):
             return metrics
         if isinstance(self.logger, TensorboardLogger):
             episode_metrics = self.logger.record_episode(step, event)
         else:
-            episode_metrics = self._episode_tracker.metrics_from_event(event)
+            episode_metrics = episode_metrics_from_event(event)
         return {**metrics, **episode_metrics}
 
     def _close_logger(self) -> None:
@@ -456,6 +566,8 @@ class TrainingLoop:
             )
 
     def _select_action(self, observation: Observation) -> Action:
+        if self._progress_bar is not None:
+            self._progress_bar.pulse({"phase": "search"})
         return self.planner.search(observation, deterministic=False)
 
     def _enrich_transition_info(self, info: dict[str, object]) -> dict[str, object]:

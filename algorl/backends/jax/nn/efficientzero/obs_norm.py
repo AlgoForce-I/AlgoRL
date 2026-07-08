@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from typing import Any
 
+import jax.numpy as jnp
 import numpy as np
 
 
@@ -68,5 +69,46 @@ def update_representation_obs_stats(
         "running_mean": new_mean,
         "running_var": new_var,
         "running_count": np.asarray(new_count, dtype=np.float32),
+    }
+    return updated
+
+
+def update_representation_obs_stats_jax(
+    params: dict[str, Any],
+    observations: jnp.ndarray,
+    *,
+    initial_count: float = 1e3,
+) -> dict[str, Any]:
+    """JAX-friendly observation stats update for fused training scans."""
+    rep_params = params["representation_model"]
+    obs = observations
+    if obs.ndim == 3:
+        flat = obs.reshape(-1, obs.shape[-1])
+    elif obs.ndim == 2:
+        flat = obs
+    else:
+        flat = obs.reshape(1, -1)
+
+    mean = jnp.asarray(rep_params["running_mean"], dtype=jnp.float32)
+    var = jnp.asarray(rep_params["running_var"], dtype=jnp.float32)
+    count = jnp.asarray(rep_params.get("running_count", initial_count), dtype=jnp.float32)
+    batch_count = jnp.asarray(flat.shape[0], dtype=jnp.float32)
+    batch_mean = jnp.mean(flat, axis=0)
+    batch_var = jnp.var(flat, axis=0)
+
+    delta = batch_mean - mean
+    tot_count = count + batch_count
+    new_mean = mean + delta * batch_count / tot_count
+    m_a = var * count
+    m_b = batch_var * batch_count
+    m2 = m_a + m_b + jnp.square(delta) * count * batch_count / tot_count
+    new_var = m2 / tot_count
+
+    updated = dict(params)
+    updated["representation_model"] = {
+        **rep_params,
+        "running_mean": new_mean,
+        "running_var": new_var,
+        "running_count": tot_count,
     }
     return updated

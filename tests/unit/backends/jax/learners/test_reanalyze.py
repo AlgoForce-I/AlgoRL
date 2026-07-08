@@ -75,7 +75,7 @@ def test_reanalyze_uses_planner_search_batch_size() -> None:
         params=_REANALYZE_PARAMS,
         reanalyze_count=5,
     )
-    assert planner.batch_sizes == [4, 4, 4, 3]
+    assert planner.batch_sizes == [4, 4, 4, 4]
 
 
 def test_reanalyze_search_batch_size_override() -> None:
@@ -90,7 +90,7 @@ def test_reanalyze_search_batch_size_override() -> None:
         reanalyze_count=5,
         search_batch_size=4,
     )
-    assert planner.batch_sizes == [4, 4, 4, 3]
+    assert planner.batch_sizes == [4, 4, 4, 4]
 
 
 def test_reanalyze_search_uses_reanalyze_params() -> None:

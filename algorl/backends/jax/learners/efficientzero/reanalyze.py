@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from collections.abc import Callable
+from collections.abc import Callable, Sequence
 
 import jax
 import jax.numpy as jnp
@@ -130,64 +130,16 @@ def _pad_trajectory_steps(
     return padded_policies, search_values, padded_candidates, padded_best
 
 
-def reanalyze_policy_batch(
-    planner: EfficientZeroPlanner,
-    observations: np.ndarray,
+def _scatter_reanalyze_batch(
     *,
-    params: Params,
-    reanalyze_count: int,
-    temperature: float = 1.0,
-    search_batch_size: int | None = None,
-    on_progress: Callable[[int, int], None] | None = None,
+    batch_size: int,
+    window: int,
+    count: int,
+    step_policies: dict[tuple[int, int], np.ndarray],
+    step_values: dict[tuple[int, int], float],
+    step_candidates: dict[tuple[int, int], np.ndarray],
+    step_best: dict[tuple[int, int], np.ndarray],
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
-    """Run fresh MCTS on the first ``reanalyze_count`` batch items (policy reanalyze only).
-
-    Returns ``policy_targets``, ``search_values``, ``policy_candidates``, and
-    ``best_actions`` with shape ``[B, K+1, ...]``.
-    """
-    batch_size, window, _ = observations.shape
-    count = min(int(reanalyze_count), batch_size)
-    if count <= 0:
-        raise ValueError("reanalyze_count must be > 0 when reanalyze is enabled.")
-
-    if search_batch_size is None:
-        search_batch_size = max(1, planner.search_batch_size)
-    else:
-        search_batch_size = max(1, validate_search_batch_size(search_batch_size))
-    work_items = [(batch_index, step_index) for batch_index in range(count) for step_index in range(window)]
-    total_progress = len(work_items)
-
-    step_policies: dict[tuple[int, int], np.ndarray] = {}
-    step_values: dict[tuple[int, int], float] = {}
-    step_candidates: dict[tuple[int, int], np.ndarray] = {}
-    step_best: dict[tuple[int, int], np.ndarray] = {}
-    completed_progress = 0
-
-    for chunk_start in range(0, total_progress, search_batch_size):
-        chunk_items = work_items[chunk_start : chunk_start + search_batch_size]
-        obs_chunk = np.stack(
-            [_as_host_array(observations[batch_index, step_index]) for batch_index, step_index in chunk_items],
-            axis=0,
-        )
-        result = planner.search_batch(
-            obs_chunk,
-            deterministic=False,
-            temperature=temperature,
-            params=params,
-            use_self_play=False,
-        )
-        for lane, (batch_index, step_index) in enumerate(chunk_items):
-            weights, value, candidates, best = _extract_search_outputs(result, lane)
-            key = (batch_index, step_index)
-            step_policies[key] = weights
-            step_values[key] = value
-            step_candidates[key] = candidates
-            step_best[key] = best
-
-        completed_progress += len(chunk_items)
-        if on_progress is not None:
-            on_progress(completed_progress, total_progress)
-
     policy_targets = np.zeros((batch_size, window, 0), dtype=np.float32)
     search_values = np.zeros((batch_size, window), dtype=np.float32)
     policy_candidates: list[np.ndarray] = []
@@ -230,6 +182,180 @@ def reanalyze_policy_batch(
     for batch_index, candidates in enumerate(policy_candidates):
         stacked[batch_index, :, : candidates.shape[1], :] = candidates
     return policy_targets, search_values, stacked, best_actions
+
+
+def _pad_search_observations(
+    observations: np.ndarray,
+    *,
+    search_batch_size: int,
+) -> tuple[np.ndarray, int]:
+    """Pad MCTS roots to a fixed width so JAX search compiles once."""
+    chunk = np.asarray(observations, dtype=np.float32)
+    valid_count = int(chunk.shape[0])
+    if valid_count == search_batch_size:
+        return chunk, valid_count
+    if valid_count > search_batch_size:
+        raise ValueError(
+            f"search chunk size {valid_count} exceeds configured width {search_batch_size}."
+        )
+    if valid_count == 0:
+        raise ValueError("search chunk must contain at least one observation.")
+    pad = np.repeat(chunk[-1:], search_batch_size - valid_count, axis=0)
+    return np.concatenate([chunk, pad], axis=0), valid_count
+
+
+def _execute_reanalyze_mcts(
+    planner: EfficientZeroPlanner,
+    observation_batches: Sequence[np.ndarray],
+    work_items: Sequence[tuple[int, int, int]],
+    *,
+    params: Params,
+    temperature: float,
+    search_batch_size: int,
+    on_progress: Callable[[int, int], None] | None = None,
+) -> tuple[
+    dict[tuple[int, int, int], np.ndarray],
+    dict[tuple[int, int, int], float],
+    dict[tuple[int, int, int], np.ndarray],
+    dict[tuple[int, int, int], np.ndarray],
+]:
+    step_policies: dict[tuple[int, int, int], np.ndarray] = {}
+    step_values: dict[tuple[int, int, int], float] = {}
+    step_candidates: dict[tuple[int, int, int], np.ndarray] = {}
+    step_best: dict[tuple[int, int, int], np.ndarray] = {}
+    total_progress = len(work_items)
+    completed_progress = 0
+
+    for chunk_start in range(0, total_progress, search_batch_size):
+        chunk_items = work_items[chunk_start : chunk_start + search_batch_size]
+        obs_chunk = np.stack(
+            [
+                _as_host_array(observation_batches[burst_index][batch_index, step_index])
+                for burst_index, batch_index, step_index in chunk_items
+            ],
+            axis=0,
+        )
+        padded_chunk, valid_count = _pad_search_observations(
+            obs_chunk,
+            search_batch_size=search_batch_size,
+        )
+        result = planner.search_batch(
+            padded_chunk,
+            deterministic=False,
+            temperature=temperature,
+            params=params,
+            use_self_play=False,
+        )
+        for lane, item in enumerate(chunk_items):
+            if lane >= valid_count:
+                break
+            weights, value, candidates, best = _extract_search_outputs(result, lane)
+            step_policies[item] = weights
+            step_values[item] = value
+            step_candidates[item] = candidates
+            step_best[item] = best
+
+        completed_progress += len(chunk_items)
+        if on_progress is not None:
+            on_progress(completed_progress, total_progress)
+
+    return step_policies, step_values, step_candidates, step_best
+
+
+def reanalyze_fused_policy_batches(
+    planner: EfficientZeroPlanner,
+    observation_batches: Sequence[np.ndarray],
+    *,
+    params: Params,
+    reanalyze_count: int,
+    temperature: float = 1.0,
+    search_batch_size: int | None = None,
+    on_progress: Callable[[int, int], None] | None = None,
+) -> list[tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]]:
+    """Run fresh MCTS for multiple training batches through one wide search queue."""
+    if not observation_batches:
+        return []
+    if int(reanalyze_count) <= 0:
+        raise ValueError("reanalyze_count must be > 0 when reanalyze is enabled.")
+
+    if search_batch_size is None:
+        search_batch_size = max(1, planner.search_batch_size)
+    else:
+        search_batch_size = max(1, validate_search_batch_size(search_batch_size))
+
+    work_items: list[tuple[int, int, int]] = []
+    for burst_index, observations in enumerate(observation_batches):
+        batch_size, window, _ = observations.shape
+        count = min(int(reanalyze_count), batch_size)
+        for batch_index in range(count):
+            for step_index in range(window):
+                work_items.append((burst_index, batch_index, step_index))
+
+    step_policies, step_values, step_candidates, step_best = _execute_reanalyze_mcts(
+        planner,
+        observation_batches,
+        work_items,
+        params=params,
+        temperature=temperature,
+        search_batch_size=search_batch_size,
+        on_progress=on_progress,
+    )
+
+    outputs: list[tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]] = []
+    for burst_index, observations in enumerate(observation_batches):
+        batch_size, window, _ = observations.shape
+        count = min(int(reanalyze_count), batch_size)
+        local_policies: dict[tuple[int, int], np.ndarray] = {}
+        local_values: dict[tuple[int, int], float] = {}
+        local_candidates: dict[tuple[int, int], np.ndarray] = {}
+        local_best: dict[tuple[int, int], np.ndarray] = {}
+        for batch_index in range(count):
+            for step_index in range(window):
+                key = (burst_index, batch_index, step_index)
+                local_key = (batch_index, step_index)
+                local_policies[local_key] = step_policies[key]
+                local_values[local_key] = step_values[key]
+                local_candidates[local_key] = step_candidates[key]
+                local_best[local_key] = step_best[key]
+        outputs.append(
+            _scatter_reanalyze_batch(
+                batch_size=batch_size,
+                window=window,
+                count=count,
+                step_policies=local_policies,
+                step_values=local_values,
+                step_candidates=local_candidates,
+                step_best=local_best,
+            )
+        )
+    return outputs
+
+
+def reanalyze_policy_batch(
+    planner: EfficientZeroPlanner,
+    observations: np.ndarray,
+    *,
+    params: Params,
+    reanalyze_count: int,
+    temperature: float = 1.0,
+    search_batch_size: int | None = None,
+    on_progress: Callable[[int, int], None] | None = None,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+    """Run fresh MCTS on the first ``reanalyze_count`` batch items (policy reanalyze only).
+
+    Returns ``policy_targets``, ``search_values``, ``policy_candidates``, and
+    ``best_actions`` with shape ``[B, K+1, ...]``.
+    """
+    results = reanalyze_fused_policy_batches(
+        planner,
+        [observations],
+        params=params,
+        reanalyze_count=reanalyze_count,
+        temperature=temperature,
+        search_batch_size=search_batch_size,
+        on_progress=on_progress,
+    )
+    return results[0]
 
 
 def reanalyze_training_batch(

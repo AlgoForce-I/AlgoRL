@@ -228,6 +228,11 @@ def test_batched_gradient_steps_per_rollout_limits_train_calls() -> None:
             self.calls += 1
             return {"loss": float(self.calls)}
 
+        def train_burst(self, replay_buffer: ReplayBuffer, steps: int, **kwargs) -> dict[str, float]:
+            del replay_buffer, kwargs
+            self.calls += steps
+            return {"loss": float(self.calls)}
+
     learner = _CountingLearner()
     buffer = UniformReplayBuffer(capacity=100)
     config = BaseAgentConfig(
@@ -247,6 +252,86 @@ def test_batched_gradient_steps_per_rollout_limits_train_calls() -> None:
     )
     loop.run(8)
     assert len(buffer) == 8
+    assert learner.calls == 2
+
+
+def test_training_loop_batched_train_burst_runs_capped_updates() -> None:
+    num_envs = 2
+    env = _MockBatchedEnv(num_envs=num_envs)
+
+    class _BurstLearner(Learner):
+        def __init__(self) -> None:
+            self.burst_sizes: list[int] = []
+
+        def train_step(self, replay_buffer: ReplayBuffer) -> dict[str, float]:
+            del replay_buffer
+            return {"loss": 0.0}
+
+        def train_burst(self, replay_buffer: ReplayBuffer, steps: int, **kwargs) -> dict[str, float]:
+            del replay_buffer, kwargs
+            self.burst_sizes.append(steps)
+            return {"loss": float(steps)}
+
+    learner = _BurstLearner()
+    buffer = UniformReplayBuffer(capacity=100)
+    config = BaseAgentConfig(
+        learning_starts=0,
+        train_freq=1,
+        batch_size=1,
+        seed=0,
+        jax_rollout_chunk=2,
+        gradient_steps_per_rollout=num_envs,
+    )
+    loop = TrainingLoop(
+        env=env,
+        planner=_BatchedPlanner(batch_size=num_envs),
+        learner=learner,
+        replay_buffer=buffer,
+        config=config,
+    )
+    loop.run(8)
+    assert learner.burst_sizes == [num_envs, num_envs]
+
+
+def test_training_loop_batched_interleaves_training_with_replay_buffer_warmup() -> None:
+    """Batched mode should match sequential timing once buffer size gates training.
+
+    With num_envs=2 and jax_rollout_chunk=2, the first chunk adds 4 transitions.
+    If batch_size=3 and learning_starts=0, sequential would start training on
+    global step 2 (len(buffer) becomes 3) and then again on step 3.
+    """
+    num_envs = 2
+    env = _MockBatchedEnv(num_envs=num_envs)
+
+    class _CountingLearner(Learner):
+        def __init__(self) -> None:
+            self.calls = 0
+
+        def train_step(self, replay_buffer: ReplayBuffer) -> dict[str, float]:
+            # Ensure train is only called when the buffer is warm enough.
+            assert len(replay_buffer) >= 3
+            self.calls += 1
+            return {"loss": float(self.calls)}
+
+    learner = _CountingLearner()
+    buffer = UniformReplayBuffer(capacity=100)
+    config = BaseAgentConfig(
+        learning_starts=0,
+        train_freq=1,
+        batch_size=3,
+        seed=0,
+        jax_rollout_chunk=2,
+        gradient_steps_per_rollout=None,
+    )
+    loop = TrainingLoop(
+        env=env,
+        planner=_BatchedPlanner(batch_size=num_envs),
+        learner=learner,
+        replay_buffer=buffer,
+        config=config,
+    )
+    loop.run(4)
+    assert len(buffer) == 4
     assert learner.calls == 2
 
 
@@ -336,6 +421,57 @@ def test_training_loop_batched_tensorboard_logs_during_rollout() -> None:
         assert any("train/reward" in entry for entry in logger.history)
 
 
+def test_training_loop_batched_logs_per_lane_episode_returns() -> None:
+    num_envs = 2
+    env = _MockBatchedEnv(num_envs=num_envs)
+    buffer = UniformReplayBuffer(capacity=100)
+    planner = _BatchedPlanner(batch_size=num_envs)
+    config = BaseAgentConfig(learning_starts=0, train_freq=100, batch_size=100, seed=0, jax_rollout_chunk=1)
+
+    original_collect = env.collect_rollout
+
+    def collect_with_done(policy, num_steps, *, key=None, on_step=None):
+        batch = original_collect(policy, num_steps, key=key, on_step=None)
+        if on_step is not None:
+            on_step(
+                num_envs,
+                {
+                    "train/reward": 0.0,
+                    "rewards": np.asarray([1.0, 10.0], dtype=np.float32),
+                    "dones": np.asarray([True, False], dtype=bool),
+                    "infos": [{}, {}],
+                },
+            )
+        return batch
+
+    env.collect_rollout = collect_with_done
+
+    with tempfile.TemporaryDirectory() as log_dir:
+        logger = TensorboardLogger(log_dir)
+        loop = TrainingLoop(
+            env=env,
+            planner=planner,
+            learner=_NoOpLearner(),
+            replay_buffer=buffer,
+            config=config,
+            logger=logger,
+        )
+        loop.run(2)
+        episode_returns = [
+            entry["train/episode_return"]
+            for entry in logger.history
+            if "train/episode_return" in entry
+        ]
+        assert episode_returns
+        assert all(return_value == 1.0 for return_value in episode_returns)
+        assert 11.0 not in episode_returns
+        summary_entries = [
+            entry for entry in logger.history if "train/batched/mean_episode_return" in entry
+        ]
+        assert summary_entries
+        assert summary_entries[0]["train/batched/mean_episode_return"] == 1.0
+
+
 def test_training_loop_batched_progress_bar_updates_during_rollout() -> None:
     num_envs = 2
     env = _MockBatchedEnv(num_envs=num_envs)
@@ -354,6 +490,7 @@ def test_training_loop_batched_progress_bar_updates_during_rollout() -> None:
         def __init__(self) -> None:
             self.total = 0
             self.n = 0
+            self.pulses: list[dict[str, object]] = []
 
         def start(self, total: int, **kwargs) -> None:
             del kwargs
@@ -363,6 +500,10 @@ def test_training_loop_batched_progress_bar_updates_during_rollout() -> None:
             del step_info
             self.n += n
 
+        def pulse(self, step_info=None) -> None:
+            if step_info is not None:
+                self.pulses.append(dict(step_info))
+
         def close(self) -> None:
             return
 
@@ -370,6 +511,7 @@ def test_training_loop_batched_progress_bar_updates_during_rollout() -> None:
     loop.run(4, progress_bar=progress_bar)
     assert progress_bar.n == 4
     assert len(buffer) == 4
+    assert any(pulse.get("phase") == "search" for pulse in progress_bar.pulses)
 
 
 def test_training_loop_merges_rollout_step_info() -> None:

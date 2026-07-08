@@ -164,4 +164,15 @@ class EfficientZeroWorldModel(WorldModel):
 
 
 def build_efficient_zero_world_model(context: ComponentContext) -> EfficientZeroWorldModel:
+    if not isinstance(context.config, EfficientZeroConfig):
+        if getattr(context.config, "require_implemented", True) is False:
+            # Let composition-contract tests resolve with stubs when a generic
+            # BaseAgentConfig is provided.
+            from algorl.backends.jax.world_models import _StubWorldModel
+
+            return _StubWorldModel("efficient_zero", context)  # type: ignore[return-value]
+        raise TypeError(
+            "EfficientZeroWorldModel requires EfficientZeroConfig, "
+            f"got {type(context.config)!r}."
+        )
     return EfficientZeroWorldModel(context)

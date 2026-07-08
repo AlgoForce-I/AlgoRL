@@ -21,10 +21,21 @@ def _build_efficient_zero(context: ComponentContext) -> ReplayBuffer:
     from algorl.agents.configs import EfficientZeroConfig
 
     if not isinstance(context.config, EfficientZeroConfig):
+        if getattr(context.config, "require_implemented", True) is False:
+            # Composition-contract tests pass a generic BaseAgentConfig and
+            # only require that component construction succeeds.
+            effective = EfficientZeroConfig(unroll_steps=5, trajectory_size=100)
+            return EfficientZeroReplayBuffer(
+                capacity=context.config.buffer_capacity,
+                config=effective,
+                unroll_steps=effective.unroll_steps,
+                trajectory_size=int(getattr(effective, "trajectory_size", 100)),
+            )
         raise TypeError(
             "EfficientZero replay buffer requires EfficientZeroConfig, "
             f"got {type(context.config)!r}."
         )
+
     trajectory_size = int(getattr(context.config, "trajectory_size", 100))
     return EfficientZeroReplayBuffer(
         capacity=context.config.buffer_capacity,

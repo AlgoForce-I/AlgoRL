@@ -358,6 +358,18 @@ class EfficientZeroPlanner(BatchedPlanner):
 
 def build_efficient_zero_planner(context: ComponentContext) -> EfficientZeroPlanner:
     """Factory registered as JAX planner kind ``mcts`` for EfficientZero."""
+    if not isinstance(context.config, EfficientZeroConfig):
+        if getattr(context.config, "require_implemented", True) is False:
+            # Allow composition-contract tests to resolve even with a generic
+            # BaseAgentConfig(require_implemented=False) by returning a stub.
+            from algorl.backends.jax.planners import _StubPlanner
+
+            return _StubPlanner("mcts", context)
+        # Caller requested stubs to be rejected; fail fast.
+        raise TypeError(
+            "EfficientZeroPlanner requires EfficientZeroConfig, "
+            f"got {type(context.config)!r}."
+        )
     return EfficientZeroPlanner(context)
 
 
