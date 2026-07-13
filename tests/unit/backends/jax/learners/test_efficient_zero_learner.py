@@ -242,11 +242,18 @@ def test_efficient_zero_learner_train_burst_reanalyze_once_when_scan_chunks(
     assert len(mock_reanalyze.call_args.args[1]) == 6
 
 
-def test_as_candidate_matrix_normalizes_mcts_shapes() -> None:
-    from algorl.backends.jax.learners.efficientzero.reanalyze import _as_candidate_matrix
+def test_batched_search_outputs_normalizes_mcts_shapes() -> None:
+    from algorl.backends.jax.learners.efficientzero.reanalyze import _batched_search_outputs
 
-    matrix = _as_candidate_matrix(np.zeros((16, 4), dtype=np.float32))
-    assert matrix.shape == (16, 4)
+    class _Result:
+        action_weights = np.ones((4, 16), dtype=np.float32)
+        root_values = np.arange(4, dtype=np.float32)
+        root_candidates = np.zeros((4, 16), dtype=np.float32)  # 1-D actions
+        actions = np.zeros((4,), dtype=np.float32)
 
-    vector = _as_candidate_matrix(np.zeros(16, dtype=np.float32))
-    assert vector.shape == (16, 1)
+    weights, values, candidates, best = _batched_search_outputs(_Result(), valid_count=3)
+    assert weights.shape == (3, 16)
+    assert values.shape == (3,)
+    assert candidates.shape == (3, 16, 1)
+    assert best.shape == (3, 1)
+    assert values.tolist() == [0.0, 1.0, 2.0]

@@ -19,6 +19,31 @@ def _configure_jax_for_subprocess_workers() -> None:
     os.environ.setdefault("CUDA_VISIBLE_DEVICES", "")
 
 
+def gpu_available_memory_bytes() -> int | None:
+    """Free device memory on the default JAX accelerator, or ``None`` if unknown.
+
+    Uses the allocator's own view (``bytes_limit`` respects
+    ``XLA_PYTHON_CLIENT_MEM_FRACTION``), so results account for memory already
+    claimed by compiled programs and live buffers.
+    """
+    try:
+        import jax
+
+        device = jax.local_devices()[0]
+        if device.platform == "cpu":
+            return None
+        stats = device.memory_stats()
+        if not stats:
+            return None
+        limit = stats.get("bytes_limit") or stats.get("bytes_reservable_limit")
+        if limit is None:
+            return None
+        in_use = stats.get("bytes_in_use", 0)
+        return max(0, int(limit) - int(in_use))
+    except Exception:  # pragma: no cover - platform-specific probing
+        return None
+
+
 def configure_jax_gpu_memory(
     *,
     preallocate: bool = False,

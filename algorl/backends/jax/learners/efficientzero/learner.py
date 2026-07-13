@@ -15,11 +15,13 @@ import optax
 
 from algorl.agents.configs import EfficientZeroConfig
 from algorl.backends.jax.learners.efficientzero.reanalyze import (
+    ValueInferenceFn,
     batch_initial_values,
-    effective_reanalyze_search_batch_size,
+    make_batched_value_inference,
     mcts_temperature,
     reanalyze_fused_policy_batches,
     reanalyze_policy_batch,
+    resolve_reanalyze_search_width,
 )
 from algorl.buffers.efficientzero.targets import (
     prepare_bootstrapped_batch_values,
@@ -350,6 +352,12 @@ class EfficientZeroLearner(Learner):
         )
         self._opt_state = self._optimizer.init(self.params)
         self._burst_spec = training_burst_spec(self.config, context.env)
+        self._value_infer_fn = make_batched_value_inference(self.model)
+        # Resolve once so every reanalyze call compiles to a single width.
+        self._reanalyze_search_width = resolve_reanalyze_search_width(
+            self.config,
+            action_dim=self._burst_spec.action_dim,
+        )
         self._update = jax.jit(
             partial(
                 _optimizer_step,
@@ -398,6 +406,8 @@ class EfficientZeroLearner(Learner):
             rng_key=step_key,
             on_reanalyze_progress=getattr(self, "_on_reanalyze_progress", None),
             skip_reanalyze=skip_reanalyze,
+            value_infer_fn=self._value_infer_fn,
+            reanalyze_search_width=self._reanalyze_search_width,
         )
         self.params = update_representation_obs_stats(
             self.params,
@@ -471,6 +481,7 @@ class EfficientZeroLearner(Learner):
                 total_transitions=replay_buffer.total_transitions,
                 rng_key=step_keys[offset],
                 skip_reanalyze=True,
+                value_infer_fn=self._value_infer_fn,
             )
             prepared_batches.append(arrays)
             observation_windows.append(
@@ -489,7 +500,7 @@ class EfficientZeroLearner(Learner):
                 params=self._reanalyze_params,
                 reanalyze_count=reanalyze_count,
                 temperature=temperature,
-                search_batch_size=effective_reanalyze_search_batch_size(self.config),
+                search_batch_size=self._reanalyze_search_width,
                 on_progress=getattr(self, "_on_reanalyze_progress", None),
             )
             for offset, refreshed in enumerate(reanalyze_outputs):
@@ -681,6 +692,8 @@ def _prepare_training_batch(
     rng_key: jax.Array,
     on_reanalyze_progress: Callable[[int, int], None] | None = None,
     skip_reanalyze: bool = False,
+    value_infer_fn: ValueInferenceFn | None = None,
+    reanalyze_search_width: int | None = None,
 ) -> dict[str, jnp.ndarray]:
     arrays = _batch_to_arrays(batch)
     window = config.unroll_steps + 1
@@ -704,6 +717,7 @@ def _prepare_training_batch(
             obs,
             rng_key=rng_key,
             mini_batch_size=config.reanalyze_mini_batch_size,
+            infer_fn=value_infer_fn,
         )
 
     if config.model_value_target == "bootstrapped":
@@ -739,13 +753,15 @@ def _prepare_training_batch(
 
     if reanalyze_count > 0 and isinstance(planner, EfficientZeroPlanner):
         temperature = mcts_temperature(config, trained_steps)
+        if reanalyze_search_width is None:
+            reanalyze_search_width = resolve_reanalyze_search_width(config)
         policy_targets, search_values, policy_candidates, best_actions = reanalyze_policy_batch(
             planner,
             observations[:, :window],
             params=reanalyze_params,
             reanalyze_count=reanalyze_count,
             temperature=temperature,
-            search_batch_size=effective_reanalyze_search_batch_size(config),
+            search_batch_size=reanalyze_search_width,
             on_progress=on_reanalyze_progress,
         )
         arrays = _apply_reanalyze_outputs(

@@ -54,7 +54,10 @@ class EfficientZeroConfig(SearchAgentConfig):
     """
 
     reanalyze_ratio: float = 0.5
-    reanalyze_search_batch_size: int | None = None
+    # Reanalyze MCTS width: an int, ``None`` (fall back to ``search_batch_size``),
+    # or ``"auto"`` (size from free GPU memory at learner init; results are
+    # identical at any width, wider just raises device occupancy).
+    reanalyze_search_batch_size: int | str | None = None
     reanalyze_mini_batch_size: int = 256
     reanalyze_update_interval: int = 200
     unroll_steps: int = 5
@@ -158,11 +161,12 @@ class EfficientZeroConfig(SearchAgentConfig):
         """Single-env vector control (Gymnasium / DMC state).
 
         Rollout MCTS uses ``search_batch_size=1``; training-time reanalyze
-        batches ``reanalyze_search_batch_size`` roots per JIT search.
+        batches ``reanalyze_search_batch_size`` roots per JIT search
+        (``"auto"`` sizes the width from free GPU memory).
         """
         config = cls.for_dmc_state(
             search_batch_size=1,
-            reanalyze_search_batch_size=10_240,
+            reanalyze_search_batch_size="auto",
             jax_rollout_chunk=10,
             gradient_steps_per_rollout=1,
             batch_size=256,

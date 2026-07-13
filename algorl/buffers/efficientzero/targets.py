@@ -199,41 +199,45 @@ def prepare_bootstrapped_batch_values(
         dtype=np.float32,
     ).reshape(batch_size, window)
 
-    targets = np.zeros((batch_size, unroll_positions), dtype=np.float32)
-    for batch_index in range(batch_size):
-        valid_len = int(valid_lengths[batch_index])
-        limit = int(bootstrap_limits[batch_index])
-        sample_index = int(sample_indices[batch_index])
+    # Vectorized over the batch; float64 accumulation matches the reference
+    # per-element Python-float arithmetic.
+    valid = np.asarray(valid_lengths, dtype=np.int64)[:, None]
+    limits = np.asarray(bootstrap_limits, dtype=np.int64)[:, None]
+    positions = np.arange(unroll_positions, dtype=np.int64)[None, :]
+    discount = float(config.discount)
+    inferred64 = inferred.astype(np.float64)
+    rewards64 = np.asarray(rewards, dtype=np.float64)
 
-        # Off-policy correction: shorter horizon of td steps. Disabled for
-        # ``mixed``/``max`` value targets, exactly as in EfficientZero-V2.
-        if config.value_target in ("mixed", "max"):
-            td_steps = config.td_steps
-        else:
-            td_steps = adaptive_td_steps(
-                config.td_steps,
-                sample_index=sample_index,
-                collected_transitions=total_transitions,
-                auto_td_steps=config.auto_td_steps,
-            )
-        td_steps = int(np.clip(min(valid_len, td_steps), 1, config.td_steps))
+    # Off-policy correction: shorter horizon of td steps. Disabled for
+    # ``mixed``/``max`` value targets, exactly as in EfficientZero-V2.
+    if config.value_target in ("mixed", "max"):
+        base_td = np.full((batch_size,), config.td_steps, dtype=np.int64)
+    else:
+        delta = (total_transitions - np.asarray(sample_indices, dtype=np.int64)) // max(
+            1, int(config.auto_td_steps)
+        )
+        base_td = np.clip(config.td_steps - delta, 1, config.td_steps)
+    base_td = np.clip(np.minimum(valid[:, 0], base_td), 1, config.td_steps)
 
-        for position in range(unroll_positions):
-            td_steps = max(1, min(valid_len - position, td_steps))
-            bootstrap_position = position + td_steps
+    td = np.maximum(1, np.minimum(valid - positions, base_td[:, None]))
+    bootstrap_positions = positions + td
+    bootstrap_mask = (bootstrap_positions <= limits) & (bootstrap_positions < window)
+    bootstrap_safe = np.clip(bootstrap_positions, 0, window - 1)
+    targets = np.where(
+        bootstrap_mask,
+        (discount**td) * np.take_along_axis(inferred64, bootstrap_safe, axis=1),
+        0.0,
+    )
+    for offset in range(int(config.td_steps)):
+        steps = positions + offset
+        step_mask = (offset < td) & (steps < window)
+        steps_safe = np.broadcast_to(np.clip(steps, 0, window - 1), td.shape)
+        reward_term = (discount**offset) * np.take_along_axis(rewards64, steps_safe, axis=1)
+        targets = targets + np.where(step_mask, reward_term, 0.0)
 
-            target = 0.0
-            if bootstrap_position <= limit and bootstrap_position < window:
-                target = float(config.discount**td_steps) * float(
-                    inferred[batch_index, bootstrap_position]
-                )
-            for step in range(position, min(bootstrap_position, window)):
-                target += float(config.discount ** (step - position)) * float(
-                    rewards[batch_index, step]
-                )
-            # Positions past the trajectory end train against zero (masked out).
-            targets[batch_index, position] = target if position <= valid_len else 0.0
-    return targets
+    # Positions past the trajectory end train against zero (masked out).
+    targets = np.where(positions <= valid, targets, 0.0)
+    return targets.astype(np.float32)
 
 
 def prepare_gae_batch_values(
