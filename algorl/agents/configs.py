@@ -192,18 +192,26 @@ class EfficientZeroConfig(SearchAgentConfig):
 
         Training runs as a post-rollout burst of ``num_envs * jax_rollout_chunk``
         gradient steps (one update per collected env step, matching sequential).
-        Reanalyze is fused across the full burst; the scanned optimizer compiles
-        to the same width unless ``burst_compile_steps`` is set lower for
-        memory. Set ``gradient_steps_per_rollout=None`` for interleaved training.
+        The burst executes in sub-bursts of ``burst_compile_steps`` updates:
+        each sub-burst re-samples the buffer, recomputes value targets, and
+        reruns fused reanalyze against the latest parameters and priorities,
+        keeping target staleness close to the sequential loop while the scanned
+        optimizer and wide reanalyze searches keep GPU throughput high. Set
+        ``gradient_steps_per_rollout=None`` for fully interleaved training.
         """
         dynamics_every = 10
         if overrides and "dynamics_update_every" in overrides:
             dynamics_every = int(overrides["dynamics_update_every"])  # type: ignore[arg-type]
+        burst_steps = num_envs * dynamics_every
         config = cls.for_sequential(
             search_batch_size=num_envs,
             jax_rollout_chunk=dynamics_every,
             dynamics_update_every=dynamics_every,
-            gradient_steps_per_rollout=num_envs * dynamics_every,
+            gradient_steps_per_rollout=burst_steps,
+            # Sub-burst width: bounded so priorities/targets refresh at least as
+            # often as the sequential self-play interval, while each sub-burst
+            # still feeds reanalyze enough roots to saturate the search width.
+            burst_compile_steps=min(burst_steps, 64),
         )
         return config.with_overrides(**overrides) if overrides else config
 

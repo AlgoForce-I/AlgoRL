@@ -220,6 +220,29 @@ class EfficientZeroReplayBuffer(ReplayBuffer):
             if step.done and transition.next_observation is not None:
                 final_observation = np.asarray(transition.next_observation, dtype=np.float32)
             self._commit_active(env_id, step.done, final_observation=final_observation)
+        else:
+            self._maybe_release_pending(env_id)
+
+    def _maybe_release_pending(self, env_id: int) -> None:
+        """Store a pending block as soon as its tail context exists.
+
+        The pending block only needs ``trajectory_padding_gap`` steps from the
+        next block for full-horizon value targets. Releasing it immediately
+        (instead of waiting for the next block to fill completely) makes new
+        data sampleable ~one block earlier, which matters for parallel envs
+        where a full block spans ``trajectory_size * num_envs`` global steps.
+        """
+        pending = self._pending_commit.get(env_id)
+        if pending is None:
+            return
+        active = self._active.get(env_id)
+        gap = trajectory_padding_gap(self.config)
+        if active is None or len(active.steps) < gap:
+            return
+        del self._pending_commit[env_id]
+        pending.pad_over(active.steps[:gap])
+        pending.finalize_targets(self.config)
+        self._store_trajectory(pending.steps, pending)
 
     def sample(
         self,

@@ -185,6 +185,45 @@ def test_efficient_zero_buffer_keeps_interleaved_env_streams_separate() -> None:
         assert all(b - a == 1.0 for a, b in zip(observed, observed[1:]))
 
 
+def test_efficient_zero_buffer_releases_pending_block_after_gap_tail() -> None:
+    """A full block becomes sampleable once the next block has its tail context.
+
+    Waiting for the next block to *fill* delays data availability by a whole
+    trajectory block (trajectory_size * num_envs env steps in batched runs).
+    """
+    config = EfficientZeroConfig(
+        unroll_steps=2,
+        trajectory_size=10,
+        td_steps=2,
+        use_priority=False,
+    )
+    buffer = EfficientZeroReplayBuffer(
+        capacity=1000,
+        config=config,
+        unroll_steps=2,
+        trajectory_size=10,
+    )
+    gap = 1 + 2  # n_stack + td_steps for bootstrapped targets
+
+    for index in range(10):
+        buffer.add(_transition(index))
+    # Block is full but has no tail context yet: held back.
+    assert len(buffer) == 0
+    assert 0 in buffer._pending_commit
+
+    for index in range(10, 10 + gap - 1):
+        buffer.add(_transition(index))
+    assert len(buffer) == 0
+
+    buffer.add(_transition(10 + gap - 1))
+    # Gap tail available: pending block stored without waiting for block 2.
+    assert len(buffer) == 10
+    assert 0 not in buffer._pending_commit
+    stored = buffer._stored_steps[0]
+    assert len(stored) == 10 + gap
+    assert [float(step.observation[0]) for step in stored] == [float(i) for i in range(10 + gap)]
+
+
 def test_efficient_zero_buffer_default_env_id_matches_sequential() -> None:
     """Transitions without env_id (sequential path) all land in lane 0."""
     buffer = EfficientZeroReplayBuffer(

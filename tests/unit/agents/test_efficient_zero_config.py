@@ -26,7 +26,9 @@ def test_for_batched_defaults() -> None:
     assert config.buffer_capacity == 100_000
     assert config.learning_starts == 2_000
     assert config.gradient_steps_per_rollout == 32 * 10
-    assert config.burst_compile_steps is None
+    # Sub-bursts keep priorities/targets fresh within each rollout burst.
+    assert config.burst_compile_steps == 64
+    assert EfficientZeroConfig.for_batched(num_envs=4).burst_compile_steps == 40
 
 
 def test_legacy_aliases_match_new_presets() -> None:

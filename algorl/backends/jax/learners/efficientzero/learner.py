@@ -441,7 +441,15 @@ class EfficientZeroLearner(Learner):
         *,
         on_progress: Callable[[int, int], None] | None = None,
     ) -> dict[str, float]:
-        """Run several gradient updates with fused reanalyze and a scanned optimizer."""
+        """Run several gradient updates in compiled sub-bursts.
+
+        Each sub-burst (``burst_compile_steps`` gradient steps) samples the
+        buffer, computes value targets, and runs fused reanalyze *after* the
+        previous sub-burst's parameter and priority updates. Freezing all of
+        this across a long burst (as one big snapshot) measurably hurts sample
+        efficiency versus the sequential loop, since the last gradient steps
+        would train toward targets and priorities hundreds of steps stale.
+        """
         if steps <= 0:
             return {}
         if not isinstance(replay_buffer, EfficientZeroReplayBuffer):
@@ -450,6 +458,31 @@ class EfficientZeroLearner(Learner):
                 f"got {type(replay_buffer)!r}."
             )
 
+        metrics: dict[str, float] = {}
+        completed = 0
+        scan_width = self._burst_spec.burst_steps
+        while completed < steps:
+            chunk_steps = min(steps - completed, scan_width)
+            metrics = self._train_burst_chunk(
+                replay_buffer,
+                chunk_steps,
+                on_progress=on_progress,
+                completed_steps=completed,
+                total_steps=steps,
+            )
+            completed += chunk_steps
+        return metrics
+
+    def _train_burst_chunk(
+        self,
+        replay_buffer: EfficientZeroReplayBuffer,
+        steps: int,
+        *,
+        on_progress: Callable[[int, int], None] | None,
+        completed_steps: int,
+        total_steps: int,
+    ) -> dict[str, float]:
+        """Sample, reanalyze, and run one compiled optimizer scan of ``steps`` updates."""
         beta = self._priority_beta()
         start_step = self._train_steps
         batches: list[Batch] = []
@@ -524,23 +557,16 @@ class EfficientZeroLearner(Learner):
                     trained_steps=start_step + offset,
                 )
 
-        metrics: dict[str, float] = {}
-        completed = 0
-        scan_width = self._burst_spec.burst_steps
-        while completed < steps:
-            chunk_steps = min(steps - completed, scan_width)
-            metrics = self._run_burst_scan_chunk(
-                replay_buffer,
-                prepared_batches=prepared_batches[completed : completed + chunk_steps],
-                step_keys=step_keys[completed : completed + chunk_steps],
-                start_step=start_step + completed,
-                chunk_steps=chunk_steps,
-                on_progress=on_progress,
-                completed_steps=completed,
-                total_steps=steps,
-            )
-            completed += chunk_steps
-        return metrics
+        return self._run_burst_scan_chunk(
+            replay_buffer,
+            prepared_batches=prepared_batches,
+            step_keys=step_keys,
+            start_step=start_step,
+            chunk_steps=steps,
+            on_progress=on_progress,
+            completed_steps=completed_steps,
+            total_steps=total_steps,
+        )
 
     def _run_burst_scan_chunk(
         self,

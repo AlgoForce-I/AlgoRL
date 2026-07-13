@@ -197,10 +197,14 @@ def test_efficient_zero_learner_train_burst_reanalyze_once(learner_context: Comp
     assert len(mock_reanalyze.call_args.args[1]) == 3
 
 
-def test_efficient_zero_learner_train_burst_reanalyze_once_when_scan_chunks(
+def test_efficient_zero_learner_train_burst_reanalyzes_per_sub_burst(
     learner_context: ComponentContext,
 ) -> None:
-    """Reanalyze stays fused across the full burst even when the scan is chunked."""
+    """Chunked bursts re-sample and re-reanalyze each sub-burst with fresh params.
+
+    Freezing sampling/reanalyze across the whole burst trains later steps
+    toward stale targets and priorities, hurting sample efficiency.
+    """
     config = learner_context.config.with_overrides(
         batch_size=2,
         reanalyze_ratio=1.0,
@@ -233,13 +237,15 @@ def test_efficient_zero_learner_train_burst_reanalyze_once_when_scan_chunks(
                 np.zeros((2, config.unroll_steps + 1, 1), dtype=np.float32),
             )
         ]
-        * 6,
+        * 2,
     ) as mock_reanalyze:
         metrics = learner.train_burst(buffer, 6)
 
     assert np.isfinite(metrics["loss"])
-    assert mock_reanalyze.call_count == 1
-    assert len(mock_reanalyze.call_args.args[1]) == 6
+    # One fused reanalyze per 2-step sub-burst.
+    assert mock_reanalyze.call_count == 3
+    assert all(len(call.args[1]) == 2 for call in mock_reanalyze.call_args_list)
+    assert learner._train_steps == 6
 
 
 def test_batched_search_outputs_normalizes_mcts_shapes() -> None:
