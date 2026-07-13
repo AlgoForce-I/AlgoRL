@@ -96,6 +96,64 @@ def test_collect_rollout_uses_final_observation_on_done() -> None:
     assert np.allclose(batch.next_observation[0, 0], np.array([9.0, 9.0], dtype=np.float32))
 
 
+class _TerminalAfterTwoSteps(gym.Env):
+    metadata = {"render_modes": []}
+
+    def __init__(self) -> None:
+        self.observation_space = gym.spaces.Box(low=-10.0, high=10.0, shape=(2,), dtype=np.float32)
+        self.action_space = gym.spaces.Discrete(2)
+        self._step_count = 0
+
+    def reset(self, *, seed: int | None = None, options=None):
+        del options
+        if seed is not None:
+            super().reset(seed=seed)
+        self._step_count = 0
+        return np.array([0.0, 0.0], dtype=np.float32), {}
+
+    def step(self, action):
+        del action
+        self._step_count += 1
+        obs = np.array([float(self._step_count), 0.0], dtype=np.float32)
+        return obs, 1.0, self._step_count >= 2, False, {}
+
+
+def test_collect_rollout_flags_next_step_autoreset_transitions() -> None:
+    vector_env = gym.vector.SyncVectorEnv([_TerminalAfterTwoSteps for _ in range(1)])
+    assert vector_env.metadata["autoreset_mode"] == gym.vector.AutoresetMode.NEXT_STEP
+    jax_env = GymnasiumVectorJaxEnv(vector_env, seed=0)
+
+    def policy(observations: np.ndarray, key: jax.Array) -> np.ndarray:
+        del observations, key
+        return np.zeros((1,), dtype=np.int64)
+
+    batch = jax_env.collect_rollout(policy, 4, key=jax.random.PRNGKey(0))
+    assert batch.step_info is not None
+    dones = batch.done[:, 0].tolist()
+    skips = [bool(info[0].get("replay_skip", False)) for info in batch.step_info]
+    # Episode ends at step 1; step 2 is the reset filler and must be flagged.
+    assert dones == [False, True, False, False]
+    assert skips == [False, False, True, False]
+    # The filler step carries the fabricated zero reward.
+    assert batch.reward[2, 0] == 0.0
+
+
+def test_collect_rollout_flags_autoreset_across_chunk_boundary() -> None:
+    vector_env = gym.vector.SyncVectorEnv([_TerminalAfterTwoSteps for _ in range(1)])
+    jax_env = GymnasiumVectorJaxEnv(vector_env, seed=0)
+
+    def policy(observations: np.ndarray, key: jax.Array) -> np.ndarray:
+        del observations, key
+        return np.zeros((1,), dtype=np.int64)
+
+    first = jax_env.collect_rollout(policy, 2, key=jax.random.PRNGKey(0))
+    second = jax_env.collect_rollout(policy, 2, key=jax.random.PRNGKey(1))
+    assert bool(first.done[1, 0])
+    assert second.step_info is not None
+    assert bool(second.step_info[0][0].get("replay_skip", False))
+    assert not second.step_info[1][0].get("replay_skip", False)
+
+
 def test_collect_rollout_continuous_action_shape() -> None:
     pytest.importorskip("mujoco")
     jax_env = make_gymnasium_vector_env(lambda: gym.make("HalfCheetah-v5"), num_envs=2, seed=0)

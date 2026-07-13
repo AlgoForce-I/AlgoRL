@@ -151,6 +151,18 @@ def _actions_for_vector_env(
     return array.astype(np.float32)
 
 
+def _uses_next_step_autoreset(vector_env: gym.vector.VectorEnv) -> bool:
+    """Whether the vector env resets done lanes on the *following* step call."""
+    mode = getattr(vector_env, "metadata", {}).get("autoreset_mode")
+    if mode is None:
+        return False
+    try:
+        from gymnasium.vector import AutoresetMode
+    except ImportError:
+        return False
+    return mode in (AutoresetMode.NEXT_STEP, AutoresetMode.NEXT_STEP.value)
+
+
 @dataclass
 class _GymVectorState:
     observation: np.ndarray
@@ -163,6 +175,10 @@ class GymnasiumVectorJaxEnv(BatchedJaxEnv):
         self._vector_env = vector_env
         self._seed = seed
         self._state: _GymVectorState | None = None
+        self._next_step_autoreset = _uses_next_step_autoreset(vector_env)
+        # Lanes whose previous step ended an episode; under NEXT_STEP autoreset
+        # their next step() call is a reset, not a real transition.
+        self._autoreset_lanes = np.zeros((int(vector_env.num_envs),), dtype=bool)
 
     @property
     def vector_env(self) -> gym.vector.VectorEnv:
@@ -184,6 +200,7 @@ class GymnasiumVectorJaxEnv(BatchedJaxEnv):
         del key
         observation, _ = self._vector_env.reset(seed=self._seed)
         self._state = _GymVectorState(observation=np.asarray(observation, dtype=np.float32))
+        self._autoreset_lanes[:] = False
         return self._state
 
     def observation(self, state: JaxState) -> jnp.ndarray:
@@ -198,7 +215,8 @@ class GymnasiumVectorJaxEnv(BatchedJaxEnv):
             np.asarray(actions),
             action_space=self._vector_env.single_action_space,
         )
-        next_observation, _, _, _, _ = self._vector_env.step(vector_actions)
+        next_observation, _, terminations, truncations, _ = self._vector_env.step(vector_actions)
+        self._autoreset_lanes = np.asarray(terminations | truncations, dtype=bool)
         next_state = _GymVectorState(observation=np.asarray(next_observation, dtype=np.float32))
         self._state = next_state
         return next_state
@@ -241,6 +259,11 @@ class GymnasiumVectorJaxEnv(BatchedJaxEnv):
                 num_envs=self.num_envs,
             )
             vector_actions = _actions_for_vector_env(action, action_space=action_space)
+            resetting_lanes = (
+                self._autoreset_lanes.copy()
+                if self._next_step_autoreset
+                else np.zeros((self.num_envs,), dtype=bool)
+            )
             next_observation, reward, terminations, truncations, infos = self._vector_env.step(
                 vector_actions
             )
@@ -251,7 +274,13 @@ class GymnasiumVectorJaxEnv(BatchedJaxEnv):
                 infos,
             )
             done = np.asarray(terminations | truncations, dtype=bool)
+            self._autoreset_lanes = done.copy()
             lane_infos = _lane_infos_from_vector_infos(infos, self.num_envs)
+            for env_idx in np.flatnonzero(resetting_lanes):
+                # NEXT_STEP autoreset: this lane's step was a reset (action
+                # ignored, reward forced to 0); flag it so replay storage
+                # skips the fabricated transition.
+                lane_infos[int(env_idx)]["replay_skip"] = True
 
             observations.append(obs)
             actions.append(action)

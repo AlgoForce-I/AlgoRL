@@ -357,6 +357,38 @@ def test_training_loop_batched_rollout_stores_search_targets() -> None:
         assert transition.info[SEARCH_VALUE_INFO_KEY] == float(index % num_envs)
 
 
+def test_training_loop_batched_transitions_tag_env_id_and_skip_autoreset_steps() -> None:
+    num_envs = 2
+    env = _MockBatchedEnv(num_envs=num_envs)
+    planner = _BatchedPlanner(batch_size=num_envs)
+    loop = TrainingLoop(
+        env=env,
+        planner=planner,
+        learner=_NoOpLearner(),
+        replay_buffer=UniformReplayBuffer(capacity=100),
+        config=BaseAgentConfig(learning_starts=0, train_freq=100, batch_size=100, seed=0),
+    )
+
+    num_steps = 2
+    observations = np.zeros((num_steps, num_envs, 3), dtype=np.float32)
+    batch = JaxRolloutBatch(
+        observation=observations,
+        action=np.zeros((num_steps, num_envs, 1), dtype=np.float32),
+        reward=np.zeros((num_steps, num_envs), dtype=np.float32),
+        next_observation=observations,
+        done=np.zeros((num_steps, num_envs), dtype=bool),
+        step_info=[
+            [{}, {}],
+            # Env 1's second step is a NEXT_STEP autoreset filler.
+            [{}, {"replay_skip": True}],
+        ],
+    )
+    transitions = loop._transitions_from_rollout(batch, search_results=[])
+
+    assert len(transitions) == num_steps * num_envs - 1
+    assert [transition.info["env_id"] for transition in transitions] == [0, 1, 0]
+
+
 def test_training_loop_progress_bar_shows_training_phase(cartpole_env: TrainingEnv) -> None:
     config = BaseAgentConfig(learning_starts=0, train_freq=1, batch_size=1, seed=0)
     buffer = UniformReplayBuffer(capacity=100)

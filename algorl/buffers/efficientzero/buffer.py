@@ -24,6 +24,7 @@ SEARCH_VALUE_INFO_KEY = "search_value"
 PRED_VALUE_INFO_KEY = "pred_value"
 ROOT_CANDIDATES_INFO_KEY = "root_candidates"
 BEST_ACTION_INFO_KEY = "best_action"
+ENV_ID_INFO_KEY = "env_id"
 
 INFO_KEYS = (
     POLICY_TARGET_INFO_KEY,
@@ -200,17 +201,25 @@ class EfficientZeroReplayBuffer(ReplayBuffer):
         self._lookup: list[tuple[int, int]] = []
         self._priorities: list[float] = []
         self._base_traj_idx = 0
-        self._active = EfficientZeroTrajectory(max_size=trajectory_size)
-        self._pending_commit: EfficientZeroTrajectory | None = None
+        # Per-env-lane trajectory assembly: parallel rollouts interleave
+        # transitions from independent envs, so each lane accumulates its own
+        # temporally-coherent trajectory before committing to shared storage.
+        self._active: dict[int, EfficientZeroTrajectory] = {}
+        self._pending_commit: dict[int, EfficientZeroTrajectory] = {}
         self._total_commits = 0
 
     def add(self, transition: Transition) -> None:
+        env_id = int(transition.info.get(ENV_ID_INFO_KEY, 0))
         step = step_from_transition(transition)
-        if self._active.append(step):
+        active = self._active.get(env_id)
+        if active is None:
+            active = EfficientZeroTrajectory(max_size=self.trajectory_size)
+            self._active[env_id] = active
+        if active.append(step):
             final_observation = None
             if step.done and transition.next_observation is not None:
                 final_observation = np.asarray(transition.next_observation, dtype=np.float32)
-            self._commit_active(step.done, final_observation=final_observation)
+            self._commit_active(env_id, step.done, final_observation=final_observation)
 
     def sample(
         self,
@@ -240,8 +249,14 @@ class EfficientZeroReplayBuffer(ReplayBuffer):
     def total_transitions(self) -> int:
         return len(self._lookup)
 
-    def _commit_active(self, done: bool, *, final_observation: np.ndarray | None = None) -> None:
-        steps = self._active.clear()
+    def _commit_active(
+        self,
+        env_id: int,
+        done: bool,
+        *,
+        final_observation: np.ndarray | None = None,
+    ) -> None:
+        steps = self._active[env_id].clear()
         if not steps:
             return
 
@@ -251,27 +266,19 @@ class EfficientZeroReplayBuffer(ReplayBuffer):
         if done:
             current.final_observation = final_observation
 
-        if self._pending_commit is not None:
+        pending = self._pending_commit.pop(env_id, None)
+        if pending is not None:
             gap = trajectory_padding_gap(self.config)
             tail = current.steps[:gap]
-            self._pending_commit.pad_over(tail)
-            self._pending_commit.finalize_targets(self.config)
-            self._store_trajectory(self._pending_commit.steps, self._pending_commit)
-            self._pending_commit = None
+            pending.pad_over(tail)
+            pending.finalize_targets(self.config)
+            self._store_trajectory(pending.steps, pending)
 
         if len(current.steps) >= self.trajectory_size and not done:
-            self._pending_commit = current
+            self._pending_commit[env_id] = current
         else:
             current.finalize_targets(self.config)
             self._store_trajectory(current.steps, current)
-
-        if done and self._pending_commit is not None:
-            self._pending_commit.finalize_targets(self.config)
-            self._store_trajectory(self._pending_commit.steps, self._pending_commit)
-            self._pending_commit = None
-
-        if not done:
-            self._active = EfficientZeroTrajectory(max_size=self.trajectory_size)
 
     def _store_trajectory(
         self,

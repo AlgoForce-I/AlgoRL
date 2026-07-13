@@ -443,9 +443,22 @@ class TrainingLoop:
         for step_idx in range(batch.num_steps):
             result = search_results[step_idx] if step_idx < len(search_results) else None
             for env_idx in range(batch.num_envs):
+                step_info = (
+                    batch.step_info[step_idx][env_idx]
+                    if batch.step_info is not None
+                    else None
+                )
+                # Gymnasium NEXT_STEP autoreset: the step after a done lane
+                # ignores the action and returns the reset observation; it is
+                # not a real transition and must not enter the replay buffer.
+                if step_info is not None and step_info.get("replay_skip"):
+                    continue
                 info = self._search_info_from_result(result, env_idx)
-                if batch.step_info is not None:
-                    info = {**batch.step_info[step_idx][env_idx], **info}
+                if step_info is not None:
+                    info = {**step_info, **info}
+                # Lane identity lets trajectory-based buffers keep each env's
+                # stream temporally coherent despite interleaved adds.
+                info["env_id"] = env_idx
                 transitions.append(
                     Transition(
                         observation=batch.observation[step_idx, env_idx],

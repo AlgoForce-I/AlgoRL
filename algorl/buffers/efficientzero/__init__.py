@@ -2,6 +2,7 @@
 
 from algorl.buffers.efficientzero.buffer import (
     BEST_ACTION_INFO_KEY,
+    ENV_ID_INFO_KEY,
     INFO_KEYS,
     POLICY_TARGET_INFO_KEY,
     PRED_VALUE_INFO_KEY,
@@ -32,6 +33,7 @@ from algorl.buffers.efficientzero.targets import (
 
 __all__ = [
     "BEST_ACTION_INFO_KEY",
+    "ENV_ID_INFO_KEY",
     "INFO_KEYS",
     "POLICY_TARGET_INFO_KEY",
     "PRED_VALUE_INFO_KEY",
