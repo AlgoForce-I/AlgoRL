@@ -285,9 +285,17 @@ def _loss_from_batch(
     pred_priority_values = pred_scalars
     if pred_priority_values.ndim == 2:
         pred_priority_values = jnp.min(pred_priority_values, axis=0)
+    priority_targets = value_targets[:, 0]
     if config.clip_inference_values:
         pred_priority_values = jnp.clip(pred_priority_values, 0.0, 1e5)
-    priorities = jnp.abs(pred_priority_values - value_targets[:, 0]) + config.min_prior
+        priority_targets = jnp.clip(priority_targets, 0.0, 1e5)
+    priorities = jnp.abs(pred_priority_values - priority_targets) + config.min_prior
+    priorities = jnp.nan_to_num(
+        priorities,
+        nan=config.min_prior,
+        posinf=1e5 + config.min_prior,
+        neginf=config.min_prior,
+    )
 
     metrics = {
         "loss": loss,
@@ -423,10 +431,12 @@ class EfficientZeroLearner(Learner):
             jnp.asarray(self._learning_rate_scale(), dtype=jnp.float32),
         )
         self._sync_params()
-        replay_buffer.update_priorities(
-            np.asarray(arrays["indices"]),
-            np.asarray(metrics["priorities"]),
-        )
+        priorities = np.asarray(metrics["priorities"])
+        if np.all(np.isfinite(priorities)):
+            replay_buffer.update_priorities(
+                np.asarray(arrays["indices"]),
+                priorities,
+            )
         self._train_steps += 1
         return {
             key: float(value)
@@ -608,10 +618,12 @@ class EfficientZeroLearner(Learner):
         self._sync_params()
 
         for offset in range(chunk_steps):
-            replay_buffer.update_priorities(
-                np.asarray(padded_batches[offset]["indices"]),
-                np.asarray(burst_metrics["priorities"][offset]),
-            )
+            priorities = np.asarray(burst_metrics["priorities"][offset])
+            if np.all(np.isfinite(priorities)):
+                replay_buffer.update_priorities(
+                    np.asarray(padded_batches[offset]["indices"]),
+                    priorities,
+                )
         if on_progress is not None:
             on_progress(completed_steps + chunk_steps, total_steps)
 
@@ -1069,13 +1081,27 @@ def _optimizer_step(
         return loss_fn(current_params, batch, rng=rng)
 
     (loss, metrics), grads = jax.value_and_grad(objective, has_aux=True)(params)
-    updates, new_opt_state = optimizer.update(grads, opt_state, params)
-    # EfficientZero-V2 mutates ``param_group['lr']`` per step; Adam updates scale
-    # linearly in the learning rate, so scaling the final update is identical.
-    updates = jax.tree.map(lambda update: update * lr_scale, updates)
-    new_params = optax.apply_updates(params, updates)
-    metrics = {**metrics, "loss": loss}
-    return new_params, new_opt_state, metrics
+
+    def merge_metrics() -> dict[str, jnp.ndarray]:
+        merged = _zeroed_step_metrics(batch)
+        for key in merged:
+            if key in metrics:
+                merged[key] = metrics[key]
+        merged["loss"] = loss
+        return merged
+
+    def apply_step(_: None) -> tuple[Params, optax.OptState, dict[str, jnp.ndarray]]:
+        updates, new_opt_state = optimizer.update(grads, opt_state, params)
+        # EfficientZero-V2 mutates ``param_group['lr']`` per step; Adam updates scale
+        # linearly in the learning rate, so scaling the final update is identical.
+        updates = jax.tree.map(lambda update: update * lr_scale, updates)
+        new_params = optax.apply_updates(params, updates)
+        return new_params, new_opt_state, merge_metrics()
+
+    def skip_step(_: None) -> tuple[Params, optax.OptState, dict[str, jnp.ndarray]]:
+        return params, opt_state, merge_metrics()
+
+    return jax.lax.cond(jnp.isfinite(loss), apply_step, skip_step, None)
 
 
 def build_efficient_zero_learner(context: ComponentContext) -> EfficientZeroLearner:

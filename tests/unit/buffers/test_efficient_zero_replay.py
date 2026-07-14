@@ -248,3 +248,41 @@ def test_efficient_zero_buffer_rejects_oversized_batch() -> None:
 
     with pytest.raises(ValueError, match="exceeds stored transitions"):
         buffer.sample(2)
+
+
+def test_efficient_zero_buffer_samples_when_priorities_contain_nan() -> None:
+    """PER sampling must stay valid even if a stale NaN priority is present."""
+    config = EfficientZeroConfig(unroll_steps=1, trajectory_size=2, use_priority=True)
+    buffer = EfficientZeroReplayBuffer(
+        capacity=100,
+        config=config,
+        unroll_steps=1,
+        trajectory_size=2,
+    )
+    for index in range(4):
+        buffer.add(_transition(index, done=index in {1, 3}))
+
+    buffer._priorities[0] = float("nan")
+    buffer._priorities[1] = float("inf")
+    batch = buffer.sample(2)
+    assert batch.data["observations"].shape[0] == 2
+
+
+def test_efficient_zero_buffer_sanitizes_priority_updates() -> None:
+    config = EfficientZeroConfig(unroll_steps=1, trajectory_size=2, use_priority=True)
+    buffer = EfficientZeroReplayBuffer(
+        capacity=100,
+        config=config,
+        unroll_steps=1,
+        trajectory_size=2,
+    )
+    for index in range(4):
+        buffer.add(_transition(index, done=index in {1, 3}))
+
+    buffer.update_priorities(
+        np.asarray([0, 1], dtype=np.int32),
+        np.asarray([float("nan"), float("inf")], dtype=np.float32),
+    )
+    assert np.all(np.isfinite(buffer._priorities[:2]))
+    batch = buffer.sample(2)
+    assert batch.data["observations"].shape[0] == 2

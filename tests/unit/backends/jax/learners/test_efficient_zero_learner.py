@@ -248,6 +248,46 @@ def test_efficient_zero_learner_train_burst_reanalyzes_per_sub_burst(
     assert learner._train_steps == 6
 
 
+def test_efficient_zero_learner_skips_optimizer_on_non_finite_loss(
+    learner_context: ComponentContext,
+) -> None:
+    learner = build_efficient_zero_learner(learner_context)
+    buffer = EfficientZeroReplayBuffer(
+        capacity=100,
+        config=learner_context.config,
+        unroll_steps=learner_context.config.unroll_steps,
+        trajectory_size=learner_context.config.trajectory_size,
+    )
+    _fill_buffer(buffer)
+    params_before = copy.deepcopy(jax.tree.map(np.asarray, learner.params))
+
+    with (
+        mock.patch(
+            "algorl.backends.jax.learners.efficientzero.learner.update_representation_obs_stats",
+            side_effect=lambda params, obs: params,
+        ),
+        mock.patch(
+            "algorl.backends.jax.learners.efficientzero.learner._loss_from_batch",
+            return_value=(
+                jnp.asarray(float("nan"), dtype=jnp.float32),
+                {"priorities": jnp.full((2,), float("nan"), dtype=jnp.float32)},
+            ),
+        ),
+    ):
+        metrics = learner.train_step(buffer)
+
+    params_after = jax.tree.map(np.asarray, learner.params)
+    assert not np.isfinite(metrics["loss"])
+    assert all(
+        np.allclose(before, after)
+        for before, after in zip(
+            jax.tree.leaves(params_before),
+            jax.tree.leaves(params_after),
+            strict=True,
+        )
+    )
+
+
 def test_batched_search_outputs_normalizes_mcts_shapes() -> None:
     from algorl.backends.jax.learners.efficientzero.reanalyze import _batched_search_outputs
 

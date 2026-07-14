@@ -34,6 +34,23 @@ INFO_KEYS = (
     BEST_ACTION_INFO_KEY,
 )
 
+# Matches ``clip_inference_values`` in the learner priority computation.
+_PRIORITY_VALUE_CLIP = 1e5
+
+
+def _sanitize_priority(value: float, *, min_prior: float) -> float:
+    """Map non-finite PER priorities to a large but sampleable finite weight."""
+    if not np.isfinite(value):
+        return _PRIORITY_VALUE_CLIP + min_prior
+    return float(np.clip(value, min_prior, _PRIORITY_VALUE_CLIP + min_prior))
+
+
+def _finite_max_priority(priorities: list[float], *, default: float = 1.0) -> float:
+    finite = [priority for priority in priorities if np.isfinite(priority)]
+    if not finite:
+        return default
+    return float(max(finite))
+
 
 @dataclass(frozen=True)
 class EfficientZeroStep:
@@ -260,10 +277,14 @@ class EfficientZeroReplayBuffer(ReplayBuffer):
         return self._build_batch(indices, trained_steps=trained_steps)
 
     def update_priorities(self, indices: np.ndarray, priorities: np.ndarray) -> None:
+        min_prior = float(self.config.min_prior)
         for index, priority in zip(indices.reshape(-1), priorities.reshape(-1), strict=True):
             flat_index = int(index)
             if 0 <= flat_index < len(self._priorities):
-                self._priorities[flat_index] = float(priority)
+                self._priorities[flat_index] = _sanitize_priority(
+                    float(priority),
+                    min_prior=min_prior,
+                )
 
     def __len__(self) -> int:
         return len(self._lookup)
@@ -328,12 +349,17 @@ class EfficientZeroReplayBuffer(ReplayBuffer):
 
         # New transitions inherit the buffer-wide max priority (optimistic PER init).
         if self.config.use_priority:
-            traj_priorities = (
-                np.abs(pred_values[:core_len] - np.asarray(bootstrapped[:core_len], dtype=np.float32))
-                + self.config.min_prior
+            pred_for_prior = np.asarray(pred_values[:core_len], dtype=np.float32)
+            boot_for_prior = np.asarray(bootstrapped[:core_len], dtype=np.float32)
+            if self.config.clip_inference_values:
+                pred_for_prior = np.clip(pred_for_prior, 0.0, _PRIORITY_VALUE_CLIP)
+                boot_for_prior = np.clip(boot_for_prior, 0.0, _PRIORITY_VALUE_CLIP)
+            traj_priorities = np.abs(pred_for_prior - boot_for_prior) + self.config.min_prior
+            max_prior = _finite_max_priority(self._priorities)
+            new_priority = _sanitize_priority(
+                max(max_prior, float(traj_priorities.max())),
+                min_prior=self.config.min_prior,
             )
-            max_prior = max(self._priorities) if self._priorities else 1.0
-            new_priority = float(max(max_prior, float(traj_priorities.max())))
         else:
             new_priority = 1.0
 
@@ -358,12 +384,16 @@ class EfficientZeroReplayBuffer(ReplayBuffer):
                 self._priorities[index] = 0.0
 
         priorities = np.asarray(self._priorities[:total], dtype=np.float64)
+        priorities = np.nan_to_num(priorities, nan=0.0, posinf=0.0, neginf=0.0)
+        priorities = np.maximum(priorities, 0.0)
         probs = priorities**self.config.priority_prob_alpha
         total_prob = probs.sum()
-        if total_prob <= 0.0:
-            probs = np.ones_like(probs) / len(probs)
+        if total_prob <= 0.0 or not np.isfinite(total_prob):
+            probs = np.ones_like(priorities) / len(priorities)
         else:
             probs = probs / total_prob
+            if not np.all(np.isfinite(probs)):
+                probs = np.ones_like(priorities) / len(priorities)
 
         rng = np.random.default_rng()
         indices = rng.choice(total, size=batch_size, replace=False, p=probs)

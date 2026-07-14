@@ -24,6 +24,20 @@ from algorl.envs import resolve_env
 NUM_ENVS = 32
 
 
+def half_cheetah_batched_config(*, num_envs: int) -> EfficientZeroConfig:
+    """``for_batched`` with Gym HalfCheetah overrides (DMC preset stays intact)."""
+    return EfficientZeroConfig.for_batched(num_envs=num_envs).with_overrides(
+        # HalfCheetah returns reach thousands; DMC ±299 support caps value learning.
+        value_support_range=(-5000.0, 5000.0),
+        # Random-policy episodes are strongly negative; do not floor MCTS values at 0.
+        clip_inference_values=False,
+        # Per-step rewards can exceed the DMC default once the agent runs forward.
+        reward_support_range=(-10.0, 10.0),
+        use_bn=True,
+        lr_warm_up=0.01,
+    )
+
+
 def main() -> None:
     jax_env = make_gymnasium_vector_env(
         lambda: gym.make("HalfCheetah-v5"),
@@ -34,7 +48,7 @@ def main() -> None:
     env = resolve_env(jax_env, seed=42)
     agent = arl.EfficientZero(
         env,
-        config=EfficientZeroConfig.for_batched(num_envs=NUM_ENVS),
+        config=half_cheetah_batched_config(num_envs=NUM_ENVS),
     )
     agent.learn(
         total_timesteps=10_000_000,
