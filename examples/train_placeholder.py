@@ -10,12 +10,11 @@ from __future__ import annotations
 import gymnasium as gym
 
 import algorl as arl
-from algorl.agents.configs import EfficientZeroConfig
 
 
 def main() -> None:
     env = gym.make("CartPole-v1")
-    config = EfficientZeroConfig(require_implemented=False)
+    config = arl.EfficientZeroConfig(require_implemented=False)
     agent = arl.EfficientZero(env, config=config)
     print(f"AlgoRL {arl.__version__} on {env.spec.id if env.spec else 'unknown env'}")
     print("Call agent.learn() once training is implemented.")

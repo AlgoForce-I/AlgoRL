@@ -2,7 +2,19 @@
 
 import pytest
 
+import algorl as arl
+from algorl.agents import EfficientZeroConfig as AgentsEfficientZeroConfig
 from algorl.agents.configs import EfficientZeroConfig
+
+
+def test_config_classes_exported_from_top_level() -> None:
+    assert arl.EfficientZeroConfig is EfficientZeroConfig
+    assert arl.BaseAgentConfig is not None
+    assert arl.SearchAgentConfig is not None
+
+
+def test_config_classes_exported_from_agents_package() -> None:
+    assert AgentsEfficientZeroConfig is EfficientZeroConfig
 
 
 def test_config_with_overrides() -> None:

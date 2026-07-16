@@ -15,12 +15,21 @@ if mp.current_process().name != "MainProcess":
 
 _LAZY_EXPORTS: dict[str, tuple[str, str]] = {
     "AlphaZero": ("algorl.agents.search.alphazero", "AlphaZero"),
+    "AlphaZeroConfig": ("algorl.agents.configs", "AlphaZeroConfig"),
+    "BaseAgentConfig": ("algorl.agents.configs", "BaseAgentConfig"),
     "DreamerV3": ("algorl.agents.world_model.dreamer_v3", "DreamerV3"),
+    "DreamerV3Config": ("algorl.agents.configs", "DreamerV3Config"),
     "EfficientZero": ("algorl.agents.search.efficient_zero", "EfficientZero"),
+    "EfficientZeroConfig": ("algorl.agents.configs", "EfficientZeroConfig"),
     "MuZero": ("algorl.agents.search.muzero", "MuZero"),
+    "MuZeroConfig": ("algorl.agents.configs", "MuZeroConfig"),
     "PlaNet": ("algorl.agents.world_model.planet", "PlaNet"),
+    "PlaNetConfig": ("algorl.agents.configs", "PlaNetConfig"),
+    "SearchAgentConfig": ("algorl.agents.configs", "SearchAgentConfig"),
     "TDMPC": ("algorl.agents.world_model.td_mpc", "TDMPC"),
+    "TDMPCConfig": ("algorl.agents.configs", "TDMPCConfig"),
     "get_backend": ("algorl.core.factory", "get_backend"),
+    "make_env": ("algorl.envs", "make_env"),
 }
 
 
@@ -34,12 +43,21 @@ def __getattr__(name: str) -> Any:
 
 __all__ = [
     "AlphaZero",
+    "AlphaZeroConfig",
+    "BaseAgentConfig",
     "DreamerV3",
+    "DreamerV3Config",
     "EfficientZero",
+    "EfficientZeroConfig",
     "MuZero",
+    "MuZeroConfig",
     "PlaNet",
+    "PlaNetConfig",
+    "SearchAgentConfig",
     "TDMPC",
+    "TDMPCConfig",
     "get_backend",
+    "make_env",
     "__version__",
 ]
 

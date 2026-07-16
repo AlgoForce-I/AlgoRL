@@ -18,6 +18,8 @@ def test_for_sequential_defaults() -> None:
 def test_for_batched_defaults() -> None:
     config = EfficientZeroConfig.for_batched(num_envs=32)
     assert config.search_batch_size == 32
+    assert config.rollout_envs == 32
+    assert config.uses_batched_rollout
     assert config.jax_rollout_chunk == 10
     assert config.batch_size == 256
     assert config.reanalyze_ratio == 1.0

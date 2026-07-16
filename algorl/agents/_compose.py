@@ -13,7 +13,7 @@ from algorl.agents.configs import BaseAgentConfig
 from algorl.core.agent_components import AgentComponents
 from algorl.core.component_context import ComponentContext
 from algorl.core.factory import get_backend, get_component_factory
-from algorl.envs.resolve import resolve_env
+from algorl.envs.resolve import make_env
 from algorl.envs.training_env import TrainingEnv
 
 
@@ -27,7 +27,7 @@ def compose_agent(
     agent_composition = compositions.registry.create(composition_name)
     resolved_backend = get_backend(config.backend)
     component_factory = get_component_factory(resolved_backend)
-    training_env = env if isinstance(env, TrainingEnv) else resolve_env(env)
+    training_env = env if isinstance(env, TrainingEnv) else make_env(env, config=config, seed=config.seed)
     context = ComponentContext(backend=resolved_backend, config=config, env=training_env)
 
     stub_components: list[str] = []

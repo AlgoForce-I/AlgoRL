@@ -16,25 +16,21 @@ from algorl.backends.jax.memory import configure_jax_gpu_memory
 configure_jax_gpu_memory(preallocate=False, memory_fraction=0.85)
 
 import algorl as arl
-from algorl.agents.configs import EfficientZeroConfig
 from algorl.backends.jax.envs import make_batched_cw_train_env
-from algorl.envs import resolve_env
 from MTCWorldMJX import CWConfig
 
 NUM_ENVS = 32
 
 
 def main() -> None:
-    jax_env = make_batched_cw_train_env(
-        "CW10",
-        num_envs=NUM_ENVS,
-        seed=42,
-        config=CWConfig(seed=42, steps_per_task=1_000_000),
-    )
-    env = resolve_env(jax_env, seed=42)
     agent = arl.EfficientZero(
-        env,
-        config=EfficientZeroConfig.for_batched(num_envs=NUM_ENVS),
+        make_batched_cw_train_env(
+            "CW10",
+            num_envs=NUM_ENVS,
+            seed=42,
+            config=CWConfig(seed=42, steps_per_task=1_000_000),
+        ),
+        config=arl.EfficientZeroConfig.for_batched(num_envs=NUM_ENVS),
     )
     agent.learn(
         total_timesteps=10_000_000,
