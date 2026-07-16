@@ -261,17 +261,11 @@ def test_efficient_zero_learner_skips_optimizer_on_non_finite_loss(
     _fill_buffer(buffer)
     params_before = copy.deepcopy(jax.tree.map(np.asarray, learner.params))
 
-    with (
-        mock.patch(
-            "algorl.backends.jax.learners.efficientzero.learner.update_representation_obs_stats",
-            side_effect=lambda params, obs: params,
-        ),
-        mock.patch(
-            "algorl.backends.jax.learners.efficientzero.learner._loss_from_batch",
-            return_value=(
-                jnp.asarray(float("nan"), dtype=jnp.float32),
-                {"priorities": jnp.full((2,), float("nan"), dtype=jnp.float32)},
-            ),
+    with mock.patch(
+        "algorl.backends.jax.learners.efficientzero.learner._loss_from_batch",
+        return_value=(
+            jnp.asarray(float("nan"), dtype=jnp.float32),
+            {"priorities": jnp.full((2,), float("nan"), dtype=jnp.float32)},
         ),
     ):
         metrics = learner.train_step(buffer)

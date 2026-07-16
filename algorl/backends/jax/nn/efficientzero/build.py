@@ -369,7 +369,6 @@ def init_efficient_zero_params(
     obs_dim = int(np.prod(np.asarray(obs).shape))
     rep_params.setdefault("running_mean", jnp.zeros((obs_dim,), dtype=jnp.float32))
     rep_params.setdefault("running_var", jnp.ones((obs_dim,), dtype=jnp.float32))
-    rep_params.setdefault("running_count", jnp.asarray(1e3, dtype=jnp.float32))
 
     dyn_vars = model.dynamics_model.init(keys[1], state, action)
     if model.config.value_prefix:

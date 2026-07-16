@@ -28,7 +28,7 @@ def half_cheetah_batched_config(*, num_envs: int) -> EfficientZeroConfig:
     """``for_batched`` with Gym HalfCheetah overrides (DMC preset stays intact)."""
     return EfficientZeroConfig.for_batched(num_envs=num_envs).with_overrides(
         # HalfCheetah returns reach thousands; DMC ±299 support caps value learning.
-        value_support_range=(-10000.0, 10000.0),
+        value_support_range=(-5000.0, 5000.0),
         # Random-policy episodes are strongly negative; do not floor MCTS values at 0.
         clip_inference_values=False,
         # Per-step rewards can exceed the DMC default once the agent runs forward.
@@ -52,7 +52,7 @@ def main() -> None:
     )
     agent.learn(
         total_timesteps=10_000_000,
-        tensorboard_log_dir="runs/half_cheetah_ez_batched",
+        tensorboard_log_dir="runs/half_cheetah_ez_batched_fixcheck_from_cursor",
         progress_bar=True,
     )
 

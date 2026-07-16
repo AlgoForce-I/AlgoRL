@@ -7,6 +7,12 @@ import math
 from algorl.agents.configs import EfficientZeroConfig
 
 # Reference schedule ratios from the EfficientZero-V2 vector-control preset.
+_EZV2_REFERENCE_TRAINING_STEPS: dict[str, int] = {
+    "atari": 100_000,
+    "dmc_image": 120_000,
+    "dmc_state": 100_000,
+}
+
 _EZV2_SCHEDULE_RATIOS: dict[str, dict[str, float]] = {
     "atari": {
         "mix_start": 30_000 / 100_000,
@@ -33,6 +39,16 @@ def _schedule_preset_key(config: EfficientZeroConfig) -> str:
     if model_type not in _EZV2_SCHEDULE_RATIOS:
         return "dmc_state"
     return model_type
+
+
+def _reference_training_steps(config: EfficientZeroConfig) -> int:
+    return _EZV2_REFERENCE_TRAINING_STEPS[_schedule_preset_key(config)]
+
+
+def _scaled_lr_decay_steps(config: EfficientZeroConfig, grad_budget: int) -> int:
+    """Scale ``lr_decay_steps`` with run length (EZ-V2 uses a fixed budget per preset)."""
+    reference = max(1, _reference_training_steps(config))
+    return max(1, int(config.lr_decay_steps * grad_budget / reference))
 
 
 def schedule_ratios(config: EfficientZeroConfig) -> dict[str, float]:
@@ -105,10 +121,12 @@ def resolve_efficient_zero_schedule(
         1.0,
         float(config.buffer_capacity) * ratios["mixed_value_buffer"],
     )
+    lr_decay_steps = _scaled_lr_decay_steps(config, grad_budget)
 
     return config.with_overrides(
         total_training_steps=grad_budget,
         start_use_mix_training_steps=mix_start,
         auto_td_steps=auto_td,
         mixed_value_threshold=mixed_threshold,
+        lr_decay_steps=lr_decay_steps,
     )

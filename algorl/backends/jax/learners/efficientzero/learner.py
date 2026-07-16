@@ -28,8 +28,8 @@ from algorl.buffers.efficientzero.targets import (
     prepare_gae_batch_values,
 )
 from algorl.backends.jax.nn.efficientzero.obs_norm import (
-    update_representation_obs_stats,
-    update_representation_obs_stats_jax,
+    with_representation_obs_stats,
+    compute_tentative_obs_stats_jax,
 )
 from algorl.backends.jax.nn.efficientzero.losses import (
     _reduce_value_logits,
@@ -309,6 +309,21 @@ def _loss_from_batch(
     return loss, metrics
 
 
+def _extract_obs_running_count(params: Params) -> int:
+    rep = params.get("representation_model", {})
+    count = rep.get("running_count")
+    if count is None:
+        return 1000
+    return int(np.asarray(count, dtype=np.int64))
+
+
+def _strip_obs_running_count(params: Params) -> Params:
+    rep = dict(params["representation_model"])
+    if "running_count" in rep:
+        rep = {key: value for key, value in rep.items() if key != "running_count"}
+    return {**params, "representation_model": rep}
+
+
 class EfficientZeroLearner(Learner):
     """EfficientZero-V2 EfficientZero learner with reanalyze and priority replay."""
 
@@ -331,10 +346,12 @@ class EfficientZeroLearner(Learner):
         self.world_model: EfficientZeroWorldModel = context.world_model
         self.planner = context.planner
         self.model = self.world_model.model
-        self.params: Params = self.world_model.params
-        self._self_play_params: Params = copy.deepcopy(self.params)
-        self._reanalyze_params: Params = copy.deepcopy(self.params)
-        self._recent_reanalyze_params: Params = copy.deepcopy(self.params)
+        self._obs_running_count = _extract_obs_running_count(self.world_model.params)
+        self.params = _strip_obs_running_count(self.world_model.params)
+        self.world_model.params = self.params
+        self._self_play_params = _strip_obs_running_count(copy.deepcopy(self.params))
+        self._reanalyze_params = _strip_obs_running_count(copy.deepcopy(self.params))
+        self._recent_reanalyze_params = _strip_obs_running_count(copy.deepcopy(self.params))
         self._train_steps = 0
         if isinstance(self.planner, EfficientZeroPlanner):
             self.planner.self_play_params = self._self_play_params
@@ -417,19 +434,17 @@ class EfficientZeroLearner(Learner):
             value_infer_fn=self._value_infer_fn,
             reanalyze_search_width=self._reanalyze_search_width,
         )
-        self.params = update_representation_obs_stats(
-            self.params,
-            np.asarray(arrays["observations"]),
-        )
-        self._propagate_obs_norm_stats()
         self._maybe_refresh_model_copies()
-        self.params, self._opt_state, metrics = self._update(
+        self.params, self._opt_state, self._obs_running_count, metrics = self._update(
             self.params,
             self._opt_state,
+            jnp.asarray(self._obs_running_count, dtype=jnp.int32),
             arrays,
             step_key,
             jnp.asarray(self._learning_rate_scale(), dtype=jnp.float32),
         )
+        self._obs_running_count = int(np.asarray(self._obs_running_count))
+        self._propagate_obs_norm_stats()
         self._sync_params()
         priorities = np.asarray(metrics["priorities"])
         if np.all(np.isfinite(priorities)):
@@ -601,14 +616,16 @@ class EfficientZeroLearner(Learner):
             [self._learning_rate_scale_at(start_step + offset) for offset in range(chunk_steps)],
             spec=self._burst_spec,
         )
-        self.params, self._opt_state, burst_metrics = self._burst_update(
+        self.params, self._opt_state, self._obs_running_count, burst_metrics = self._burst_update(
             self.params,
             self._opt_state,
+            jnp.asarray(self._obs_running_count, dtype=jnp.int32),
             stacked_batch,
             step_keys,
             lr_scales,
             active_mask,
         )
+        self._obs_running_count = int(np.asarray(self._obs_running_count))
         self._train_steps = start_step + chunk_steps
         self._propagate_obs_norm_stats()
         for offset in range(chunk_steps):
@@ -646,9 +663,10 @@ class EfficientZeroLearner(Learner):
         step_keys = jax.random.split(warmup_key, spec.burst_steps)
         lr_scales = jnp.ones((spec.burst_steps,), dtype=jnp.float32)
         active_mask = jnp.ones((spec.burst_steps,), dtype=jnp.float32)
-        _, _, _ = self._burst_update(
+        _, _, _, _ = self._burst_update(
             self.params,
             self._opt_state,
+            jnp.asarray(self._obs_running_count, dtype=jnp.int32),
             stacked_batch,
             step_keys,
             lr_scales,
@@ -698,7 +716,7 @@ class EfficientZeroLearner(Learner):
         for attr in ("_self_play_params", "_reanalyze_params", "_recent_reanalyze_params"):
             target = getattr(self, attr)
             rep = dict(target["representation_model"])
-            for key in ("running_mean", "running_var", "running_count"):
+            for key in ("running_mean", "running_var"):
                 if key in source:
                     rep[key] = source[key]
             target["representation_model"] = rep
@@ -707,7 +725,7 @@ class EfficientZeroLearner(Learner):
                 if params is None:
                     continue
                 rep = dict(params["representation_model"])
-                for key in ("running_mean", "running_var", "running_count"):
+                for key in ("running_mean", "running_var"):
                     if key in source:
                         rep[key] = source[key]
                 params["representation_model"] = rep
@@ -1011,6 +1029,7 @@ def _merge_reanalyze_1d(
 def _burst_optimizer_scan(
     params: Params,
     opt_state: optax.OptState,
+    obs_count: jnp.ndarray,
     stacked_batch: dict[str, jnp.ndarray],
     rngs: jax.Array,
     lr_scales: jax.Array,
@@ -1019,22 +1038,21 @@ def _burst_optimizer_scan(
     model: EfficientZeroNetwork,
     config: EfficientZeroConfig,
     optimizer: optax.GradientTransformation,
-) -> tuple[Params, optax.OptState, dict[str, jnp.ndarray]]:
+) -> tuple[Params, optax.OptState, jnp.ndarray, dict[str, jnp.ndarray]]:
     def scan_step(
-        carry: tuple[Params, optax.OptState],
+        carry: tuple[Params, optax.OptState, jnp.ndarray],
         inputs: tuple[dict[str, jnp.ndarray], jax.Array, jax.Array, jax.Array],
-    ) -> tuple[tuple[Params, optax.OptState], dict[str, jnp.ndarray]]:
-        current_params, current_opt_state = carry
+    ) -> tuple[tuple[Params, optax.OptState, jnp.ndarray], dict[str, jnp.ndarray]]:
+        current_params, current_opt_state, current_obs_count = carry
         batch, rng, lr_scale, active = inputs
 
-        def run_step(_: None) -> tuple[Params, optax.OptState, dict[str, jnp.ndarray]]:
-            updated_params = update_representation_obs_stats_jax(
+        def run_step(
+            _: None,
+        ) -> tuple[tuple[Params, optax.OptState, jnp.ndarray], dict[str, jnp.ndarray]]:
+            new_params, new_opt_state, new_obs_count, metrics = _optimizer_step(
                 current_params,
-                batch["observations"],
-            )
-            return _optimizer_step(
-                updated_params,
                 current_opt_state,
+                current_obs_count,
                 batch,
                 rng,
                 lr_scale,
@@ -1042,27 +1060,29 @@ def _burst_optimizer_scan(
                 config=config,
                 optimizer=optimizer,
             )
+            return (new_params, new_opt_state, new_obs_count), metrics
 
-        def skip_step(_: None) -> tuple[Params, optax.OptState, dict[str, jnp.ndarray]]:
-            return current_params, current_opt_state, _zeroed_step_metrics(batch)
+        def skip_step(
+            _: None,
+        ) -> tuple[tuple[Params, optax.OptState, jnp.ndarray], dict[str, jnp.ndarray]]:
+            return (current_params, current_opt_state, current_obs_count), _zeroed_step_metrics(
+                batch
+            )
 
-        new_params, new_opt_state, metrics = jax.lax.cond(
-            active > 0.0,
-            run_step,
-            skip_step,
-            operand=None,
-        )
-        return (new_params, new_opt_state), metrics
+        return jax.lax.cond(active > 0.0, run_step, skip_step, operand=None)
 
     scan_inputs = (stacked_batch, rngs, lr_scales, active_mask)
-    (params, opt_state), metrics = jax.lax.scan(scan_step, (params, opt_state), scan_inputs)
+    (params, opt_state, obs_count), metrics = jax.lax.scan(
+        scan_step, (params, opt_state, obs_count), scan_inputs
+    )
     stacked_metrics = jax.tree.map(lambda leaf: jnp.asarray(leaf), metrics)
-    return params, opt_state, stacked_metrics
+    return params, opt_state, obs_count, stacked_metrics
 
 
 def _optimizer_step(
     params: Params,
     opt_state: optax.OptState,
+    obs_count: jnp.ndarray,
     batch: dict[str, jnp.ndarray],
     rng: jax.Array,
     lr_scale: jnp.ndarray,
@@ -1070,7 +1090,18 @@ def _optimizer_step(
     model: EfficientZeroNetwork,
     config: EfficientZeroConfig,
     optimizer: optax.GradientTransformation,
-) -> tuple[Params, optax.OptState, dict[str, jnp.ndarray]]:
+) -> tuple[Params, optax.OptState, jnp.ndarray, dict[str, jnp.ndarray]]:
+    tentative_mean, tentative_var, tentative_count = compute_tentative_obs_stats_jax(
+        params,
+        batch["observations"],
+        obs_count,
+    )
+    forward_params = with_representation_obs_stats(
+        params,
+        mean=tentative_mean,
+        var=tentative_var,
+    )
+
     loss_fn = partial(
         _loss_from_batch,
         model=model,
@@ -1080,7 +1111,7 @@ def _optimizer_step(
     def objective(current_params: Params) -> tuple[jnp.ndarray, dict[str, jnp.ndarray]]:
         return loss_fn(current_params, batch, rng=rng)
 
-    (loss, metrics), grads = jax.value_and_grad(objective, has_aux=True)(params)
+    (loss, metrics), grads = jax.value_and_grad(objective, has_aux=True)(forward_params)
 
     def merge_metrics() -> dict[str, jnp.ndarray]:
         merged = _zeroed_step_metrics(batch)
@@ -1090,16 +1121,21 @@ def _optimizer_step(
         merged["loss"] = loss
         return merged
 
-    def apply_step(_: None) -> tuple[Params, optax.OptState, dict[str, jnp.ndarray]]:
+    def apply_step(_: None) -> tuple[Params, optax.OptState, jnp.ndarray, dict[str, jnp.ndarray]]:
         updates, new_opt_state = optimizer.update(grads, opt_state, params)
         # EfficientZero-V2 mutates ``param_group['lr']`` per step; Adam updates scale
         # linearly in the learning rate, so scaling the final update is identical.
         updates = jax.tree.map(lambda update: update * lr_scale, updates)
         new_params = optax.apply_updates(params, updates)
-        return new_params, new_opt_state, merge_metrics()
+        committed_params = with_representation_obs_stats(
+            new_params,
+            mean=tentative_mean,
+            var=tentative_var,
+        )
+        return committed_params, new_opt_state, tentative_count, merge_metrics()
 
-    def skip_step(_: None) -> tuple[Params, optax.OptState, dict[str, jnp.ndarray]]:
-        return params, opt_state, merge_metrics()
+    def skip_step(_: None) -> tuple[Params, optax.OptState, jnp.ndarray, dict[str, jnp.ndarray]]:
+        return params, opt_state, obs_count, merge_metrics()
 
     return jax.lax.cond(jnp.isfinite(loss), apply_step, skip_step, None)
 
