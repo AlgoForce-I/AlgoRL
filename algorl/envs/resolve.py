@@ -13,6 +13,11 @@ def resolve_env(env: object, *, seed: int = 0) -> TrainingEnv:
     if isinstance(env, TrainingEnv):
         return env
 
+    if isinstance(env, gym.vector.VectorEnv):
+        from algorl.backends.jax.envs.gymnasium_vector import GymnasiumVectorJaxEnv
+
+        return TrainingEnv.from_jax(GymnasiumVectorJaxEnv(env, seed=seed), seed=seed)
+
     if isinstance(env, gym.Env):
         return TrainingEnv.from_gymnasium(env)
 
@@ -26,6 +31,6 @@ def resolve_env(env: object, *, seed: int = 0) -> TrainingEnv:
         return TrainingEnv.from_jax(mtc_env, seed=seed)
 
     raise TypeError(
-        f"Expected gymnasium.Env, JaxEnv, BatchedJaxEnv, MTCWorldMJX env, or TrainingEnv; "
-        f"got {type(env)!r}."
+        f"Expected gymnasium.Env, gymnasium.vector.VectorEnv, JaxEnv, BatchedJaxEnv, "
+        f"MTCWorldMJX env, or TrainingEnv; got {type(env)!r}."
     )

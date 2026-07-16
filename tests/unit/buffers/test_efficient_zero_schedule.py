@@ -38,6 +38,27 @@ def test_resolve_schedule_scales_with_run_length() -> None:
     assert resolved.start_use_mix_training_steps == int(9_998_000 * 0.4)
     assert resolved.auto_td_steps == int(9_998_000 * 0.6)
     assert resolved.mixed_value_threshold == 20_000.0
+    assert resolved.lr_decay_steps == int(300_000 * 9_998_000 / 100_000)
+
+
+def test_resolve_schedule_keeps_lr_decay_near_default_for_reference_length() -> None:
+    config = EfficientZeroConfig.for_dmc_state(
+        schedule_horizon="auto",
+        learning_starts=2_000,
+        train_freq=1,
+    )
+    resolved = resolve_efficient_zero_schedule(config, 100_000)
+    assert resolved.total_training_steps == 98_000
+    assert resolved.lr_decay_steps == int(300_000 * 98_000 / 100_000)
+
+
+def test_resolve_schedule_scales_lr_decay_for_batched_run() -> None:
+    config = EfficientZeroConfig.for_batched(num_envs=32).with_schedule_for_run(
+        10_000_000,
+        num_envs=32,
+    )
+    grad_budget = config.total_training_steps
+    assert config.lr_decay_steps == int(300_000 * grad_budget / 100_000)
 
 
 def test_fixed_schedule_horizon_ignores_run_length() -> None:
@@ -51,3 +72,4 @@ def test_fixed_schedule_horizon_ignores_run_length() -> None:
     resolved = resolve_efficient_zero_schedule(config, 10_000_000)
     assert resolved.total_training_steps == 100_000
     assert resolved.start_use_mix_training_steps == 40_000
+    assert resolved.lr_decay_steps == 300_000

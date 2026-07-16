@@ -24,6 +24,7 @@ SEARCH_VALUE_INFO_KEY = "search_value"
 PRED_VALUE_INFO_KEY = "pred_value"
 ROOT_CANDIDATES_INFO_KEY = "root_candidates"
 BEST_ACTION_INFO_KEY = "best_action"
+ENV_ID_INFO_KEY = "env_id"
 
 INFO_KEYS = (
     POLICY_TARGET_INFO_KEY,
@@ -32,6 +33,23 @@ INFO_KEYS = (
     ROOT_CANDIDATES_INFO_KEY,
     BEST_ACTION_INFO_KEY,
 )
+
+# Matches ``clip_inference_values`` in the learner priority computation.
+_PRIORITY_VALUE_CLIP = 1e5
+
+
+def _sanitize_priority(value: float, *, min_prior: float) -> float:
+    """Map non-finite PER priorities to a large but sampleable finite weight."""
+    if not np.isfinite(value):
+        return _PRIORITY_VALUE_CLIP + min_prior
+    return float(np.clip(value, min_prior, _PRIORITY_VALUE_CLIP + min_prior))
+
+
+def _finite_max_priority(priorities: list[float], *, default: float = 1.0) -> float:
+    finite = [priority for priority in priorities if np.isfinite(priority)]
+    if not finite:
+        return default
+    return float(max(finite))
 
 
 @dataclass(frozen=True)
@@ -200,17 +218,48 @@ class EfficientZeroReplayBuffer(ReplayBuffer):
         self._lookup: list[tuple[int, int]] = []
         self._priorities: list[float] = []
         self._base_traj_idx = 0
-        self._active = EfficientZeroTrajectory(max_size=trajectory_size)
-        self._pending_commit: EfficientZeroTrajectory | None = None
+        # Per-env-lane trajectory assembly: parallel rollouts interleave
+        # transitions from independent envs, so each lane accumulates its own
+        # temporally-coherent trajectory before committing to shared storage.
+        self._active: dict[int, EfficientZeroTrajectory] = {}
+        self._pending_commit: dict[int, EfficientZeroTrajectory] = {}
         self._total_commits = 0
 
     def add(self, transition: Transition) -> None:
+        env_id = int(transition.info.get(ENV_ID_INFO_KEY, 0))
         step = step_from_transition(transition)
-        if self._active.append(step):
+        active = self._active.get(env_id)
+        if active is None:
+            active = EfficientZeroTrajectory(max_size=self.trajectory_size)
+            self._active[env_id] = active
+        if active.append(step):
             final_observation = None
             if step.done and transition.next_observation is not None:
                 final_observation = np.asarray(transition.next_observation, dtype=np.float32)
-            self._commit_active(step.done, final_observation=final_observation)
+            self._commit_active(env_id, step.done, final_observation=final_observation)
+        else:
+            self._maybe_release_pending(env_id)
+
+    def _maybe_release_pending(self, env_id: int) -> None:
+        """Store a pending block as soon as its tail context exists.
+
+        The pending block only needs ``trajectory_padding_gap`` steps from the
+        next block for full-horizon value targets. Releasing it immediately
+        (instead of waiting for the next block to fill completely) makes new
+        data sampleable ~one block earlier, which matters for parallel envs
+        where a full block spans ``trajectory_size * num_envs`` global steps.
+        """
+        pending = self._pending_commit.get(env_id)
+        if pending is None:
+            return
+        active = self._active.get(env_id)
+        gap = trajectory_padding_gap(self.config)
+        if active is None or len(active.steps) < gap:
+            return
+        del self._pending_commit[env_id]
+        pending.pad_over(active.steps[:gap])
+        pending.finalize_targets(self.config)
+        self._store_trajectory(pending.steps, pending)
 
     def sample(
         self,
@@ -228,10 +277,14 @@ class EfficientZeroReplayBuffer(ReplayBuffer):
         return self._build_batch(indices, trained_steps=trained_steps)
 
     def update_priorities(self, indices: np.ndarray, priorities: np.ndarray) -> None:
+        min_prior = float(self.config.min_prior)
         for index, priority in zip(indices.reshape(-1), priorities.reshape(-1), strict=True):
             flat_index = int(index)
             if 0 <= flat_index < len(self._priorities):
-                self._priorities[flat_index] = float(priority)
+                self._priorities[flat_index] = _sanitize_priority(
+                    float(priority),
+                    min_prior=min_prior,
+                )
 
     def __len__(self) -> int:
         return len(self._lookup)
@@ -240,8 +293,14 @@ class EfficientZeroReplayBuffer(ReplayBuffer):
     def total_transitions(self) -> int:
         return len(self._lookup)
 
-    def _commit_active(self, done: bool, *, final_observation: np.ndarray | None = None) -> None:
-        steps = self._active.clear()
+    def _commit_active(
+        self,
+        env_id: int,
+        done: bool,
+        *,
+        final_observation: np.ndarray | None = None,
+    ) -> None:
+        steps = self._active[env_id].clear()
         if not steps:
             return
 
@@ -251,27 +310,19 @@ class EfficientZeroReplayBuffer(ReplayBuffer):
         if done:
             current.final_observation = final_observation
 
-        if self._pending_commit is not None:
+        pending = self._pending_commit.pop(env_id, None)
+        if pending is not None:
             gap = trajectory_padding_gap(self.config)
             tail = current.steps[:gap]
-            self._pending_commit.pad_over(tail)
-            self._pending_commit.finalize_targets(self.config)
-            self._store_trajectory(self._pending_commit.steps, self._pending_commit)
-            self._pending_commit = None
+            pending.pad_over(tail)
+            pending.finalize_targets(self.config)
+            self._store_trajectory(pending.steps, pending)
 
         if len(current.steps) >= self.trajectory_size and not done:
-            self._pending_commit = current
+            self._pending_commit[env_id] = current
         else:
             current.finalize_targets(self.config)
             self._store_trajectory(current.steps, current)
-
-        if done and self._pending_commit is not None:
-            self._pending_commit.finalize_targets(self.config)
-            self._store_trajectory(self._pending_commit.steps, self._pending_commit)
-            self._pending_commit = None
-
-        if not done:
-            self._active = EfficientZeroTrajectory(max_size=self.trajectory_size)
 
     def _store_trajectory(
         self,
@@ -298,12 +349,17 @@ class EfficientZeroReplayBuffer(ReplayBuffer):
 
         # New transitions inherit the buffer-wide max priority (optimistic PER init).
         if self.config.use_priority:
-            traj_priorities = (
-                np.abs(pred_values[:core_len] - np.asarray(bootstrapped[:core_len], dtype=np.float32))
-                + self.config.min_prior
+            pred_for_prior = np.asarray(pred_values[:core_len], dtype=np.float32)
+            boot_for_prior = np.asarray(bootstrapped[:core_len], dtype=np.float32)
+            if self.config.clip_inference_values:
+                pred_for_prior = np.clip(pred_for_prior, 0.0, _PRIORITY_VALUE_CLIP)
+                boot_for_prior = np.clip(boot_for_prior, 0.0, _PRIORITY_VALUE_CLIP)
+            traj_priorities = np.abs(pred_for_prior - boot_for_prior) + self.config.min_prior
+            max_prior = _finite_max_priority(self._priorities)
+            new_priority = _sanitize_priority(
+                max(max_prior, float(traj_priorities.max())),
+                min_prior=self.config.min_prior,
             )
-            max_prior = max(self._priorities) if self._priorities else 1.0
-            new_priority = float(max(max_prior, float(traj_priorities.max())))
         else:
             new_priority = 1.0
 
@@ -328,12 +384,16 @@ class EfficientZeroReplayBuffer(ReplayBuffer):
                 self._priorities[index] = 0.0
 
         priorities = np.asarray(self._priorities[:total], dtype=np.float64)
+        priorities = np.nan_to_num(priorities, nan=0.0, posinf=0.0, neginf=0.0)
+        priorities = np.maximum(priorities, 0.0)
         probs = priorities**self.config.priority_prob_alpha
         total_prob = probs.sum()
-        if total_prob <= 0.0:
-            probs = np.ones_like(probs) / len(probs)
+        if total_prob <= 0.0 or not np.isfinite(total_prob):
+            probs = np.ones_like(priorities) / len(priorities)
         else:
             probs = probs / total_prob
+            if not np.all(np.isfinite(probs)):
+                probs = np.ones_like(priorities) / len(priorities)
 
         rng = np.random.default_rng()
         indices = rng.choice(total, size=batch_size, replace=False, p=probs)

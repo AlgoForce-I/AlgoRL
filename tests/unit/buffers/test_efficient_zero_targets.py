@@ -99,6 +99,95 @@ def test_prepare_bootstrapped_values_shrinks_horizon_near_trajectory_end() -> No
     assert targets[0, 2] == pytest.approx(0.0, abs=1e-6)
 
 
+def _reference_bootstrapped_batch_values(
+    observations,
+    rewards,
+    sample_indices,
+    *,
+    valid_lengths,
+    bootstrap_limits,
+    total_transitions,
+    config,
+    infer_values,
+):
+    """Original per-element loop implementation, kept as the numeric reference."""
+    from algorl.buffers.efficientzero import adaptive_td_steps
+
+    batch_size, window, obs_dim = observations.shape
+    unroll_positions = config.unroll_steps + 1
+    inferred = np.asarray(
+        infer_values(observations.reshape(batch_size * window, obs_dim)),
+        dtype=np.float32,
+    ).reshape(batch_size, window)
+
+    targets = np.zeros((batch_size, unroll_positions), dtype=np.float32)
+    for batch_index in range(batch_size):
+        valid_len = int(valid_lengths[batch_index])
+        limit = int(bootstrap_limits[batch_index])
+        sample_index = int(sample_indices[batch_index])
+        if config.value_target in ("mixed", "max"):
+            td_steps = config.td_steps
+        else:
+            td_steps = adaptive_td_steps(
+                config.td_steps,
+                sample_index=sample_index,
+                collected_transitions=total_transitions,
+                auto_td_steps=config.auto_td_steps,
+            )
+        td_steps = int(np.clip(min(valid_len, td_steps), 1, config.td_steps))
+        for position in range(unroll_positions):
+            td_steps = max(1, min(valid_len - position, td_steps))
+            bootstrap_position = position + td_steps
+            target = 0.0
+            if bootstrap_position <= limit and bootstrap_position < window:
+                target = float(config.discount**td_steps) * float(
+                    inferred[batch_index, bootstrap_position]
+                )
+            for step in range(position, min(bootstrap_position, window)):
+                target += float(config.discount ** (step - position)) * float(
+                    rewards[batch_index, step]
+                )
+            targets[batch_index, position] = target if position <= valid_len else 0.0
+    return targets
+
+
+@pytest.mark.parametrize("value_target", ["mixed", "search"])
+def test_prepare_bootstrapped_values_matches_reference_loop(value_target: str) -> None:
+    """Vectorized target preparation must reproduce the per-element reference."""
+    config = EfficientZeroConfig(
+        unroll_steps=3,
+        td_steps=4,
+        discount=0.95,
+        value_target=value_target,
+        model_value_target="bootstrapped",
+        auto_td_steps=50,
+    )
+    ext_window = extended_target_window(config)
+    rng = np.random.default_rng(7)
+    batch_size = 16
+    observations = rng.normal(size=(batch_size, ext_window, 5)).astype(np.float32)
+    rewards = rng.normal(size=(batch_size, ext_window)).astype(np.float32)
+    sample_indices = rng.integers(0, 500, size=batch_size).astype(np.int32)
+    valid_lengths = rng.integers(1, ext_window + 1, size=batch_size).astype(np.int32)
+    bootstrap_limits = np.minimum(valid_lengths, rng.integers(1, ext_window + 1, size=batch_size)).astype(np.int32)
+
+    def infer_values(obs):
+        return obs.sum(axis=-1).astype(np.float32)
+
+    kwargs = dict(
+        valid_lengths=valid_lengths,
+        bootstrap_limits=bootstrap_limits,
+        total_transitions=500,
+        config=config,
+        infer_values=infer_values,
+    )
+    actual = prepare_bootstrapped_batch_values(observations, rewards, sample_indices, **kwargs)
+    expected = _reference_bootstrapped_batch_values(
+        observations, rewards, sample_indices, **kwargs
+    )
+    np.testing.assert_allclose(actual, expected, rtol=1e-6, atol=1e-6)
+
+
 def test_prepare_gae_values_matches_constant_case() -> None:
     config = EfficientZeroConfig(
         unroll_steps=2,

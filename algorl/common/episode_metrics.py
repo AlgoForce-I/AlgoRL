@@ -105,3 +105,61 @@ class EpisodeMetricsTracker:
         self._has_success_signal = True
         if float(info["success"]) >= self._success_threshold:
             self._episode_success = True
+
+
+class BatchedEpisodeMetricsTracker:
+    """Independent episode trackers for each parallel env lane."""
+
+    def __init__(self, num_envs: int, *, success_threshold: float = 0.5) -> None:
+        if num_envs < 1:
+            raise ValueError("num_envs must be >= 1")
+        self._num_envs = num_envs
+        self._trackers = [
+            EpisodeMetricsTracker(success_threshold=success_threshold)
+            for _ in range(num_envs)
+        ]
+        self._started = [False] * num_envs
+
+    @property
+    def num_envs(self) -> int:
+        return self._num_envs
+
+    def begin_episode(self, lane: int, info: dict[str, object]) -> None:
+        self._trackers[lane].begin_episode(info)
+        self._started[lane] = True
+
+    def observe_step(
+        self,
+        lane: int,
+        reward: float,
+        done: bool,
+        info: dict[str, object],
+    ) -> EpisodeEndEvent | None:
+        if not 0 <= lane < self._num_envs:
+            raise IndexError(f"lane {lane} out of range for {self._num_envs} envs")
+        if not self._started[lane]:
+            self.begin_episode(lane, info)
+        event = self._trackers[lane].observe_step(reward, done, info)
+        if event is not None:
+            self.begin_episode(lane, info)
+        return event
+
+    def metrics_from_event(self, event: EpisodeEndEvent) -> dict[str, float]:
+        return episode_metrics_from_event(event)
+
+
+def batched_episode_summary_metrics(events: list[EpisodeEndEvent]) -> dict[str, float]:
+    """Aggregate per-lane episode completions from one vector-env step."""
+    if not events:
+        return {}
+    returns = [float(event.episode_return) for event in events]
+    lengths = [float(event.episode_length) for event in events]
+    metrics: dict[str, float] = {
+        "train/batched/mean_episode_return": float(sum(returns) / len(returns)),
+        "train/batched/mean_episode_length": float(sum(lengths) / len(lengths)),
+        "train/batched/episode_completions": float(len(events)),
+    }
+    successes = [event.success for event in events if event.success is not None]
+    if successes:
+        metrics["train/batched/episode_success_frac"] = float(sum(bool(s) for s in successes) / len(successes))
+    return metrics

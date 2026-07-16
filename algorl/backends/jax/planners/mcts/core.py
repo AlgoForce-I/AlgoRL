@@ -156,7 +156,10 @@ def normalize_observation_batch(observations: ObservationBatch) -> NormalizedObs
         return NormalizedObservationBatch(items=observations, is_stacked=False)
     if isinstance(observations, (jnp.ndarray, np.ndarray)):
         array = jnp.asarray(observations, dtype=jnp.float32)
-        if array.ndim >= 2:
+        # Only treat rank-2 arrays as pre-stacked batches.
+        # Higher-rank arrays are ambiguous (e.g. PGX board matrices/tensors),
+        # and for AlgoRL we treat those as a *single* observation.
+        if array.ndim == 2:
             return NormalizedObservationBatch(items=array, is_stacked=True)
         return NormalizedObservationBatch(items=[array], is_stacked=False)
     return NormalizedObservationBatch(items=[observations], is_stacked=False)

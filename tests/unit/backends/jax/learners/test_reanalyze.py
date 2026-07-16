@@ -10,24 +10,11 @@ from algorl.backends.jax.learners.efficientzero.reanalyze import reanalyze_train
 class _RecordingSearchResult:
     def __init__(self, batch_size: int, *, action_dim: int = 1, num_candidates: int = 2) -> None:
         self.batch_size = batch_size
-        self._action_dim = action_dim
-        self._num_candidates = num_candidates
-
-    def to_single(self, index: int) -> object:
-        return _RecordingSingleResult(
-            index=index,
-            action_dim=self._action_dim,
-            num_candidates=self._num_candidates,
-        )
-
-
-class _RecordingSingleResult:
-    def __init__(self, *, index: int, action_dim: int, num_candidates: int) -> None:
-        self.action_weights = np.full((num_candidates,), 0.5, dtype=np.float32)
-        self.root_value = float(index)
-        self.root_candidates = np.zeros((num_candidates, action_dim), dtype=np.float32)
-        self.action = np.zeros((action_dim,), dtype=np.float32)
-        self.action_index = 0
+        self.action_weights = np.full((batch_size, num_candidates), 0.5, dtype=np.float32)
+        self.root_values = np.arange(batch_size, dtype=np.float32)
+        self.root_candidates = np.zeros((batch_size, num_candidates, action_dim), dtype=np.float32)
+        self.actions = np.zeros((batch_size, action_dim), dtype=np.float32)
+        self.action_indices = np.zeros((batch_size,), dtype=np.int32)
 
 
 class _RecordingPlanner:
@@ -75,7 +62,7 @@ def test_reanalyze_uses_planner_search_batch_size() -> None:
         params=_REANALYZE_PARAMS,
         reanalyze_count=5,
     )
-    assert planner.batch_sizes == [4, 4, 4, 3]
+    assert planner.batch_sizes == [4, 4, 4, 4]
 
 
 def test_reanalyze_search_batch_size_override() -> None:
@@ -90,7 +77,7 @@ def test_reanalyze_search_batch_size_override() -> None:
         reanalyze_count=5,
         search_batch_size=4,
     )
-    assert planner.batch_sizes == [4, 4, 4, 3]
+    assert planner.batch_sizes == [4, 4, 4, 4]
 
 
 def test_reanalyze_search_uses_reanalyze_params() -> None:
@@ -105,6 +92,81 @@ def test_reanalyze_search_uses_reanalyze_params() -> None:
     assert planner.search_params
     assert all(params is _REANALYZE_PARAMS for params in planner.search_params)
     assert all(use_self_play is False for use_self_play in planner.use_self_play_flags)
+
+
+def test_resolve_reanalyze_search_width_passthrough_and_fallback() -> None:
+    from unittest import mock
+
+    from algorl.agents.configs import EfficientZeroConfig
+    from algorl.backends.jax.learners.efficientzero.reanalyze import (
+        resolve_reanalyze_search_width,
+    )
+
+    explicit = EfficientZeroConfig(reanalyze_search_batch_size=512)
+    assert resolve_reanalyze_search_width(explicit) == 512
+
+    unset = EfficientZeroConfig(reanalyze_search_batch_size=None, search_batch_size=8)
+    assert resolve_reanalyze_search_width(unset) == 8
+
+    auto = EfficientZeroConfig(reanalyze_search_batch_size="auto")
+    with mock.patch(
+        "algorl.backends.jax.memory.gpu_available_memory_bytes",
+        return_value=None,
+    ):
+        assert resolve_reanalyze_search_width(auto) == 10_240
+
+    with mock.patch(
+        "algorl.backends.jax.memory.gpu_available_memory_bytes",
+        return_value=64 * 1024**3,
+    ):
+        width = resolve_reanalyze_search_width(auto)
+        assert 1_024 <= width <= 65_536
+
+    import pytest
+
+    invalid = EfficientZeroConfig(reanalyze_search_batch_size="huge")
+    with pytest.raises(ValueError, match="'auto'"):
+        resolve_reanalyze_search_width(invalid)
+
+
+def test_reanalyze_scatters_values_to_correct_positions() -> None:
+    """Each root's search value must land at its (batch, step) slot."""
+    from algorl.backends.jax.learners.efficientzero.reanalyze import (
+        reanalyze_fused_policy_batches,
+    )
+
+    class _CountingPlanner:
+        search_batch_size = 4
+
+        def __init__(self) -> None:
+            self._offset = 0
+
+        def search_batch(self, observations, **kwargs):
+            del kwargs
+            batch_size = int(np.asarray(observations).shape[0])
+            result = _RecordingSearchResult(batch_size)
+            result.root_values = self._offset + np.arange(batch_size, dtype=np.float32)
+            self._offset += batch_size
+            return result
+
+    window = 3
+    outputs = reanalyze_fused_policy_batches(
+        _CountingPlanner(),  # type: ignore[arg-type]
+        [np.zeros((4, window, 2), dtype=np.float32), np.zeros((4, window, 2), dtype=np.float32)],
+        params={},
+        reanalyze_count=2,
+        search_batch_size=4,
+    )
+
+    flat = 0
+    for policy_targets, search_values, _, _ in outputs:
+        assert policy_targets.shape[0] == 4
+        for batch_index in range(2):  # reanalyze_count
+            for step_index in range(window):
+                assert search_values[batch_index, step_index] == flat
+                flat += 1
+        # Rows beyond reanalyze_count stay zeroed.
+        assert np.all(search_values[2:] == 0.0)
 
 
 def test_reanalyze_preserves_trajectory_shapes() -> None:

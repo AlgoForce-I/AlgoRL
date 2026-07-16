@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import copy
+from dataclasses import dataclass
 from functools import partial
 from collections.abc import Callable
 from typing import Any
@@ -14,16 +15,22 @@ import optax
 
 from algorl.agents.configs import EfficientZeroConfig
 from algorl.backends.jax.learners.efficientzero.reanalyze import (
+    ValueInferenceFn,
     batch_initial_values,
-    effective_reanalyze_search_batch_size,
+    make_batched_value_inference,
     mcts_temperature,
+    reanalyze_fused_policy_batches,
     reanalyze_policy_batch,
+    resolve_reanalyze_search_width,
 )
 from algorl.buffers.efficientzero.targets import (
     prepare_bootstrapped_batch_values,
     prepare_gae_batch_values,
 )
-from algorl.backends.jax.nn.efficientzero.obs_norm import update_representation_obs_stats
+from algorl.backends.jax.nn.efficientzero.obs_norm import (
+    with_representation_obs_stats,
+    compute_tentative_obs_stats_jax,
+)
 from algorl.backends.jax.nn.efficientzero.losses import (
     _reduce_value_logits,
     apply_half_gradient,
@@ -35,6 +42,7 @@ from algorl.backends.jax.nn.efficientzero.losses import (
 from algorl.backends.jax.nn.efficientzero.model import EfficientZero as EfficientZeroNetwork
 from algorl.backends.jax.nn.efficientzero.model import Params
 from algorl.backends.jax.planners.efficientzero import EfficientZeroPlanner
+from algorl.backends.jax.planners.efficientzero.planner import continuous_search_config_from_agent
 from algorl.backends.jax.world_models.efficientzero import EfficientZeroWorldModel
 from algorl.buffers.efficientzero import EfficientZeroReplayBuffer
 from algorl.core.component_context import ComponentContext
@@ -42,6 +50,55 @@ from algorl.core.learner import Learner
 from algorl.core.planner import Planner
 from algorl.core.replay_buffer import ReplayBuffer
 from algorl.core.types import Batch
+from algorl.envs.training_env import TrainingEnv
+
+
+@dataclass(frozen=True)
+class TrainingBurstSpec:
+    """Fixed tensor shapes for a compiled gradient burst."""
+
+    burst_steps: int
+    batch_size: int
+    window: int
+    unroll_steps: int
+    obs_dim: int
+    action_dim: int
+    policy_width: int
+
+
+def training_burst_spec(config: EfficientZeroConfig, env: TrainingEnv) -> TrainingBurstSpec:
+    """Derive stable burst shapes from config and the training env."""
+    import gymnasium as gym
+
+    obs_space = env.observation_space
+    if isinstance(obs_space, gym.spaces.Box):
+        obs_dim = int(np.prod(obs_space.shape))
+    elif isinstance(obs_space, gym.spaces.Discrete):
+        obs_dim = int(obs_space.n)
+    else:
+        raise TypeError(f"Unsupported observation space for burst compile: {type(obs_space)!r}")
+
+    action_space = env.action_space
+    if isinstance(action_space, gym.spaces.Box):
+        action_dim = int(np.prod(action_space.shape))
+    elif isinstance(action_space, gym.spaces.Discrete):
+        action_dim = 1
+    else:
+        raise TypeError(f"Unsupported action space for burst compile: {type(action_space)!r}")
+
+    compile_steps = config.burst_compile_steps
+    if compile_steps is None:
+        compile_steps = max(1, int(config.gradient_steps_per_rollout or 1))
+    search_cfg = continuous_search_config_from_agent(config)
+    return TrainingBurstSpec(
+        burst_steps=max(1, int(compile_steps)),
+        batch_size=config.batch_size,
+        window=config.unroll_steps + 1,
+        unroll_steps=config.unroll_steps,
+        obs_dim=obs_dim,
+        action_dim=action_dim,
+        policy_width=search_cfg.num_sampled_actions,
+    )
 
 
 def _batch_to_arrays(batch: Batch) -> dict[str, jnp.ndarray]:
@@ -228,9 +285,17 @@ def _loss_from_batch(
     pred_priority_values = pred_scalars
     if pred_priority_values.ndim == 2:
         pred_priority_values = jnp.min(pred_priority_values, axis=0)
+    priority_targets = value_targets[:, 0]
     if config.clip_inference_values:
         pred_priority_values = jnp.clip(pred_priority_values, 0.0, 1e5)
-    priorities = jnp.abs(pred_priority_values - value_targets[:, 0]) + config.min_prior
+        priority_targets = jnp.clip(priority_targets, 0.0, 1e5)
+    priorities = jnp.abs(pred_priority_values - priority_targets) + config.min_prior
+    priorities = jnp.nan_to_num(
+        priorities,
+        nan=config.min_prior,
+        posinf=1e5 + config.min_prior,
+        neginf=config.min_prior,
+    )
 
     metrics = {
         "loss": loss,
@@ -242,6 +307,21 @@ def _loss_from_batch(
         "priorities": priorities,
     }
     return loss, metrics
+
+
+def _extract_obs_running_count(params: Params) -> int:
+    rep = params.get("representation_model", {})
+    count = rep.get("running_count")
+    if count is None:
+        return 1000
+    return int(np.asarray(count, dtype=np.int64))
+
+
+def _strip_obs_running_count(params: Params) -> Params:
+    rep = dict(params["representation_model"])
+    if "running_count" in rep:
+        rep = {key: value for key, value in rep.items() if key != "running_count"}
+    return {**params, "representation_model": rep}
 
 
 class EfficientZeroLearner(Learner):
@@ -266,10 +346,12 @@ class EfficientZeroLearner(Learner):
         self.world_model: EfficientZeroWorldModel = context.world_model
         self.planner = context.planner
         self.model = self.world_model.model
-        self.params: Params = self.world_model.params
-        self._self_play_params: Params = copy.deepcopy(self.params)
-        self._reanalyze_params: Params = copy.deepcopy(self.params)
-        self._recent_reanalyze_params: Params = copy.deepcopy(self.params)
+        self._obs_running_count = _extract_obs_running_count(self.world_model.params)
+        self.params = _strip_obs_running_count(self.world_model.params)
+        self.world_model.params = self.params
+        self._self_play_params = _strip_obs_running_count(copy.deepcopy(self.params))
+        self._reanalyze_params = _strip_obs_running_count(copy.deepcopy(self.params))
+        self._recent_reanalyze_params = _strip_obs_running_count(copy.deepcopy(self.params))
         self._train_steps = 0
         if isinstance(self.planner, EfficientZeroPlanner):
             self.planner.self_play_params = self._self_play_params
@@ -294,6 +376,13 @@ class EfficientZeroLearner(Learner):
             optax.adam(self.config.learning_rate),
         )
         self._opt_state = self._optimizer.init(self.params)
+        self._burst_spec = training_burst_spec(self.config, context.env)
+        self._value_infer_fn = make_batched_value_inference(self.model)
+        # Resolve once so every reanalyze call compiles to a single width.
+        self._reanalyze_search_width = resolve_reanalyze_search_width(
+            self.config,
+            action_dim=self._burst_spec.action_dim,
+        )
         self._update = jax.jit(
             partial(
                 _optimizer_step,
@@ -302,8 +391,22 @@ class EfficientZeroLearner(Learner):
                 optimizer=self._optimizer,
             )
         )
+        self._burst_update = jax.jit(
+            partial(
+                _burst_optimizer_scan,
+                model=self.model,
+                config=self.config,
+                optimizer=self._optimizer,
+            )
+        )
+        self._warmup_burst_compile()
 
-    def train_step(self, replay_buffer: ReplayBuffer) -> dict[str, float]:
+    def train_step(
+        self,
+        replay_buffer: ReplayBuffer,
+        *,
+        skip_reanalyze: bool = False,
+    ) -> dict[str, float]:
         if not isinstance(replay_buffer, EfficientZeroReplayBuffer):
             raise TypeError(
                 "EfficientZeroLearner requires EfficientZeroReplayBuffer, "
@@ -327,25 +430,28 @@ class EfficientZeroLearner(Learner):
             total_transitions=replay_buffer.total_transitions,
             rng_key=step_key,
             on_reanalyze_progress=getattr(self, "_on_reanalyze_progress", None),
+            skip_reanalyze=skip_reanalyze,
+            value_infer_fn=self._value_infer_fn,
+            reanalyze_search_width=self._reanalyze_search_width,
         )
-        self.params = update_representation_obs_stats(
-            self.params,
-            np.asarray(arrays["observations"]),
-        )
-        self._propagate_obs_norm_stats()
         self._maybe_refresh_model_copies()
-        self.params, self._opt_state, metrics = self._update(
+        self.params, self._opt_state, self._obs_running_count, metrics = self._update(
             self.params,
             self._opt_state,
+            jnp.asarray(self._obs_running_count, dtype=jnp.int32),
             arrays,
             step_key,
             jnp.asarray(self._learning_rate_scale(), dtype=jnp.float32),
         )
+        self._obs_running_count = int(np.asarray(self._obs_running_count))
+        self._propagate_obs_norm_stats()
         self._sync_params()
-        replay_buffer.update_priorities(
-            np.asarray(arrays["indices"]),
-            np.asarray(metrics["priorities"]),
-        )
+        priorities = np.asarray(metrics["priorities"])
+        if np.all(np.isfinite(priorities)):
+            replay_buffer.update_priorities(
+                np.asarray(arrays["indices"]),
+                priorities,
+            )
         self._train_steps += 1
         return {
             key: float(value)
@@ -353,15 +459,233 @@ class EfficientZeroLearner(Learner):
             if key != "priorities"
         }
 
-    def _learning_rate_scale(self) -> float:
-        """Linear LR warmup, then step decay."""
+    def train_burst(
+        self,
+        replay_buffer: ReplayBuffer,
+        steps: int,
+        *,
+        on_progress: Callable[[int, int], None] | None = None,
+    ) -> dict[str, float]:
+        """Run several gradient updates in compiled sub-bursts.
+
+        Each sub-burst (``burst_compile_steps`` gradient steps) samples the
+        buffer, computes value targets, and runs fused reanalyze *after* the
+        previous sub-burst's parameter and priority updates. Freezing all of
+        this across a long burst (as one big snapshot) measurably hurts sample
+        efficiency versus the sequential loop, since the last gradient steps
+        would train toward targets and priorities hundreds of steps stale.
+        """
+        if steps <= 0:
+            return {}
+        if not isinstance(replay_buffer, EfficientZeroReplayBuffer):
+            raise TypeError(
+                "EfficientZeroLearner requires EfficientZeroReplayBuffer, "
+                f"got {type(replay_buffer)!r}."
+            )
+
+        metrics: dict[str, float] = {}
+        completed = 0
+        scan_width = self._burst_spec.burst_steps
+        while completed < steps:
+            chunk_steps = min(steps - completed, scan_width)
+            metrics = self._train_burst_chunk(
+                replay_buffer,
+                chunk_steps,
+                on_progress=on_progress,
+                completed_steps=completed,
+                total_steps=steps,
+            )
+            completed += chunk_steps
+        return metrics
+
+    def _train_burst_chunk(
+        self,
+        replay_buffer: EfficientZeroReplayBuffer,
+        steps: int,
+        *,
+        on_progress: Callable[[int, int], None] | None,
+        completed_steps: int,
+        total_steps: int,
+    ) -> dict[str, float]:
+        """Sample, reanalyze, and run one compiled optimizer scan of ``steps`` updates."""
+        beta = self._priority_beta()
+        start_step = self._train_steps
+        batches: list[Batch] = []
+        for offset in range(steps):
+            batches.append(
+                replay_buffer.sample(
+                    self.config.batch_size,
+                    beta=beta,
+                    trained_steps=start_step + offset,
+                )
+            )
+
+        self._rng_key, burst_key = jax.random.split(self._rng_key)
+        step_keys = jax.random.split(burst_key, steps)
+        prepared_batches: list[dict[str, jnp.ndarray]] = []
+        observation_windows: list[np.ndarray] = []
+        window = self.config.unroll_steps + 1
+        reanalyze_count = int(self.config.batch_size * self.config.reanalyze_ratio)
+
+        for offset, batch in enumerate(batches):
+            trained_steps = start_step + offset
+            arrays = _prepare_training_batch(
+                batch,
+                planner=self.planner,
+                config=self.config,
+                model=self.model,
+                reanalyze_params=self._reanalyze_params,
+                trained_steps=trained_steps,
+                total_transitions=replay_buffer.total_transitions,
+                rng_key=step_keys[offset],
+                skip_reanalyze=True,
+                value_infer_fn=self._value_infer_fn,
+            )
+            prepared_batches.append(arrays)
+            observation_windows.append(
+                np.asarray(batch.data["observations"], dtype=np.float32)[:, :window]
+            )
+
+        if (
+            reanalyze_count > 0
+            and isinstance(self.planner, EfficientZeroPlanner)
+            and observation_windows
+        ):
+            temperature = mcts_temperature(self.config, start_step)
+            reanalyze_outputs = reanalyze_fused_policy_batches(
+                self.planner,
+                observation_windows,
+                params=self._reanalyze_params,
+                reanalyze_count=reanalyze_count,
+                temperature=temperature,
+                search_batch_size=self._reanalyze_search_width,
+                on_progress=getattr(self, "_on_reanalyze_progress", None),
+            )
+            for offset, refreshed in enumerate(reanalyze_outputs):
+                prepared_batches[offset] = _apply_reanalyze_outputs(
+                    prepared_batches[offset],
+                    refreshed,
+                    reanalyze_count,
+                )
+                prepared_batches[offset] = _finalize_value_targets(
+                    prepared_batches[offset],
+                    batches[offset],
+                    config=self.config,
+                    trained_steps=start_step + offset,
+                )
+        else:
+            for offset in range(steps):
+                prepared_batches[offset] = _finalize_value_targets(
+                    prepared_batches[offset],
+                    batches[offset],
+                    config=self.config,
+                    trained_steps=start_step + offset,
+                )
+
+        return self._run_burst_scan_chunk(
+            replay_buffer,
+            prepared_batches=prepared_batches,
+            step_keys=step_keys,
+            start_step=start_step,
+            chunk_steps=steps,
+            on_progress=on_progress,
+            completed_steps=completed_steps,
+            total_steps=total_steps,
+        )
+
+    def _run_burst_scan_chunk(
+        self,
+        replay_buffer: EfficientZeroReplayBuffer,
+        *,
+        prepared_batches: list[dict[str, jnp.ndarray]],
+        step_keys: jax.Array,
+        start_step: int,
+        chunk_steps: int,
+        on_progress: Callable[[int, int], None] | None,
+        completed_steps: int,
+        total_steps: int,
+    ) -> dict[str, float]:
+        padded_batches, active_mask = _pad_burst_batches(
+            prepared_batches,
+            self._burst_spec,
+            active_steps=chunk_steps,
+        )
+        stacked_batch = _stack_training_batches(padded_batches)
+        step_keys, lr_scales = _pad_burst_scan_inputs(
+            step_keys,
+            [self._learning_rate_scale_at(start_step + offset) for offset in range(chunk_steps)],
+            spec=self._burst_spec,
+        )
+        self.params, self._opt_state, self._obs_running_count, burst_metrics = self._burst_update(
+            self.params,
+            self._opt_state,
+            jnp.asarray(self._obs_running_count, dtype=jnp.int32),
+            stacked_batch,
+            step_keys,
+            lr_scales,
+            active_mask,
+        )
+        self._obs_running_count = int(np.asarray(self._obs_running_count))
+        self._train_steps = start_step + chunk_steps
+        self._propagate_obs_norm_stats()
+        for offset in range(chunk_steps):
+            self._train_steps = start_step + offset + 1
+            self._maybe_refresh_model_copies()
+        self._train_steps = start_step + chunk_steps
+        self._sync_params()
+
+        for offset in range(chunk_steps):
+            priorities = np.asarray(burst_metrics["priorities"][offset])
+            if np.all(np.isfinite(priorities)):
+                replay_buffer.update_priorities(
+                    np.asarray(padded_batches[offset]["indices"]),
+                    priorities,
+                )
+        if on_progress is not None:
+            on_progress(completed_steps + chunk_steps, total_steps)
+
+        return {
+            key: float(burst_metrics[key][chunk_steps - 1])
+            for key in burst_metrics
+            if key != "priorities"
+        }
+
+    def _warmup_burst_compile(self) -> None:
+        """Compile the burst scan once with the fixed training shapes."""
+        spec = self._burst_spec
+        if spec.burst_steps <= 1:
+            return
+        self._rng_key, warmup_key = jax.random.split(self._rng_key)
+        dummy_batches = [
+            _dummy_training_batch(spec, warmup_key) for _ in range(spec.burst_steps)
+        ]
+        stacked_batch = _stack_training_batches(dummy_batches)
+        step_keys = jax.random.split(warmup_key, spec.burst_steps)
+        lr_scales = jnp.ones((spec.burst_steps,), dtype=jnp.float32)
+        active_mask = jnp.ones((spec.burst_steps,), dtype=jnp.float32)
+        _, _, _, _ = self._burst_update(
+            self.params,
+            self._opt_state,
+            jnp.asarray(self._obs_running_count, dtype=jnp.int32),
+            stacked_batch,
+            step_keys,
+            lr_scales,
+            active_mask,
+        )
+
+    def _learning_rate_scale_at(self, trained_steps: int) -> float:
+        """Learning-rate scale for a specific global train step."""
         total = max(1, self.config.total_training_steps)
         warm_steps = int(total * self.config.lr_warm_up)
-        if warm_steps > 0 and self._train_steps < warm_steps:
-            return self._train_steps / warm_steps
+        if warm_steps > 0 and trained_steps < warm_steps:
+            return trained_steps / warm_steps
         decay_steps = max(1, self.config.lr_decay_steps)
-        exponent = (self._train_steps - warm_steps) // decay_steps
+        exponent = (trained_steps - warm_steps) // decay_steps
         return float(self.config.lr_decay_rate**exponent)
+
+    def _learning_rate_scale(self) -> float:
+        """Linear LR warmup, then step decay."""
+        return self._learning_rate_scale_at(self._train_steps)
 
     def _priority_beta(self) -> float:
         if not self.config.use_priority:
@@ -392,7 +716,7 @@ class EfficientZeroLearner(Learner):
         for attr in ("_self_play_params", "_reanalyze_params", "_recent_reanalyze_params"):
             target = getattr(self, attr)
             rep = dict(target["representation_model"])
-            for key in ("running_mean", "running_var", "running_count"):
+            for key in ("running_mean", "running_var"):
                 if key in source:
                     rep[key] = source[key]
             target["representation_model"] = rep
@@ -401,7 +725,7 @@ class EfficientZeroLearner(Learner):
                 if params is None:
                     continue
                 rep = dict(params["representation_model"])
-                for key in ("running_mean", "running_var", "running_count"):
+                for key in ("running_mean", "running_var"):
                     if key in source:
                         rep[key] = source[key]
                 params["representation_model"] = rep
@@ -423,6 +747,9 @@ def _prepare_training_batch(
     total_transitions: int,
     rng_key: jax.Array,
     on_reanalyze_progress: Callable[[int, int], None] | None = None,
+    skip_reanalyze: bool = False,
+    value_infer_fn: ValueInferenceFn | None = None,
+    reanalyze_search_width: int | None = None,
 ) -> dict[str, jnp.ndarray]:
     arrays = _batch_to_arrays(batch)
     window = config.unroll_steps + 1
@@ -446,6 +773,7 @@ def _prepare_training_batch(
             obs,
             rng_key=rng_key,
             mini_batch_size=config.reanalyze_mini_batch_size,
+            infer_fn=value_infer_fn,
         )
 
     if config.model_value_target == "bootstrapped":
@@ -477,37 +805,64 @@ def _prepare_training_batch(
     arrays["value_targets"] = jnp.asarray(bootstrapped, dtype=jnp.float32)
     arrays["search_values"] = jnp.asarray(batch.data["search_values"], dtype=jnp.float32)
 
-    reanalyze_count = int(config.batch_size * config.reanalyze_ratio)
+    reanalyze_count = 0 if skip_reanalyze else int(config.batch_size * config.reanalyze_ratio)
 
     if reanalyze_count > 0 and isinstance(planner, EfficientZeroPlanner):
         temperature = mcts_temperature(config, trained_steps)
+        if reanalyze_search_width is None:
+            reanalyze_search_width = resolve_reanalyze_search_width(config)
         policy_targets, search_values, policy_candidates, best_actions = reanalyze_policy_batch(
             planner,
             observations[:, :window],
             params=reanalyze_params,
             reanalyze_count=reanalyze_count,
             temperature=temperature,
-            search_batch_size=effective_reanalyze_search_batch_size(config),
+            search_batch_size=reanalyze_search_width,
             on_progress=on_reanalyze_progress,
         )
-
-        arrays["policy_targets"] = jnp.asarray(
-            _merge_reanalyze(arrays["policy_targets"], policy_targets, reanalyze_count),
-            dtype=jnp.float32,
-        )
-        arrays["search_values"] = jnp.asarray(
-            _merge_reanalyze_1d(arrays["search_values"], search_values, reanalyze_count),
-            dtype=jnp.float32,
-        )
-        arrays["policy_candidates"] = jnp.asarray(
-            _merge_reanalyze(arrays["policy_candidates"], policy_candidates, reanalyze_count),
-            dtype=jnp.float32,
-        )
-        arrays["best_actions"] = jnp.asarray(
-            _merge_reanalyze(arrays["best_actions"], best_actions, reanalyze_count),
-            dtype=jnp.float32,
+        arrays = _apply_reanalyze_outputs(
+            arrays,
+            (policy_targets, search_values, policy_candidates, best_actions),
+            reanalyze_count,
         )
 
+    return _finalize_value_targets(arrays, batch, config=config, trained_steps=trained_steps)
+
+
+def _apply_reanalyze_outputs(
+    arrays: dict[str, jnp.ndarray],
+    refreshed: tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray],
+    reanalyze_count: int,
+) -> dict[str, jnp.ndarray]:
+    policy_targets, search_values, policy_candidates, best_actions = refreshed
+    arrays = dict(arrays)
+    arrays["policy_targets"] = jnp.asarray(
+        _merge_reanalyze(arrays["policy_targets"], policy_targets, reanalyze_count),
+        dtype=jnp.float32,
+    )
+    arrays["search_values"] = jnp.asarray(
+        _merge_reanalyze_1d(arrays["search_values"], search_values, reanalyze_count),
+        dtype=jnp.float32,
+    )
+    arrays["policy_candidates"] = jnp.asarray(
+        _merge_reanalyze(arrays["policy_candidates"], policy_candidates, reanalyze_count),
+        dtype=jnp.float32,
+    )
+    arrays["best_actions"] = jnp.asarray(
+        _merge_reanalyze(arrays["best_actions"], best_actions, reanalyze_count),
+        dtype=jnp.float32,
+    )
+    return arrays
+
+
+def _finalize_value_targets(
+    arrays: dict[str, jnp.ndarray],
+    batch: Batch,
+    *,
+    config: EfficientZeroConfig,
+    trained_steps: int,
+) -> dict[str, jnp.ndarray]:
+    arrays = dict(arrays)
     if config.value_target == "search":
         arrays["value_targets"] = arrays["search_values"]
     elif config.value_target == "max":
@@ -521,8 +876,134 @@ def _prepare_training_batch(
             arrays["value_targets"] * mix_masks
             + arrays["search_values"] * (1.0 - mix_masks)
         )
-
     return arrays
+
+
+def _pad_training_batch_to_spec(
+    batch: dict[str, jnp.ndarray],
+    spec: TrainingBurstSpec,
+) -> dict[str, jnp.ndarray]:
+    padded = dict(batch)
+    padded["policy_targets"] = _pad_axis(
+        jnp.asarray(batch["policy_targets"], dtype=jnp.float32),
+        axis=2,
+        size=spec.policy_width,
+    )
+    padded["policy_candidates"] = _pad_axis(
+        jnp.asarray(batch["policy_candidates"], dtype=jnp.float32),
+        axis=2,
+        size=spec.policy_width,
+    )
+    padded["best_actions"] = jnp.asarray(batch["best_actions"], dtype=jnp.float32)
+    if int(padded["best_actions"].shape[-1]) < spec.action_dim:
+        padded["best_actions"] = _pad_axis(padded["best_actions"], axis=2, size=spec.action_dim)
+    return padded
+
+
+def _dummy_training_batch(spec: TrainingBurstSpec, rng_key: jax.Array) -> dict[str, jnp.ndarray]:
+    batch_size = spec.batch_size
+    return {
+        "observations": jnp.zeros((batch_size, spec.window, spec.obs_dim), dtype=jnp.float32),
+        "actions": jnp.zeros((batch_size, spec.unroll_steps, spec.action_dim), dtype=jnp.float32),
+        "rewards": jnp.zeros((batch_size, spec.unroll_steps), dtype=jnp.float32),
+        "policy_targets": jnp.zeros(
+            (batch_size, spec.window, spec.policy_width),
+            dtype=jnp.float32,
+        ),
+        "value_targets": jnp.zeros((batch_size, spec.window), dtype=jnp.float32),
+        "policy_candidates": jnp.zeros(
+            (batch_size, spec.window, spec.policy_width, spec.action_dim),
+            dtype=jnp.float32,
+        ),
+        "best_actions": jnp.zeros((batch_size, spec.window, spec.action_dim), dtype=jnp.float32),
+        "dones": jnp.zeros((batch_size, spec.unroll_steps), dtype=jnp.bool_),
+        "masks": jnp.ones((batch_size, spec.unroll_steps), dtype=jnp.float32),
+        "weights": jnp.ones((batch_size,), dtype=jnp.float32),
+        "indices": jnp.zeros((batch_size,), dtype=jnp.float32),
+        "search_values": jnp.zeros((batch_size, spec.window), dtype=jnp.float32),
+    }
+
+
+def _pad_burst_batches(
+    batches: list[dict[str, jnp.ndarray]],
+    spec: TrainingBurstSpec,
+    *,
+    active_steps: int,
+) -> tuple[list[dict[str, jnp.ndarray]], jnp.ndarray]:
+    padded = [_pad_training_batch_to_spec(batch, spec) for batch in batches]
+    if not padded:
+        padded = [_dummy_training_batch(spec, jax.random.PRNGKey(0))]
+    while len(padded) < spec.burst_steps:
+        padded.append(padded[-1])
+    if len(padded) > spec.burst_steps:
+        padded = padded[: spec.burst_steps]
+    active_mask = np.zeros((spec.burst_steps,), dtype=np.float32)
+    active_mask[: min(active_steps, spec.burst_steps)] = 1.0
+    return padded, jnp.asarray(active_mask, dtype=jnp.float32)
+
+
+def _pad_burst_scan_inputs(
+    step_keys: jax.Array,
+    lr_scales: list[float],
+    *,
+    spec: TrainingBurstSpec,
+) -> tuple[jax.Array, jnp.ndarray]:
+    keys = step_keys
+    if int(keys.shape[0]) < spec.burst_steps:
+        pad = jnp.repeat(keys[-1:], spec.burst_steps - int(keys.shape[0]), axis=0)
+        keys = jnp.concatenate([keys, pad], axis=0)
+    else:
+        keys = keys[: spec.burst_steps]
+    scales = list(lr_scales)
+    while len(scales) < spec.burst_steps:
+        scales.append(scales[-1] if scales else 1.0)
+    return keys, jnp.asarray(scales[: spec.burst_steps], dtype=jnp.float32)
+
+
+def _zeroed_step_metrics(batch: dict[str, jnp.ndarray]) -> dict[str, jnp.ndarray]:
+    batch_size = int(batch["observations"].shape[0])
+    zero = jnp.asarray(0.0, dtype=jnp.float32)
+    return {
+        "loss": zero,
+        "reward_loss": zero,
+        "value_loss": zero,
+        "policy_loss": zero,
+        "consistency_loss": zero,
+        "entropy": zero,
+        "priorities": jnp.zeros((batch_size,), dtype=jnp.float32),
+    }
+
+
+def _align_training_batches(batches: list[dict[str, jnp.ndarray]]) -> list[dict[str, jnp.ndarray]]:
+    if not batches:
+        return []
+    max_policy = max(int(batch["policy_targets"].shape[2]) for batch in batches)
+    max_candidates = max(int(batch["policy_candidates"].shape[2]) for batch in batches)
+    max_best = max(int(batch["best_actions"].shape[2]) for batch in batches)
+    aligned: list[dict[str, jnp.ndarray]] = []
+    for batch in batches:
+        aligned.append(
+            {
+                **batch,
+                "policy_targets": _pad_axis(batch["policy_targets"], axis=2, size=max_policy),
+                "policy_candidates": _pad_axis(batch["policy_candidates"], axis=2, size=max_candidates),
+                "best_actions": _pad_axis(batch["best_actions"], axis=2, size=max_best),
+            }
+        )
+    return aligned
+
+
+def _pad_axis(array: jnp.ndarray, *, axis: int, size: int) -> jnp.ndarray:
+    current = int(array.shape[axis])
+    if current >= size:
+        return array
+    pad_width = [(0, 0) for _ in range(array.ndim)]
+    pad_width[axis] = (0, size - current)
+    return jnp.pad(array, pad_width)
+
+
+def _stack_training_batches(batches: list[dict[str, jnp.ndarray]]) -> dict[str, jnp.ndarray]:
+    return jax.tree.map(lambda *items: jnp.stack(items, axis=0), *batches)
 
 
 def _merge_reanalyze(
@@ -545,9 +1026,63 @@ def _merge_reanalyze_1d(
     return merged
 
 
+def _burst_optimizer_scan(
+    params: Params,
+    opt_state: optax.OptState,
+    obs_count: jnp.ndarray,
+    stacked_batch: dict[str, jnp.ndarray],
+    rngs: jax.Array,
+    lr_scales: jax.Array,
+    active_mask: jax.Array,
+    *,
+    model: EfficientZeroNetwork,
+    config: EfficientZeroConfig,
+    optimizer: optax.GradientTransformation,
+) -> tuple[Params, optax.OptState, jnp.ndarray, dict[str, jnp.ndarray]]:
+    def scan_step(
+        carry: tuple[Params, optax.OptState, jnp.ndarray],
+        inputs: tuple[dict[str, jnp.ndarray], jax.Array, jax.Array, jax.Array],
+    ) -> tuple[tuple[Params, optax.OptState, jnp.ndarray], dict[str, jnp.ndarray]]:
+        current_params, current_opt_state, current_obs_count = carry
+        batch, rng, lr_scale, active = inputs
+
+        def run_step(
+            _: None,
+        ) -> tuple[tuple[Params, optax.OptState, jnp.ndarray], dict[str, jnp.ndarray]]:
+            new_params, new_opt_state, new_obs_count, metrics = _optimizer_step(
+                current_params,
+                current_opt_state,
+                current_obs_count,
+                batch,
+                rng,
+                lr_scale,
+                model=model,
+                config=config,
+                optimizer=optimizer,
+            )
+            return (new_params, new_opt_state, new_obs_count), metrics
+
+        def skip_step(
+            _: None,
+        ) -> tuple[tuple[Params, optax.OptState, jnp.ndarray], dict[str, jnp.ndarray]]:
+            return (current_params, current_opt_state, current_obs_count), _zeroed_step_metrics(
+                batch
+            )
+
+        return jax.lax.cond(active > 0.0, run_step, skip_step, operand=None)
+
+    scan_inputs = (stacked_batch, rngs, lr_scales, active_mask)
+    (params, opt_state, obs_count), metrics = jax.lax.scan(
+        scan_step, (params, opt_state, obs_count), scan_inputs
+    )
+    stacked_metrics = jax.tree.map(lambda leaf: jnp.asarray(leaf), metrics)
+    return params, opt_state, obs_count, stacked_metrics
+
+
 def _optimizer_step(
     params: Params,
     opt_state: optax.OptState,
+    obs_count: jnp.ndarray,
     batch: dict[str, jnp.ndarray],
     rng: jax.Array,
     lr_scale: jnp.ndarray,
@@ -555,7 +1090,18 @@ def _optimizer_step(
     model: EfficientZeroNetwork,
     config: EfficientZeroConfig,
     optimizer: optax.GradientTransformation,
-) -> tuple[Params, optax.OptState, dict[str, jnp.ndarray]]:
+) -> tuple[Params, optax.OptState, jnp.ndarray, dict[str, jnp.ndarray]]:
+    tentative_mean, tentative_var, tentative_count = compute_tentative_obs_stats_jax(
+        params,
+        batch["observations"],
+        obs_count,
+    )
+    forward_params = with_representation_obs_stats(
+        params,
+        mean=tentative_mean,
+        var=tentative_var,
+    )
+
     loss_fn = partial(
         _loss_from_batch,
         model=model,
@@ -565,15 +1111,43 @@ def _optimizer_step(
     def objective(current_params: Params) -> tuple[jnp.ndarray, dict[str, jnp.ndarray]]:
         return loss_fn(current_params, batch, rng=rng)
 
-    (loss, metrics), grads = jax.value_and_grad(objective, has_aux=True)(params)
-    updates, new_opt_state = optimizer.update(grads, opt_state, params)
-    # EfficientZero-V2 mutates ``param_group['lr']`` per step; Adam updates scale
-    # linearly in the learning rate, so scaling the final update is identical.
-    updates = jax.tree.map(lambda update: update * lr_scale, updates)
-    new_params = optax.apply_updates(params, updates)
-    metrics = {**metrics, "loss": loss}
-    return new_params, new_opt_state, metrics
+    (loss, metrics), grads = jax.value_and_grad(objective, has_aux=True)(forward_params)
+
+    def merge_metrics() -> dict[str, jnp.ndarray]:
+        merged = _zeroed_step_metrics(batch)
+        for key in merged:
+            if key in metrics:
+                merged[key] = metrics[key]
+        merged["loss"] = loss
+        return merged
+
+    def apply_step(_: None) -> tuple[Params, optax.OptState, jnp.ndarray, dict[str, jnp.ndarray]]:
+        updates, new_opt_state = optimizer.update(grads, opt_state, params)
+        # EfficientZero-V2 mutates ``param_group['lr']`` per step; Adam updates scale
+        # linearly in the learning rate, so scaling the final update is identical.
+        updates = jax.tree.map(lambda update: update * lr_scale, updates)
+        new_params = optax.apply_updates(params, updates)
+        committed_params = with_representation_obs_stats(
+            new_params,
+            mean=tentative_mean,
+            var=tentative_var,
+        )
+        return committed_params, new_opt_state, tentative_count, merge_metrics()
+
+    def skip_step(_: None) -> tuple[Params, optax.OptState, jnp.ndarray, dict[str, jnp.ndarray]]:
+        return params, opt_state, obs_count, merge_metrics()
+
+    return jax.lax.cond(jnp.isfinite(loss), apply_step, skip_step, None)
 
 
 def build_efficient_zero_learner(context: ComponentContext) -> EfficientZeroLearner:
+    if not isinstance(context.config, EfficientZeroConfig):
+        if getattr(context.config, "require_implemented", True) is False:
+            from algorl.backends.jax.learners import _StubLearner
+
+            return _StubLearner("efficient_zero", context)  # type: ignore[return-value]
+        raise TypeError(
+            "EfficientZeroLearner requires EfficientZeroConfig, "
+            f"got {type(context.config)!r}."
+        )
     return EfficientZeroLearner(context)

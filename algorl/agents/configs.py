@@ -16,6 +16,7 @@ class BaseAgentConfig:
     train_freq: int = 1
     learning_starts: int = 1_000
     gradient_steps_per_rollout: int | None = None
+    burst_compile_steps: int | None = None
     checkpoint_freq: int | None = None
     jax_rollout_chunk: int = 64
     require_implemented: bool = True
@@ -53,7 +54,10 @@ class EfficientZeroConfig(SearchAgentConfig):
     """
 
     reanalyze_ratio: float = 0.5
-    reanalyze_search_batch_size: int | None = None
+    # Reanalyze MCTS width: an int, ``None`` (fall back to ``search_batch_size``),
+    # or ``"auto"`` (size from free GPU memory at learner init; results are
+    # identical at any width, wider just raises device occupancy).
+    reanalyze_search_batch_size: int | str | None = None
     reanalyze_mini_batch_size: int = 256
     reanalyze_update_interval: int = 200
     unroll_steps: int = 5
@@ -157,11 +161,12 @@ class EfficientZeroConfig(SearchAgentConfig):
         """Single-env vector control (Gymnasium / DMC state).
 
         Rollout MCTS uses ``search_batch_size=1``; training-time reanalyze
-        batches ``reanalyze_search_batch_size`` roots per JIT search.
+        batches ``reanalyze_search_batch_size`` roots per JIT search
+        (``"auto"`` sizes the width from free GPU memory).
         """
         config = cls.for_dmc_state(
             search_batch_size=1,
-            reanalyze_search_batch_size=2048,
+            reanalyze_search_batch_size="auto",
             jax_rollout_chunk=10,
             gradient_steps_per_rollout=1,
             batch_size=256,
@@ -180,24 +185,33 @@ class EfficientZeroConfig(SearchAgentConfig):
     ) -> EfficientZeroConfig:
         """Parallel vector-control envs with wide rollout MCTS.
 
-        ``jax_rollout_chunk`` is chosen so ``chunk * num_envs`` matches
-        ``dynamics_update_every`` (one learner update per rollout chunk).
+        Learner and reanalyze settings match :meth:`for_sequential`. Rollout
+        parallelism uses ``search_batch_size=num_envs`` so each MCTS call plans
+        for all lanes at once; ``jax_rollout_chunk`` stays at the sequential
+        value so a chunk still runs multiple batched MCTS steps before training.
+
+        Training runs as a post-rollout burst of ``num_envs * jax_rollout_chunk``
+        gradient steps (one update per collected env step, matching sequential).
+        The burst executes in sub-bursts of ``burst_compile_steps`` updates:
+        each sub-burst re-samples the buffer, recomputes value targets, and
+        reruns fused reanalyze against the latest parameters and priorities,
+        keeping target staleness close to the sequential loop while the scanned
+        optimizer and wide reanalyze searches keep GPU throughput high. Set
+        ``gradient_steps_per_rollout=None`` for fully interleaved training.
         """
         dynamics_every = 10
         if overrides and "dynamics_update_every" in overrides:
             dynamics_every = int(overrides["dynamics_update_every"])  # type: ignore[arg-type]
-        rollout_chunk = max(1, dynamics_every // max(1, num_envs))
-        config = cls.for_dmc_state(
-            batch_size=256,
-            mcts_simulations=32,
-            jax_rollout_chunk=rollout_chunk,
+        burst_steps = num_envs * dynamics_every
+        config = cls.for_sequential(
             search_batch_size=num_envs,
-            reanalyze_ratio=1.0,
-            gradient_steps_per_rollout=1,
+            jax_rollout_chunk=dynamics_every,
             dynamics_update_every=dynamics_every,
-            seed=0,
-            buffer_capacity=10_000,
-            learning_starts=1_000,
+            gradient_steps_per_rollout=burst_steps,
+            # Sub-burst width: bounded so priorities/targets refresh at least as
+            # often as the sequential self-play interval, while each sub-burst
+            # still feeds reanalyze enough roots to saturate the search width.
+            burst_compile_steps=min(burst_steps, 64),
         )
         return config.with_overrides(**overrides) if overrides else config
 
