@@ -24,9 +24,6 @@ from algorl.buffers.efficientzero.schedule import (
 
 NUM_ENVS = 32
 TOTAL_TIMESTEPS = 10_000_000
-# Soft anneal (best guess after lrdecay2m dips): full 3e-4 through the climb,
-# then ×0.5 every 2M train steps → ~1.5e-4 @2.1M, ~7.5e-5 @4.1M, ~3.8e-5 @6.1M.
-# Avoids the old ×0.1 cliffs to 3e-6/3e-7 that stacked with mix_start / temp drops.
 LR_DECAY_STEPS = 2_000_000
 LR_DECAY_RATE = 0.5
 
