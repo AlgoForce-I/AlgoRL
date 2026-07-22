@@ -296,6 +296,10 @@ def _loss_from_batch(
         posinf=1e5 + config.min_prior,
         neginf=config.min_prior,
     )
+    search_values = batch.get("search_values")
+    search_target_gap = jnp.zeros((), dtype=jnp.float32)
+    if search_values is not None:
+        search_target_gap = jnp.mean(jnp.abs(search_values[:, 0] - value_targets[:, 0]))
 
     metrics = {
         "loss": loss,
@@ -304,6 +308,10 @@ def _loss_from_batch(
         "policy_loss": jnp.mean(policy_loss_total),
         "consistency_loss": jnp.mean(consistency_loss_total),
         "entropy": jnp.mean(entropy_total),
+        "value_pred_mae": jnp.mean(jnp.abs(pred_priority_values - priority_targets)),
+        "value_target_mean": jnp.mean(priority_targets),
+        "value_pred_mean": jnp.mean(pred_priority_values),
+        "search_target_gap": search_target_gap,
         "priorities": priorities,
     }
     return loss, metrics
@@ -695,6 +703,19 @@ class EfficientZeroLearner(Learner):
         progress = min(1.0, self._train_steps / total)
         return float(initial + (1.0 - initial) * progress)
 
+    def sync_self_play_for_rollout(self) -> None:
+        """Copy learner weights to self-play MCTS before collecting rollout data.
+
+        Used when ``config.sync_self_play_before_rollout`` is True. EZ-V2 default
+        behavior leaves this off and refreshes only every
+        ``self_play_update_interval`` train steps.
+        """
+        self._propagate_obs_norm_stats()
+        self._self_play_params = copy.deepcopy(self.params)
+        if isinstance(self.planner, EfficientZeroPlanner):
+            self.planner.self_play_params = self._self_play_params
+            self.planner.params = self.params
+
     def _maybe_refresh_model_copies(self) -> None:
         self_play_interval = max(1, self.config.self_play_update_interval)
         if self._train_steps > 0 and self._train_steps % self_play_interval == 0:
@@ -970,6 +991,10 @@ def _zeroed_step_metrics(batch: dict[str, jnp.ndarray]) -> dict[str, jnp.ndarray
         "policy_loss": zero,
         "consistency_loss": zero,
         "entropy": zero,
+        "value_pred_mae": zero,
+        "value_target_mean": zero,
+        "value_pred_mean": zero,
+        "search_target_gap": zero,
         "priorities": jnp.zeros((batch_size,), dtype=jnp.float32),
     }
 

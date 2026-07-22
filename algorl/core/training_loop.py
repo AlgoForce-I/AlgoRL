@@ -120,7 +120,8 @@ class TrainingLoop:
                 )
             )
 
-            episode_event = self._episode_tracker.observe_step(float(reward), done, dict(info))
+            enriched_info = self._enrich_transition_info(dict(info))
+            episode_event = self._episode_tracker.observe_step(float(reward), done, enriched_info)
             if episode_event is not None:
                 metrics = self._record_episode(step, episode_event, metrics)
 
@@ -176,6 +177,11 @@ class TrainingLoop:
                     extra_step_info=extra_step_info,
                     progress_bar=progress_bar,
                 )
+
+            if getattr(self.config, "sync_self_play_before_rollout", False):
+                sync_self_play = getattr(self.learner, "sync_self_play_for_rollout", None)
+                if callable(sync_self_play):
+                    sync_self_play()
 
             batch = self.env.collect_rollout(
                 self._batched_policy(search_results),
@@ -352,6 +358,12 @@ class TrainingLoop:
             if steps_collected + rollout_progress >= total_timesteps:
                 break
             info = dict(lane_infos[lane])
+            search_info = self._search_info_from_result(
+                getattr(self.planner, "last_result", None),
+                lane,
+            )
+            if search_info:
+                info.update(search_info)
             reward = float(reward_array[lane])
             done = bool(done_array[lane])
             if "success" in info:

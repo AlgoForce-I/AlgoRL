@@ -282,6 +282,31 @@ def test_efficient_zero_learner_skips_optimizer_on_non_finite_loss(
     )
 
 
+def test_sync_self_play_for_rollout_refreshes_planner_copy(learner_context: ComponentContext) -> None:
+    context = learner_context
+    context.world_model = build_efficient_zero_world_model(context)
+    context.planner = build_efficient_zero_planner(context)
+    learner = build_efficient_zero_learner(context)
+    planner = context.planner
+
+    before_self_play = jax.tree.map(np.asarray, planner.self_play_params)
+    learner.params = jax.tree.map(lambda leaf: leaf + 1.0, learner.params)
+
+    learner.sync_self_play_for_rollout()
+
+    after_self_play = jax.tree.map(np.asarray, planner.self_play_params)
+    learner_weights = jax.tree.map(np.asarray, learner.params)
+    assert planner.self_play_params is learner._self_play_params
+    assert not np.allclose(
+        jax.tree.leaves(before_self_play)[0],
+        jax.tree.leaves(after_self_play)[0],
+    )
+    assert np.allclose(
+        jax.tree.leaves(after_self_play)[0],
+        jax.tree.leaves(learner_weights)[0],
+    )
+
+
 def test_batched_search_outputs_normalizes_mcts_shapes() -> None:
     from algorl.backends.jax.learners.efficientzero.reanalyze import _batched_search_outputs
 

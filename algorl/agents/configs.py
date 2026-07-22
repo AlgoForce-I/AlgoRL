@@ -98,6 +98,10 @@ class EfficientZeroConfig(SearchAgentConfig):
     mixed_value_threshold: float = 20_000.0
     auto_td_steps: int = 30_000
     self_play_update_interval: int = 100
+    # When True, copy learner weights into self-play MCTS before each batched
+    # rollout chunk. Default False matches EZ-V2 (refresh only every
+    # ``self_play_update_interval`` train steps).
+    sync_self_play_before_rollout: bool = False
     change_temperature: bool = True
     total_training_steps: int = 100_000
     dynamics_update_every: int = 10

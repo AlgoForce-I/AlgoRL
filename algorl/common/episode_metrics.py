@@ -29,6 +29,13 @@ def task_index_from_info(info: dict[str, object]) -> int | None:
     return None
 
 
+def _float_from_info(info: dict[str, object], key: str) -> float | None:
+    value = info.get(key)
+    if value is None:
+        return None
+    return float(value)
+
+
 @dataclass(frozen=True)
 class EpisodeEndEvent:
     """One completed training episode or continual-learning task segment."""
@@ -38,6 +45,8 @@ class EpisodeEndEvent:
     episode_return: float
     episode_length: int
     success: bool | None
+    search_value_start: float | None = None
+    pred_value_start: float | None = None
 
 
 def episode_metrics_from_event(event: EpisodeEndEvent) -> dict[str, float]:
@@ -52,6 +61,18 @@ def episode_metrics_from_event(event: EpisodeEndEvent) -> dict[str, float]:
         success_value = float(event.success)
         metrics["train/success"] = success_value
         metrics[f"train/task/{safe_name}/success"] = success_value
+    if event.search_value_start is not None:
+        gap = float(event.search_value_start) - float(event.episode_return)
+        metrics["train/search_value_start"] = float(event.search_value_start)
+        metrics["train/search_return_gap"] = gap
+        metrics["train/search_return_abs_gap"] = abs(gap)
+        metrics[f"train/task/{safe_name}/search_return_gap"] = gap
+    if event.pred_value_start is not None:
+        gap = float(event.pred_value_start) - float(event.episode_return)
+        metrics["train/pred_value_start"] = float(event.pred_value_start)
+        metrics["train/pred_return_gap"] = gap
+        metrics["train/pred_return_abs_gap"] = abs(gap)
+        metrics[f"train/task/{safe_name}/pred_return_gap"] = gap
     return metrics
 
 
@@ -66,6 +87,8 @@ class EpisodeMetricsTracker:
         self._episode_length = 0
         self._episode_success = False
         self._has_success_signal = False
+        self._search_value_start: float | None = None
+        self._pred_value_start: float | None = None
 
     def begin_episode(self, info: dict[str, object]) -> None:
         self._task_name = task_name_from_info(info)
@@ -74,6 +97,8 @@ class EpisodeMetricsTracker:
         self._episode_length = 0
         self._episode_success = False
         self._has_success_signal = False
+        self._search_value_start = None
+        self._pred_value_start = None
 
     def observe_step(
         self,
@@ -84,6 +109,9 @@ class EpisodeMetricsTracker:
         self._episode_return += float(reward)
         self._episode_length += 1
         self._observe_success(info)
+        if self._episode_length == 1:
+            self._search_value_start = _float_from_info(info, "search_value")
+            self._pred_value_start = _float_from_info(info, "pred_value")
 
         if not done:
             return None
@@ -94,6 +122,8 @@ class EpisodeMetricsTracker:
             episode_return=self._episode_return,
             episode_length=self._episode_length,
             success=self._episode_success if self._has_success_signal else None,
+            search_value_start=self._search_value_start,
+            pred_value_start=self._pred_value_start,
         )
 
     def metrics_from_event(self, event: EpisodeEndEvent) -> dict[str, float]:
@@ -162,4 +192,24 @@ def batched_episode_summary_metrics(events: list[EpisodeEndEvent]) -> dict[str, 
     successes = [event.success for event in events if event.success is not None]
     if successes:
         metrics["train/batched/episode_success_frac"] = float(sum(bool(s) for s in successes) / len(successes))
+    search_gaps = [
+        float(event.search_value_start) - float(event.episode_return)
+        for event in events
+        if event.search_value_start is not None
+    ]
+    if search_gaps:
+        metrics["train/batched/mean_search_return_gap"] = float(sum(search_gaps) / len(search_gaps))
+        metrics["train/batched/mean_search_return_abs_gap"] = float(
+            sum(abs(gap) for gap in search_gaps) / len(search_gaps)
+        )
+    pred_gaps = [
+        float(event.pred_value_start) - float(event.episode_return)
+        for event in events
+        if event.pred_value_start is not None
+    ]
+    if pred_gaps:
+        metrics["train/batched/mean_pred_return_gap"] = float(sum(pred_gaps) / len(pred_gaps))
+        metrics["train/batched/mean_pred_return_abs_gap"] = float(
+            sum(abs(gap) for gap in pred_gaps) / len(pred_gaps)
+        )
     return metrics
