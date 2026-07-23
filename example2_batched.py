@@ -17,17 +17,12 @@ configure_jax_gpu_memory(preallocate=False, memory_fraction=0.85)
 
 import algorl as arl
 import gymnasium as gym
-from algorl.backends.jax.envs import make_gymnasium_vector_env
-from algorl.envs import resolve_env
 
 NUM_ENVS = 32
 TOTAL_TIMESTEPS = 10_000_000
-# Orange lrdecay2m replay (Jul 17 2026): post-4417e35 code, manual 2M-step LR cliff
-# at default EZ-V2 rate 0.1, fixed 10M schedule. Success check by ~500K env steps:
-# median return should climb toward ~4K+, not plateau near ~2K.
 LR_DECAY_STEPS = 2_000_000
 LR_DECAY_RATE = 0.1
-TENSORBOARD_LOG_DIR = "runs/half_cheetah_ez_batched_lrdecay2m_replay_nosync"
+TENSORBOARD_LOG_DIR = "runs/half_cheetah_ez_batched_lrdecay2m_sync_env"
 
 
 def for_half_cheetah_batched(
@@ -59,13 +54,7 @@ def for_half_cheetah_batched(
 
 
 def main() -> None:
-    jax_env = make_gymnasium_vector_env(
-        lambda: gym.make("HalfCheetah-v5"),
-        NUM_ENVS,
-        vector_cls=gym.vector.AsyncVectorEnv,
-        seed=42,
-    )
-    env = resolve_env(jax_env, seed=42)
+    env = gym.make("HalfCheetah-v5")
     agent = arl.EfficientZero(
         env,
         config=for_half_cheetah_batched(num_envs=NUM_ENVS),
