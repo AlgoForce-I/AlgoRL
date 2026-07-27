@@ -58,6 +58,9 @@ class TrainingLoop:
             self._episode_tracker = EpisodeMetricsTracker()
         self._key = jax.random.PRNGKey(config.seed)
         self._progress_bar: TqdmProgressBar | None = None
+        # First global step at which training may run; pushed forward at
+        # continual-learning task switches to replay the learning_starts warmup.
+        self._min_train_step = 0
 
     def run(
         self,
@@ -191,6 +194,11 @@ class TrainingLoop:
             )
             transitions = self._transitions_from_rollout(batch, search_results)
             self._release_rollout_search_cache(search_results)
+            transitions, dropped_steps = self._apply_task_boundary(
+                transitions,
+                chunk_start_step,
+            )
+            steps_collected += dropped_steps
             if self.config.gradient_steps_per_rollout is None:
                 # Sequential-parity: add transitions and train immediately, so the
                 # replay-buffer warmup within the chunk matches the sequential
@@ -202,7 +210,7 @@ class TrainingLoop:
                     self.replay_buffer.add(transition)
                     steps_collected += 1
                     num_added += 1
-                    current_step = chunk_start_step + num_added - 1
+                    current_step = chunk_start_step + dropped_steps + num_added - 1
                     metrics = self._maybe_train(
                         current_step,
                         metrics,
@@ -222,14 +230,47 @@ class TrainingLoop:
 
                 if num_added == 0:
                     continue
-                chunk_end_step = chunk_start_step + num_added - 1
-                train_steps = self._batched_gradient_steps(chunk_start_step, chunk_end_step)
+                first_added_step = chunk_start_step + dropped_steps
+                chunk_end_step = first_added_step + num_added - 1
+                train_steps = self._batched_gradient_steps(first_added_step, chunk_end_step)
                 metrics = self._run_gradient_burst(
                     train_steps,
                     metrics,
                     checkpoint_path=checkpoint_path,
                     progress_bar=progress_bar,
                 )
+
+    def _apply_task_boundary(
+        self,
+        transitions: list[Transition],
+        chunk_start_step: int,
+    ) -> tuple[list[Transition], int]:
+        """Start a continual-learning task with fresh plasticity.
+
+        Envs mark the last transitions of a finished task with
+        ``info["task_changed"]``. When that flag is seen, the replay buffer is
+        flushed (old-task data must not train the new task), the learner resets
+        its optimizer/schedule state, and training pauses for a fresh
+        ``learning_starts`` warmup. Transitions up to and including the boundary
+        are dropped (they would be flushed with the buffer anyway); their count
+        is returned so the caller keeps global step accounting intact.
+        """
+        boundary = None
+        for index, transition in enumerate(transitions):
+            if transition.info.get("task_changed"):
+                boundary = index
+        if boundary is None:
+            return transitions, 0
+
+        clear_buffer = getattr(self.replay_buffer, "clear", None)
+        if callable(clear_buffer):
+            clear_buffer()
+        begin_new_task = getattr(self.learner, "begin_new_task", None)
+        if callable(begin_new_task):
+            begin_new_task()
+        boundary_step = chunk_start_step + boundary + 1
+        self._min_train_step = boundary_step + self.config.learning_starts
+        return transitions[boundary + 1:], boundary + 1
 
     def _batched_gradient_steps(self, chunk_start: int, chunk_end: int) -> list[int]:
         """Return global env steps that should trigger ``train_step`` after one rollout chunk."""
@@ -240,7 +281,7 @@ class TrainingLoop:
                 for step in range(chunk_start, chunk_end + 1)
                 if self._should_train(step)
             ]
-        if chunk_end < self.config.learning_starts:
+        if chunk_end < max(self.config.learning_starts, self._min_train_step):
             return []
         if len(self.replay_buffer) < self.config.batch_size:
             return []
@@ -622,7 +663,7 @@ class TrainingLoop:
         return info
 
     def _should_train(self, step: int) -> bool:
-        if step < self.config.learning_starts:
+        if step < max(self.config.learning_starts, self._min_train_step):
             return False
         if self.config.train_freq <= 0 or step % self.config.train_freq != 0:
             return False
