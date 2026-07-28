@@ -293,6 +293,62 @@ def test_training_loop_batched_train_burst_runs_capped_updates() -> None:
     assert learner.burst_sizes == [num_envs, num_envs]
 
 
+def test_training_loop_syncs_self_play_before_rollout_when_enabled() -> None:
+    from algorl.agents.configs import EfficientZeroConfig
+
+    num_envs = 2
+    env = _MockBatchedEnv(num_envs=num_envs)
+
+    class _SyncLearner(Learner):
+        def __init__(self) -> None:
+            self.sync_calls = 0
+
+        def train_step(self, replay_buffer: ReplayBuffer) -> dict[str, float]:
+            del replay_buffer
+            return {"loss": 0.0}
+
+        def train_burst(self, replay_buffer: ReplayBuffer, steps: int, **kwargs) -> dict[str, float]:
+            del replay_buffer, kwargs, steps
+            return {"loss": 0.0}
+
+        def sync_self_play_for_rollout(self) -> None:
+            self.sync_calls += 1
+
+    learner = _SyncLearner()
+    buffer = UniformReplayBuffer(capacity=100)
+    config = EfficientZeroConfig.for_batched(num_envs=num_envs).with_overrides(
+        learning_starts=0,
+        train_freq=1,
+        batch_size=1,
+        seed=0,
+        jax_rollout_chunk=2,
+        gradient_steps_per_rollout=num_envs,
+        sync_self_play_before_rollout=True,
+    )
+    loop = TrainingLoop(
+        env=env,
+        planner=_BatchedPlanner(batch_size=num_envs),
+        learner=learner,
+        replay_buffer=buffer,
+        config=config,
+    )
+    loop.run(8)
+    # One sync per rollout chunk (8 env-steps / (2 envs * 2 chunk steps) = 2 chunks).
+    assert learner.sync_calls == 2
+
+    learner_off = _SyncLearner()
+    config_off = config.with_overrides(sync_self_play_before_rollout=False)
+    loop_off = TrainingLoop(
+        env=_MockBatchedEnv(num_envs=num_envs),
+        planner=_BatchedPlanner(batch_size=num_envs),
+        learner=learner_off,
+        replay_buffer=UniformReplayBuffer(capacity=100),
+        config=config_off,
+    )
+    loop_off.run(8)
+    assert learner_off.sync_calls == 0
+
+
 def test_training_loop_batched_interleaves_training_with_replay_buffer_warmup() -> None:
     """Batched mode should match sequential timing once buffer size gates training.
 

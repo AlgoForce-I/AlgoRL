@@ -21,8 +21,8 @@ class ComposedAgent(Agent):
     config_class: ClassVar[type[BaseAgentConfig]]
 
     def __init__(self, env: TrainingEnv | object, config: BaseAgentConfig | None = None) -> None:
-        super().__init__(env)
         self.config = config or self.config_class()
+        super().__init__(env, config=self.config)
         components = compose_agent(
             self.composition_name,
             env=self.env,

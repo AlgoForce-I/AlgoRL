@@ -276,6 +276,16 @@ class EfficientZeroReplayBuffer(ReplayBuffer):
         indices = self._sample_indices(batch_size, beta=beta)
         return self._build_batch(indices, trained_steps=trained_steps)
 
+    def clear(self) -> None:
+        """Drop all stored and in-flight data (e.g. at a continual-learning task switch)."""
+        self._trajectories.clear()
+        self._stored_steps.clear()
+        self._lookup.clear()
+        self._priorities.clear()
+        self._base_traj_idx = 0
+        self._active.clear()
+        self._pending_commit.clear()
+
     def update_priorities(self, indices: np.ndarray, priorities: np.ndarray) -> None:
         min_prior = float(self.config.min_prior)
         for index, priority in zip(indices.reshape(-1), priorities.reshape(-1), strict=True):

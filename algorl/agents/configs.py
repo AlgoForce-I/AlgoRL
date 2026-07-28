@@ -43,6 +43,16 @@ class SearchAgentConfig(BaseAgentConfig):
     gumbel_scale: float = 1.0
     max_num_considered_actions: int | None = None
 
+    @property
+    def rollout_envs(self) -> int:
+        """Parallel rollout lanes configured for MCTS (``search_batch_size``)."""
+        return max(1, self.search_batch_size)
+
+    @property
+    def uses_batched_rollout(self) -> bool:
+        """Whether rollout MCTS plans across multiple env lanes at once."""
+        return self.search_batch_size > 1
+
 
 @dataclass(frozen=True)
 class EfficientZeroConfig(SearchAgentConfig):
@@ -88,6 +98,10 @@ class EfficientZeroConfig(SearchAgentConfig):
     mixed_value_threshold: float = 20_000.0
     auto_td_steps: int = 30_000
     self_play_update_interval: int = 100
+    # When True, copy learner weights into self-play MCTS before each batched
+    # rollout chunk. Default False matches EZ-V2 (refresh only every
+    # ``self_play_update_interval`` train steps).
+    sync_self_play_before_rollout: bool = False
     change_temperature: bool = True
     total_training_steps: int = 100_000
     dynamics_update_every: int = 10

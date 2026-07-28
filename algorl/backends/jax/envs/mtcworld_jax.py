@@ -238,9 +238,6 @@ class ContinualLearningJaxEnv(JaxEnv):
         return next_state
 
 
-        return next_state
-
-
 def _build_cw_vector_jax_env(
     benchmark: str,
     task_index: int,
@@ -249,6 +246,7 @@ def _build_cw_vector_jax_env(
     seed: int,
     config: Any | None,
     bench: Any | None = None,
+    autoreset: bool = True,
 ) -> VectorJaxEnv:
     """Vectorized JAX env for one Continual World task with task one-hot observations."""
     from MTCWorldMJX.cw_benchmarks import CWBenchmark, cw_sawyer_config
@@ -264,6 +262,7 @@ def _build_cw_vector_jax_env(
         config=sawyer_config,
         partially_observable=resolved_bench.config.partially_observable,
         task_select="random",
+        autoreset=autoreset,
         seed=seed,
     )
     adapter = as_mtcworld_jax_env_from_spec(
@@ -316,6 +315,9 @@ class BatchedContinualLearningJaxEnv:
         self._state: JaxState | None = None
 
     def _make_task_vector_env(self, task_index: int) -> VectorJaxEnv:
+        # Explicit resets (instead of VectorEnv's on-device autoreset) so that
+        # every episode resamples goals from the task pool (CW random_init_all)
+        # and the true terminal observation is available to the replay buffer.
         return _build_cw_vector_jax_env(
             self.benchmark_name,
             task_index,
@@ -323,6 +325,7 @@ class BatchedContinualLearningJaxEnv:
             seed=self.seed + task_index,
             config=self.config,
             bench=self._bench,
+            autoreset=False,
         )
 
     @property
@@ -366,14 +369,15 @@ class BatchedContinualLearningJaxEnv:
         state: JaxState,
         env_idx: int,
         *,
+        seq_idx: int,
         task_changed: bool,
         forced_task_change: bool,
     ) -> dict[str, Any]:
         success = state.metrics.get("success", jnp.zeros((self.num_envs,)))
         return {
-            "seq_idx": self._seq_idx,
+            "seq_idx": seq_idx,
             "global_step": self._global_step,
-            "task_name": self.task_names[self._seq_idx],
+            "task_name": self.task_names[seq_idx],
             "task_changed": task_changed,
             "forced_task_change": forced_task_change,
             "success": _as_float(success[env_idx]),
@@ -408,33 +412,50 @@ class BatchedContinualLearningJaxEnv:
         for step_idx in range(num_steps):
             obs = np.asarray(self.observation(state), dtype=np.float32)
             action = np.asarray(policy(obs, step_keys[step_idx]), dtype=np.float32)
-            next_state = self.step(state, jnp.asarray(action, dtype=jnp.float32))
-            next_obs = np.asarray(self.observation(next_state), dtype=np.float32)
+            stepped_state = self.step(state, jnp.asarray(action, dtype=jnp.float32))
+            # Capture the stepped transition before any reset/advance replaces
+            # the state, so the recorded reward, terminal observation, and
+            # success metric belong to this step rather than a reset state.
+            next_state = stepped_state
+            next_obs = np.asarray(self.observation(stepped_state), dtype=np.float32)
+            reward = np.asarray(stepped_state.reward, dtype=np.float32)
             episode_done = np.asarray(
-                (next_state.truncated + next_state.terminated) > 0,
+                (stepped_state.truncated + stepped_state.terminated) > 0,
                 dtype=bool,
             )
 
             self._global_step += self.num_envs
+            step_seq_idx = self._seq_idx
             task_end = (self._seq_idx + 1) * self.steps_per_task
             forced_task_change = self._global_step >= task_end
             task_changed = forced_task_change and self._seq_idx < self.num_tasks - 1
 
             if task_changed:
-                step_keys[step_idx], advance_key = jax.random.split(step_keys[step_idx])
+                _, advance_key = jax.random.split(step_keys[step_idx])
                 next_state = self._advance_task(advance_key)
-                next_obs = np.asarray(self.observation(next_state), dtype=np.float32)
                 done = np.ones((self.num_envs,), dtype=bool)
             else:
                 done = episode_done
                 if forced_task_change and self._seq_idx >= self.num_tasks - 1:
                     done = np.ones((self.num_envs,), dtype=bool)
+                if episode_done.any():
+                    # CW episodes are truncation-only with a shared horizon, so
+                    # all lanes finish together. Reset explicitly to resample
+                    # goals from the task pool (random_init_all protocol).
+                    if not episode_done.all():
+                        raise RuntimeError(
+                            "CW lanes desynchronized: expected all lanes to "
+                            "truncate on the same step."
+                        )
+                    _, episode_key = jax.random.split(step_keys[step_idx])
+                    next_state = self._vector_env.reset(episode_key)
 
             step_infos.append(
                 [
                     self._lane_info(
-                        next_state,
+                        stepped_state,
                         env_idx,
+                        seq_idx=step_seq_idx,
                         task_changed=task_changed,
                         forced_task_change=forced_task_change,
                     )
@@ -443,7 +464,7 @@ class BatchedContinualLearningJaxEnv:
             )
             observations.append(obs)
             actions.append(action)
-            rewards.append(np.asarray(next_state.reward, dtype=np.float32))
+            rewards.append(reward)
             next_observations.append(next_obs)
             dones.append(done)
             state = next_state

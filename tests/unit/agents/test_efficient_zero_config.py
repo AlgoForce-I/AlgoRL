@@ -18,6 +18,8 @@ def test_for_sequential_defaults() -> None:
 def test_for_batched_defaults() -> None:
     config = EfficientZeroConfig.for_batched(num_envs=32)
     assert config.search_batch_size == 32
+    assert config.rollout_envs == 32
+    assert config.uses_batched_rollout
     assert config.jax_rollout_chunk == 10
     assert config.batch_size == 256
     assert config.reanalyze_ratio == 1.0
@@ -29,6 +31,8 @@ def test_for_batched_defaults() -> None:
     # Sub-bursts keep priorities/targets fresh within each rollout burst.
     assert config.burst_compile_steps == 64
     assert EfficientZeroConfig.for_batched(num_envs=4).burst_compile_steps == 40
+    # EZ-V2 parity: do not force a self-play copy before every rollout chunk.
+    assert config.sync_self_play_before_rollout is False
 
 
 def test_legacy_aliases_match_new_presets() -> None:
