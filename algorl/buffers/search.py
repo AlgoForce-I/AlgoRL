@@ -2,27 +2,8 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
-from typing import Any
-
 from algorl.core.replay_buffer import ReplayBuffer
 from algorl.core.types import Batch, SearchEntry, Transition
-
-
-@dataclass
-class SearchBuffer:
-    """Legacy search metadata container used before registry-backed buffers."""
-
-    entries: list[Any] = field(default_factory=list)
-
-    def add(self, entry: Any) -> None:
-        self.entries.append(entry)
-
-    def clear(self) -> None:
-        self.entries.clear()
-
-    def __len__(self) -> int:
-        return len(self.entries)
 
 
 class SearchReplayBuffer(ReplayBuffer):

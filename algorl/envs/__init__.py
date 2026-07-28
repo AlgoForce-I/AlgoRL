@@ -5,10 +5,8 @@ from algorl.envs.gym_jax import JaxGymEnv
 from algorl.envs.jax_env import BatchedJaxEnv, JaxEnv, JaxRolloutBatch, PolicyFn
 from algorl.envs.resolve import make_env, resolve_env
 from algorl.envs.training_env import TrainingEnv
-from algorl.envs.wrappers import ActionRepeatWrapper
 
 __all__ = [
-    "ActionRepeatWrapper",
     "BatchedJaxEnv",
     "Env",
     "JaxEnv",

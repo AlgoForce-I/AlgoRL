@@ -6,10 +6,7 @@ entirely through registries registered in ``algorl.backends.registry``.
 
 from __future__ import annotations
 
-from typing import Any
-
 from algorl.core.backend import Backend
-from algorl.core.component_context import ComponentContext
 
 
 def get_backend(name: str = "jax") -> Backend:
@@ -35,12 +32,3 @@ def get_component_factory(backend: Backend):
         raise ValueError(f"No component factory registered for backend {backend.name!r}.") from error
 
     return factory_cls()
-
-
-def create_component(
-    component_type: str,
-    kind: str,
-    context: ComponentContext,
-) -> Any:
-    """Construct one backend component from registry entries."""
-    return get_component_factory(context.backend).create(component_type, kind, context)

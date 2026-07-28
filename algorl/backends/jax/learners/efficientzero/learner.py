@@ -999,25 +999,6 @@ def _zeroed_step_metrics(batch: dict[str, jnp.ndarray]) -> dict[str, jnp.ndarray
     }
 
 
-def _align_training_batches(batches: list[dict[str, jnp.ndarray]]) -> list[dict[str, jnp.ndarray]]:
-    if not batches:
-        return []
-    max_policy = max(int(batch["policy_targets"].shape[2]) for batch in batches)
-    max_candidates = max(int(batch["policy_candidates"].shape[2]) for batch in batches)
-    max_best = max(int(batch["best_actions"].shape[2]) for batch in batches)
-    aligned: list[dict[str, jnp.ndarray]] = []
-    for batch in batches:
-        aligned.append(
-            {
-                **batch,
-                "policy_targets": _pad_axis(batch["policy_targets"], axis=2, size=max_policy),
-                "policy_candidates": _pad_axis(batch["policy_candidates"], axis=2, size=max_candidates),
-                "best_actions": _pad_axis(batch["best_actions"], axis=2, size=max_best),
-            }
-        )
-    return aligned
-
-
 def _pad_axis(array: jnp.ndarray, *, axis: int, size: int) -> jnp.ndarray:
     current = int(array.shape[axis])
     if current >= size:

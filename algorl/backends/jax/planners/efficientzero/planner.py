@@ -63,12 +63,6 @@ class EfficientZeroBatchedResult:
     def batch_size(self) -> int:
         return int(self.actions.shape[0])
 
-    def without_search_tree(self) -> EfficientZeroBatchedResult:
-        """Drop MCTS tree payloads; training only needs root policy/value tensors."""
-        if self.search_tree is None:
-            return self
-        return replace(self, search_tree=None)
-
     def as_training_snapshot(self) -> EfficientZeroBatchedResult:
         """Host NumPy snapshot for replay targets without retaining GPU search trees."""
         return EfficientZeroBatchedResult(

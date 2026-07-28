@@ -324,16 +324,6 @@ class EfficientZeroConfig(SearchAgentConfig):
         return config.with_overrides(**overrides) if overrides else config
 
     @classmethod
-    def for_dmc_state_batched_cl(
-        cls,
-        *,
-        num_envs: int,
-        **overrides: object,
-    ) -> EfficientZeroConfig:
-        """Alias for :meth:`for_batched`."""
-        return cls.for_batched(num_envs=num_envs, **overrides)
-
-    @classmethod
     def for_dmc_state_batched_cl_gpu(
         cls,
         *,
@@ -350,18 +340,6 @@ class EfficientZeroConfig(SearchAgentConfig):
     ) -> EfficientZeroConfig:
         """Alias for :meth:`for_sequential`."""
         return cls.for_sequential(**overrides)
-
-    @classmethod
-    def for_dmc_state_throughput(cls, **overrides: object) -> EfficientZeroConfig:
-        """Vector-control preset tuned for maximum JAX throughput (no reanalyze)."""
-        config = cls.for_dmc_state(
-            reanalyze_ratio=0.0,
-            batch_size=256,
-            mcts_simulations=32,
-            jax_rollout_chunk=256,
-            search_batch_size=8,
-        )
-        return config.with_overrides(**overrides) if overrides else config
 
 
 @dataclass(frozen=True)

@@ -38,11 +38,6 @@ class KindRegistry(Generic[T]):
         self._entries[kind] = RegistryEntry(builder=builder, stub=stub)
         return builder
 
-    def replace(self, kind: str, builder: Builder[T], *, stub: bool = False) -> Builder[T]:
-        """Replace an existing registration, e.g. swap a stub for a real implementation."""
-        self._entries[kind] = RegistryEntry(builder=builder, stub=stub)
-        return builder
-
     def is_stub(self, kind: str) -> bool:
         try:
             return self._entries[kind].stub

@@ -265,9 +265,6 @@ class TrainingLoop:
         clear_buffer = getattr(self.replay_buffer, "clear", None)
         if callable(clear_buffer):
             clear_buffer()
-        begin_new_task = getattr(self.learner, "begin_new_task", None)
-        if callable(begin_new_task):
-            begin_new_task()
         boundary_step = chunk_start_step + boundary + 1
         self._min_train_step = boundary_step + self.config.learning_starts
         return transitions[boundary + 1:], boundary + 1
