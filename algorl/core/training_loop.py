@@ -106,8 +106,10 @@ class TrainingLoop:
         observation, reset_info = self.env.reset(seed=self.config.seed)
         self._episode_tracker.begin_episode(reset_info)
         metrics: dict[str, Any] = {}
+        self._sync_rollout_task_id()
 
         for step in range(total_timesteps):
+            self._sync_rollout_task_id()
             action = self._select_action(observation)
             next_observation, reward, terminated, truncated, info = self.env.step(action)
             done = terminated or truncated
@@ -127,6 +129,13 @@ class TrainingLoop:
             episode_event = self._episode_tracker.observe_step(float(reward), done, enriched_info)
             if episode_event is not None:
                 metrics = self._record_episode(step, episode_event, metrics)
+
+            if info.get("task_changed"):
+                self._notify_task_boundary(info)
+                clear_buffer = getattr(self.replay_buffer, "clear", None)
+                if callable(clear_buffer):
+                    clear_buffer()
+                self._min_train_step = step + 1 + self.config.learning_starts
 
             if done:
                 observation, reset_info = self.env.reset()
@@ -185,6 +194,8 @@ class TrainingLoop:
                 sync_self_play = getattr(self.learner, "sync_self_play_for_rollout", None)
                 if callable(sync_self_play):
                     sync_self_play()
+
+            self._sync_rollout_task_id()
 
             batch = self.env.collect_rollout(
                 self._batched_policy(search_results),
@@ -262,12 +273,53 @@ class TrainingLoop:
         if boundary is None:
             return transitions, 0
 
+        self._notify_task_boundary(transitions[boundary].info)
+
         clear_buffer = getattr(self.replay_buffer, "clear", None)
         if callable(clear_buffer):
             clear_buffer()
         boundary_step = chunk_start_step + boundary + 1
         self._min_train_step = boundary_step + self.config.learning_starts
         return transitions[boundary + 1:], boundary + 1
+
+    def _notify_task_boundary(self, info: dict[str, Any]) -> None:
+        """Invoke learner continual-learning hook when the env switches tasks."""
+        finished_task = info.get("seq_idx", info.get("task_index", 0))
+        new_task_id = int(finished_task) + 1
+        on_task_boundary = getattr(self.learner, "on_task_boundary", None)
+        if callable(on_task_boundary):
+            on_task_boundary(new_task_id)
+
+    def _sync_rollout_task_id(self) -> None:
+        """Keep learner materialization aligned with the env's active task."""
+        task_id = self._env_current_task_index()
+        if task_id is None:
+            return
+        current = int(getattr(self.learner, "task_id", -1))
+        if current == task_id:
+            return
+        if task_id > current:
+            on_task_boundary = getattr(self.learner, "on_task_boundary", None)
+            if callable(on_task_boundary):
+                on_task_boundary(task_id)
+                return
+        set_task_id = getattr(self.learner, "set_task_id", None)
+        if callable(set_task_id):
+            set_task_id(task_id)
+
+    def _env_current_task_index(self) -> int | None:
+        for candidate in (
+            self.env,
+            getattr(self.env, "raw", None),
+            getattr(self.env, "unwrapped", None),
+        ):
+            if candidate is None:
+                continue
+            current = getattr(candidate, "current_task_index", None)
+            if current is None:
+                continue
+            return int(current() if callable(current) else current)
+        return None
 
     def _batched_gradient_steps(self, chunk_start: int, chunk_end: int) -> list[int]:
         """Return global env steps that should trigger ``train_step`` after one rollout chunk."""

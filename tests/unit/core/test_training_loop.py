@@ -640,3 +640,133 @@ def test_training_loop_merges_rollout_step_info() -> None:
     assert stored[0].info["task_name"] == "hammer-v3"
     assert stored[1].info["success"] == 1.0
     assert POLICY_TARGET_INFO_KEY in stored[0].info
+
+
+def test_training_loop_notifies_learner_on_task_boundary() -> None:
+    num_envs = 1
+
+    class _TaskBoundaryEnv(_MockBatchedEnv):
+        def __init__(self, *, num_envs: int = 2) -> None:
+            super().__init__(num_envs=num_envs)
+            self._sent_boundary = False
+
+        def collect_rollout(self, policy, num_steps: int, *, key=None, on_step=None):
+            observations = np.zeros((num_steps, self.num_envs, 3), dtype=np.float32)
+            actions = np.zeros((num_steps, self.num_envs, 1), dtype=np.float32)
+            step_info = []
+            for step_idx in range(num_steps):
+                actions[step_idx] = np.asarray(
+                    policy(observations[step_idx], np.array(0)),
+                    dtype=np.float32,
+                )
+                task_changed = step_idx == 0 and not self._sent_boundary
+                if task_changed:
+                    self._sent_boundary = True
+                info = {"seq_idx": 0, "task_changed": task_changed}
+                step_info.append([info])
+                if on_step is not None:
+                    on_step(
+                        self.num_envs,
+                        {
+                            "train/reward": 0.0,
+                            "rewards": np.zeros(self.num_envs, dtype=np.float32),
+                            "dones": np.zeros(self.num_envs, dtype=bool),
+                            "infos": [info],
+                        },
+                    )
+            return JaxRolloutBatch(
+                observation=observations,
+                action=actions,
+                reward=np.zeros((num_steps, self.num_envs), dtype=np.float32),
+                next_observation=observations,
+                done=np.zeros((num_steps, self.num_envs), dtype=bool),
+                step_info=step_info,
+            )
+
+    class _BoundaryLearner(Learner):
+        def __init__(self) -> None:
+            self.boundary_task_ids: list[int] = []
+
+        def train_step(self, replay_buffer: ReplayBuffer) -> dict[str, float]:
+            del replay_buffer
+            return {}
+
+        def on_task_boundary(self, new_task_id: int) -> None:
+            self.boundary_task_ids.append(new_task_id)
+
+    class _ClearingBuffer(UniformReplayBuffer):
+        def clear(self) -> None:
+            self._storage.clear()
+
+    env = _TaskBoundaryEnv(num_envs=num_envs)
+    buffer = _ClearingBuffer(capacity=100)
+    learner = _BoundaryLearner()
+    config = BaseAgentConfig(
+        learning_starts=0,
+        train_freq=100,
+        batch_size=1,
+        seed=0,
+        jax_rollout_chunk=2,
+        gradient_steps_per_rollout=1,
+    )
+    loop = TrainingLoop(
+        env=env,
+        planner=_BatchedPlanner(batch_size=num_envs),
+        learner=learner,
+        replay_buffer=buffer,
+        config=config,
+    )
+    loop.run(4)
+    assert learner.boundary_task_ids == [1]
+    assert len(buffer) == 3
+    assert loop._min_train_step == 1 + config.learning_starts
+
+
+def test_training_loop_syncs_task_id_from_env_current_task_index() -> None:
+    num_envs = 1
+
+    class _TaskIndexedEnv(_MockBatchedEnv):
+        def __init__(self, *, num_envs: int = 1) -> None:
+            super().__init__(num_envs=num_envs)
+            self._seq_idx = 2
+
+        @property
+        def current_task_index(self) -> int:
+            return self._seq_idx
+
+    class _TaskLearner(Learner):
+        def __init__(self) -> None:
+            self.task_id = 0
+            self.boundary_calls: list[int] = []
+
+        def train_step(self, replay_buffer: ReplayBuffer) -> dict[str, float]:
+            del replay_buffer
+            return {}
+
+        def on_task_boundary(self, new_task_id: int) -> None:
+            self.boundary_calls.append(new_task_id)
+            self.task_id = int(new_task_id)
+
+        def set_task_id(self, task_id: int) -> None:
+            self.task_id = int(task_id)
+
+    env = _TaskIndexedEnv(num_envs=num_envs)
+    learner = _TaskLearner()
+    config = BaseAgentConfig(
+        learning_starts=0,
+        train_freq=100,
+        batch_size=1,
+        seed=0,
+        jax_rollout_chunk=2,
+        gradient_steps_per_rollout=1,
+    )
+    loop = TrainingLoop(
+        env=env,
+        planner=_BatchedPlanner(batch_size=num_envs),
+        learner=learner,
+        replay_buffer=UniformReplayBuffer(capacity=100),
+        config=config,
+    )
+    loop.run(2)
+    assert learner.boundary_calls == [2]
+    assert learner.task_id == 2
