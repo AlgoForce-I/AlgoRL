@@ -373,8 +373,10 @@ class HyperCEZConfig(EfficientZeroConfig):
     num_tasks: int = 10
     lr_hyper: float = 3e-4
     beta: float = 1.0
-    alpha_max: float = 0.2
-    # Near-full residual at start (α_max·tanh(2)≈0.19). 1e-3 leaves the net ≈W0.
+    # Unit-scale residual cap so ΔW stays on the same order as EZ weight updates
+    # (α_max=0.2 forced hypernet outputs ~5× larger for the same ΔW_eff).
+    alpha_max: float = 1.0
+    # Open the residual path; zero-init hnet heads keep W(0)=W0.
     alpha_init: float = 2.0
     emb_init_std: float = 1.0
     no_look_ahead: bool = False

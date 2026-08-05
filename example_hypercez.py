@@ -25,8 +25,8 @@ def for_cw10_hypercez_batched(
     Critical for matching EfficientZero on task 0:
     - EZ mix / TD / priority horizons are derived from ``STEPS_PER_TASK`` (not
       the full 10-task run), same as ``example.py``.
-    - ``alpha_init`` is large enough that ``α_max·tanh(α)`` starts near full
-      residual capacity. The old ``1e-3`` left the net ≈ frozen at ``W0``.
+    - Zero-init hypernet heads keep ``W(0)=W0``; ``alpha_max=1`` / open
+      ``alpha_init`` give unit-scale plasticity without 5× ΔW blow-up.
     """
     config = arl.HyperCEZConfig.for_batched(num_envs=num_envs).with_overrides(
         # --- EfficientZero (same as example.py) ---
@@ -66,8 +66,9 @@ def for_cw10_hypercez_batched(
         lr_hyper=3e-4,
         scale_hyper_lr=False,
         beta=0.5,
-        alpha_max=0.2,
-        # Near-full residual at start: 0.2 * tanh(2) ≈ 0.193 (was ~2e-4).
+        # Unit-scale residual: ΔW ~ same magnitude as EZ updates (not 5×).
+        # Zero-init hnet heads keep W(0)=W0 despite open α.
+        alpha_max=1.0,
         alpha_init=2.0,
         no_look_ahead=False,
         dt_scale=1.0,

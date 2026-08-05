@@ -50,11 +50,13 @@ class HyperNetwork(nn.Module):
             h = nn.relu(h)
         h = nn.LayerNorm(name="trunk_norm")(h)
 
+        # Zero-init output heads ⇒ ΔW(0)=0 ⇒ W(0)=W0 even when α is large.
         outputs: list[jnp.ndarray] = []
         for index, shape in enumerate(self.target_shapes):
             flat_size = math.prod(shape)
             flat = nn.Dense(
                 flat_size,
+                kernel_init=nn.initializers.zeros,
                 bias_init=nn.initializers.zeros,
                 name=f"head_{index}",
             )(h)
@@ -122,8 +124,10 @@ class ChunkedHyperNetwork(nn.Module):
             h = nn.Dense(width, name=f"hidden_{index}")(h)
             h = nn.relu(h)
         h = nn.LayerNorm(name="trunk_norm")(h)
+        # Zero-init output head ⇒ ΔW(0)=0 ⇒ W(0)=W0 even when α is large.
         chunks = nn.Dense(
             self.chunk_dim,
+            kernel_init=nn.initializers.zeros,
             bias_init=nn.initializers.zeros,
             name="chunk_head",
         )(h)

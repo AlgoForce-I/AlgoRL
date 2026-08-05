@@ -44,11 +44,34 @@ def test_hypernetwork_output_shapes_match_targets(cartpole_ez_params: dict) -> N
         assert tuple(output.shape) == shape
 
 
-def test_different_task_embeddings_change_outputs(cartpole_ez_params: dict) -> None:
+def test_zero_init_heads_yield_zero_deltas(cartpole_ez_params: dict) -> None:
+    """Identity residual: ΔW(0)=0 so W(0)=W0 even with large α."""
+    component = cartpole_ez_params["representation_model"]
+    for hnet_type in ("unchunked", "chunked"):
+        module = build_hypernetwork_for_component(
+            component, num_tasks=4, emb_size=8, hnet_type=hnet_type,  # type: ignore[arg-type]
+            chunk_dim=64, cemb_size=8,
+        )
+        params = init_hypernetwork_params(module, jax.random.PRNGKey(2))
+        outputs = apply_hypernetwork(module, params, task_id=0)
+        for leaf in outputs:
+            assert float(jnp.max(jnp.abs(leaf))) == 0.0
+
+
+def test_different_task_embeddings_change_outputs_after_head_noise(
+    cartpole_ez_params: dict,
+) -> None:
     component = cartpole_ez_params["representation_model"]
     module = build_hypernetwork_for_component(component, num_tasks=4, emb_size=8)
     params = init_hypernetwork_params(module, jax.random.PRNGKey(2))
 
+    def _nudge_heads(path: tuple, leaf: jnp.ndarray) -> jnp.ndarray:
+        keys = [str(getattr(p, "key", p)) for p in path]
+        if any(k.startswith("head_") or k == "chunk_head" for k in keys):
+            return leaf + jax.random.normal(jax.random.PRNGKey(leaf.size), leaf.shape) * 0.05
+        return leaf
+
+    params = jax.tree_util.tree_map_with_path(_nudge_heads, params)
     out0 = apply_hypernetwork(module, params, task_id=0)
     out1 = apply_hypernetwork(module, params, task_id=1)
     assert not all(
