@@ -155,11 +155,27 @@ def test_on_task_boundary_snapshots_targets_and_switches_task(
 ) -> None:
     learner = build_hyper_cez_learner(learner_context)
     before = copy.deepcopy(learner.train_state["hnets"])
+    learner._task_train_steps = 123
+    alpha0 = {
+        c: jnp.asarray(learner.train_state["alphas"][0][c] + 0.25)
+        for c in learner.config.hnet_components
+    }
+    alphas = dict(learner.train_state["alphas"])
+    alphas[0] = alpha0
+    learner.train_state = {**learner.train_state, "alphas": alphas}
     learner.on_task_boundary(1)
 
     assert learner.task_id == 1
+    assert learner._task_train_steps == 0
     assert learner._reg_targets is not None
     assert len(learner._reg_targets["dynamics_model"]) == 1
+    assert 0 in learner._shared_snapshots
+    for component in learner.config.hnet_components:
+        assert np.isclose(
+            float(learner.train_state["alphas"][1][component]),
+            float(alpha0[component]),
+            atol=1e-6,
+        )
     assert np.isclose(
         float(
             calc_fix_target_reg_from_learner(learner),

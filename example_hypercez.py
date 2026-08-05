@@ -6,6 +6,7 @@ configure_jax_gpu_memory(preallocate=False, memory_fraction=0.85)
 
 import algorl as arl
 from algorl.backends.jax.envs import make_batched_cw_train_env
+from algorl.common.hypercez_retention import HyperCEZRetentionCallback
 from MTCWorldMJX import CWConfig
 
 NUM_ENVS = 32
@@ -19,12 +20,12 @@ def for_cw10_hypercez_batched(
     num_envs: int = 32,
     **overrides: object,
 ) -> arl.HyperCEZConfig:
-    """CW10 HyperCEZ config: proven EZ knobs + CL hypernet settings.
+    """CW10 HyperCEZ config: EZ knobs + retention-first CL settings.
 
-    EfficientZero fields match ``example.py`` (known-good CW10 hammer setup).
-    HyperCEZ fields use chunked hypernets for throughput and a light fix-target
-    regularizer (reference HyperCEZDelta chunked defaults) so later tasks do not
-    overwrite earlier task generators.
+    EfficientZero fields match ``example.py``. Continual-learning fields follow
+    HyperCEZ-master ``main.py`` strength (β=0.5, no plastic prev embeddings)
+    while keeping a chunked hypernet for throughput. Per-task LR reset and
+    unscaled ``lr_hyper`` are handled in the learner.
     """
     config = arl.HyperCEZConfig.for_batched(num_envs=num_envs).with_overrides(
         # --- EfficientZero (same as example.py) ---
@@ -45,29 +46,35 @@ def for_cw10_hypercez_batched(
     )
 
     return config.with_overrides(
-        # --- EfficientZero schedule (same as example.py) ---
+        # --- EfficientZero schedule: applied *per task* by HyperCEZLearner ---
         schedule_horizon="fixed",
         lr_decay_steps=300_000,
         lr_decay_rate=0.5,
         # --- HyperCEZDelta / continual learning ---
         num_tasks=NUM_TASKS,
+        steps_per_task=STEPS_PER_TASK,
         hnet_type="chunked",
         hnet_arch=(20, 20),
         chunk_dim=2000,
         cemb_size=20,
-        cemb_init_std=1.0,
         emb_size=10,
+        cemb_init_std=1.0,
         emb_init_std=1.0,
-        lr_hyper=1e-4,
-        # Light output-space fix-target reg (reference chunked HyperCEZ).
-        beta=0.005,
+        lr_hyper=3e-4,
+        scale_hyper_lr=False,
+        # Match reference main.py CW10 β (was 0.005 chunked smoke default).
+        beta=0.5,
         alpha_max=0.2,
         alpha_init=1e-3,
         no_look_ahead=False,
         dt_scale=1.0,
         use_sgd_change=False,
-        plastic_prev_tembs=True,
+        plastic_prev_tembs=False,
+        warm_start_alpha=True,
+        snapshot_shared_per_task=True,
+        use_per_task_reg_scaling=False,
         hnet_grad_max_norm=5.0,
+        retention_log_interval=500,
         **overrides,
     )
 
@@ -79,17 +86,19 @@ def main() -> None:
         seed=42,
         config=CWConfig(seed=42, steps_per_task=STEPS_PER_TASK),
     )
-    agent = arl.HyperCEZ(
-        env,
-        config=for_cw10_hypercez_batched(num_envs=NUM_ENVS),
-    )
+    config = for_cw10_hypercez_batched(num_envs=NUM_ENVS)
+    agent = arl.HyperCEZ(env, config=config)
     # TrainingLoop syncs learner.task_id from env.current_task_index and calls
-    # on_task_boundary (snapshot reg targets, switch embedding) at each CW task
-    # switch; the replay buffer is cleared between tasks.
+    # on_task_boundary (snapshot reg targets + shared leaves, warm-start α,
+    # reset per-task LR) at each CW task switch; the replay buffer is cleared.
     agent.learn(
         total_timesteps=TOTAL_TIMESTEPS,
         tensorboard_log_dir=TENSORBOARD_LOG_DIR,
         progress_bar=True,
+        callbacks=HyperCEZRetentionCallback(
+            agent.learner,
+            eval_every_steps=STEPS_PER_TASK // 10,
+        ),
     )
 
 

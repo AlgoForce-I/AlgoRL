@@ -13,7 +13,9 @@ from algorl.backends.jax.nn.hypercez.hyper_model import (
 )
 from algorl.backends.jax.nn.hypercez.regularizer import (
     calc_fix_target_reg,
+    reg_scaling_from_ema,
     snapshot_reg_targets,
+    update_per_task_reg_ema,
 )
 
 
@@ -110,3 +112,30 @@ def test_lookahead_dtheta_changes_reg(tiny_hnet) -> None:
     )
     assert float(base) == 0.0
     assert float(with_dt) > 0.0
+
+
+def test_per_task_reg_scaling_and_ema(tiny_hnet) -> None:
+    module, params = tiny_hnet
+    targets = snapshot_reg_targets(
+        {"comp": params},
+        {"comp": module},
+        ("comp",),
+        task_id=2,
+    )
+    scaling = jnp.asarray([2.0, 0.5], dtype=jnp.float32)
+    reg, per_task = calc_fix_target_reg(
+        params,
+        hnet_module=module,
+        task_id=2,
+        targets=targets["comp"],
+        reg_scaling=scaling,
+        return_per_task=True,
+    )
+    assert per_task.shape == (2,)
+    assert float(reg) >= 0.0
+
+    ema = jnp.zeros((3,), dtype=jnp.float32)
+    ema = update_per_task_reg_ema(ema, jnp.asarray([1.0, 4.0]), task_id=2)
+    scales = reg_scaling_from_ema(ema, task_id=2)
+    assert scales.shape == (2,)
+    assert float(scales[0]) >= float(scales[1])  # smaller EMA → larger weight

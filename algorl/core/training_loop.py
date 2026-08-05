@@ -655,8 +655,9 @@ class TrainingLoop:
         step_info = {"train/reward": float(reward), "done": done, **prefixed_metrics}
         if extra_step_info:
             step_info.update(extra_step_info)
-        self.logger.record(step, step_info)
+        # Callbacks may enrich ``step_info`` before it is recorded (e.g. CL retention).
         self.callbacks.on_step(step, step_info)
+        self.logger.record(step, step_info)
         return step_info
 
     def _maybe_checkpoint(

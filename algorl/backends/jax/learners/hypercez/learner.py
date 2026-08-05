@@ -42,7 +42,9 @@ from algorl.backends.jax.nn.hypercez.materialize import materialize_ez_params
 from algorl.backends.jax.nn.hypercez.regularizer import (
     RegTargets,
     calc_component_reg_loss,
+    reg_scaling_from_ema,
     snapshot_reg_targets,
+    update_per_task_reg_ema,
 )
 from algorl.backends.jax.planners.efficientzero import EfficientZeroPlanner
 from algorl.backends.jax.world_models.hypercez import HyperCEZWorldModel
@@ -199,10 +201,11 @@ def materialize_from_train_state(
     hnet_components: tuple[str, ...],
     num_tasks: int,
     alpha_max: float,
+    shared_override: dict[str, Any] | None = None,
 ) -> Params:
     """Build EZ params from Optax train state (differentiable w.r.t. train_state)."""
     live_ez = join_live_ez(
-        shared=train_state["shared"],
+        shared=train_state["shared"] if shared_override is None else shared_override,
         projections=train_state["projections"],
         frozen_ez=frozen_ez,
         hnet_components=hnet_components,
@@ -234,13 +237,31 @@ def materialize_from_train_state(
     )
 
 
+def _scale_train_state_updates(
+    updates: dict[str, Any],
+    *,
+    main_lr_scale: jnp.ndarray,
+    hyper_lr_scale: jnp.ndarray,
+) -> dict[str, Any]:
+    """Apply separate LR scales to main-net vs hypernet / alpha leaves."""
+    return {
+        "hnets": jax.tree.map(lambda update: update * hyper_lr_scale, updates["hnets"]),
+        "alphas": jax.tree.map(lambda update: update * hyper_lr_scale, updates["alphas"]),
+        "shared": jax.tree.map(lambda update: update * main_lr_scale, updates["shared"]),
+        "projections": jax.tree.map(
+            lambda update: update * main_lr_scale, updates["projections"]
+        ),
+    }
+
+
 def _hypercez_task_step(
     train_state: dict[str, Any],
     opt_state: optax.OptState,
     obs_count: jnp.ndarray,
     batch: dict[str, jnp.ndarray],
     rng: jax.Array,
-    lr_scale: jnp.ndarray,
+    main_lr_scale: jnp.ndarray,
+    hyper_lr_scale: jnp.ndarray,
     task_id: int,
     defer_theta: bool,
     *,
@@ -327,7 +348,11 @@ def _hypercez_task_step(
             defer_theta=defer_theta,
         )
         updates, new_opt_state = optimizer.update(masked_grads, opt_state, train_state)
-        updates = jax.tree.map(lambda update: update * lr_scale, updates)
+        updates = _scale_train_state_updates(
+            updates,
+            main_lr_scale=main_lr_scale,
+            hyper_lr_scale=hyper_lr_scale,
+        )
         new_state = optax.apply_updates(train_state, updates)
         shared = dict(new_state["shared"])
         rep_shared = dict(shared["representation_model"])
@@ -391,13 +416,17 @@ def _hypercez_reg_step(
     dtheta: dict[str, Any] | None,
     task_id: int,
     beta: jnp.ndarray,
-    lr_scale: jnp.ndarray,
+    hyper_lr_scale: jnp.ndarray,
     hnet_opt_state: optax.OptState,
     alpha_opt_state: optax.OptState,
+    ema_reg_per_task: jnp.ndarray,
     *,
     hnet_modules: dict[str, Any],
     hnet_components: tuple[str, ...],
     plastic_prev_tembs: bool,
+    use_per_task_reg_scaling: bool,
+    reg_scaling_min: float,
+    reg_scaling_max: float,
     reg_optimizer: optax.GradientTransformation,
 ) -> tuple[
     dict[str, Any],
@@ -405,8 +434,20 @@ def _hypercez_reg_step(
     optax.OptState,
     optax.OptState,
     jnp.ndarray,
+    jnp.ndarray,
+    jnp.ndarray,
 ]:
-    def reg_objective(hnets: dict[str, Any]) -> jnp.ndarray:
+    """Fix-target phase: one value_and_grad (value reused for EMA β)."""
+    reg_scaling = None
+    if use_per_task_reg_scaling and task_id > 0:
+        reg_scaling = reg_scaling_from_ema(
+            ema_reg_per_task,
+            task_id,
+            scale_min=reg_scaling_min,
+            scale_max=reg_scaling_max,
+        )
+
+    def reg_objective(hnets: dict[str, Any]) -> tuple[jnp.ndarray, jnp.ndarray]:
         return calc_component_reg_loss(
             hnets,
             hnet_modules=hnet_modules,
@@ -414,9 +455,13 @@ def _hypercez_reg_step(
             task_id=task_id,
             reg_targets=reg_targets,
             dtheta=dtheta,
+            reg_scaling=reg_scaling,
+            return_per_task=True,
         )
 
-    reg_loss, reg_grads = jax.value_and_grad(reg_objective)(hnet_params)
+    (reg_loss, per_task_regs), reg_grads = jax.value_and_grad(
+        reg_objective, has_aux=True
+    )(hnet_params)
     scaled_reg_loss = beta * reg_loss
     masked_reg = {
         component: _mask_hnet_grads_theta_only(
@@ -443,10 +488,18 @@ def _hypercez_reg_step(
         alpha_opt_state,
         alpha_params,
     )
-    scale = lambda update: update * lr_scale
+    scale = lambda update: update * hyper_lr_scale
     new_hnets = optax.apply_updates(hnet_params, jax.tree.map(scale, hnet_updates))
     new_alphas = optax.apply_updates(alpha_params, jax.tree.map(scale, alpha_updates))
-    return new_hnets, new_alphas, new_hnet_opt_state, new_alpha_opt_state, scaled_reg_loss
+    return (
+        new_hnets,
+        new_alphas,
+        new_hnet_opt_state,
+        new_alpha_opt_state,
+        scaled_reg_loss,
+        reg_loss,
+        per_task_regs,
+    )
 
 
 def _hypercez_zeroed_step_metrics(batch: dict[str, jnp.ndarray]) -> dict[str, jnp.ndarray]:
@@ -499,9 +552,11 @@ def _hypercez_full_train_step(
     obs_count: jnp.ndarray,
     batch: dict[str, jnp.ndarray],
     rng: jax.Array,
-    lr_scale: jnp.ndarray,
+    main_lr_scale: jnp.ndarray,
+    hyper_lr_scale: jnp.ndarray,
     ema_task_loss: jnp.ndarray,
     ema_reg_loss: jnp.ndarray,
+    ema_reg_per_task: jnp.ndarray,
     *,
     task_id: int,
     defer_theta: bool,
@@ -523,6 +578,7 @@ def _hypercez_full_train_step(
     dict[str, jnp.ndarray],
     jnp.ndarray,
     jnp.ndarray,
+    jnp.ndarray,
 ]:
     (
         train_state,
@@ -538,7 +594,8 @@ def _hypercez_full_train_step(
         obs_count,
         batch,
         rng,
-        lr_scale,
+        main_lr_scale,
+        hyper_lr_scale,
         task_id,
         defer_theta,
         materialize_params=materialize_params,
@@ -560,6 +617,7 @@ def _hypercez_full_train_step(
             _with_cl_metric_placeholders(metrics),
             ema_task_loss,
             ema_reg_loss,
+            ema_reg_per_task,
         )
 
     task_theta_grads = _theta_grads_for_lookahead(
@@ -584,20 +642,15 @@ def _hypercez_full_train_step(
         )
         dtheta_for_reg = dtheta
 
-    reg_loss_raw = calc_component_reg_loss(
-        train_state["hnets"],
-        hnet_modules=hnet_modules,
-        hnet_components=config.hnet_components,
-        task_id=task_id,
-        reg_targets=reg_targets,
-        dtheta=dtheta_for_reg,
-    )
-    ema_task_loss, ema_reg_loss, beta_eff = _update_reg_beta_ema(
-        ema_task_loss,
-        ema_reg_loss,
-        metrics["loss"],
-        reg_loss_raw,
-        config.beta,
+    # Provisional beta from previous EMA (avoids a second reg forward).
+    beta_eff = jnp.where(
+        ema_reg_loss <= 0.0,
+        jnp.asarray(config.beta, dtype=jnp.float32),
+        jnp.minimum(
+            jnp.asarray(config.beta, dtype=jnp.float32)
+            * (ema_task_loss / (ema_reg_loss + 1e-8)),
+            jnp.asarray(config.beta * 1000.0, dtype=jnp.float32),
+        ),
     )
     (
         new_hnets,
@@ -605,22 +658,41 @@ def _hypercez_full_train_step(
         reg_hnet_opt_state,
         reg_alpha_opt_state,
         reg_loss,
+        reg_loss_raw,
+        per_task_regs,
     ) = _hypercez_reg_step(
         train_state["hnets"],
         train_state["alphas"],
         alpha_grads,
         task_theta_grads,
         reg_targets,
-        dtheta,
+        dtheta_for_reg,
         task_id,
         beta_eff,
-        lr_scale,
+        hyper_lr_scale,
         reg_hnet_opt_state,
         reg_alpha_opt_state,
+        ema_reg_per_task,
         hnet_modules=hnet_modules,
         hnet_components=config.hnet_components,
         plastic_prev_tembs=config.plastic_prev_tembs,
+        use_per_task_reg_scaling=config.use_per_task_reg_scaling,
+        reg_scaling_min=config.reg_scaling_min,
+        reg_scaling_max=config.reg_scaling_max,
         reg_optimizer=reg_optimizer,
+    )
+    ema_task_loss, ema_reg_loss, beta_logged = _update_reg_beta_ema(
+        ema_task_loss,
+        ema_reg_loss,
+        metrics["loss"],
+        reg_loss_raw,
+        config.beta,
+    )
+    ema_reg_per_task = update_per_task_reg_ema(
+        ema_reg_per_task,
+        per_task_regs,
+        task_id,
+        momentum=_EMA_MOMENTUM,
     )
     train_state = {**train_state, "hnets": new_hnets, "alphas": new_alphas}
     if materialize_params:
@@ -635,7 +707,7 @@ def _hypercez_full_train_step(
         )
     metrics = dict(metrics)
     metrics["reg_loss"] = reg_loss
-    metrics["cl_beta"] = beta_eff
+    metrics["cl_beta"] = beta_logged
     metrics["dtheta_norm"] = (
         optax.tree.norm(dtheta)
         if not config.no_look_ahead
@@ -651,6 +723,7 @@ def _hypercez_full_train_step(
         metrics,
         ema_task_loss,
         ema_reg_loss,
+        ema_reg_per_task,
     )
 
 
@@ -662,9 +735,11 @@ def _hypercez_burst_scan(
     obs_count: jnp.ndarray,
     ema_task_loss: jnp.ndarray,
     ema_reg_loss: jnp.ndarray,
+    ema_reg_per_task: jnp.ndarray,
     stacked_batch: dict[str, jnp.ndarray],
     rngs: jax.Array,
-    lr_scales: jax.Array,
+    main_lr_scales: jax.Array,
+    hyper_lr_scales: jax.Array,
     active_mask: jax.Array,
     *,
     task_id: int,
@@ -684,6 +759,7 @@ def _hypercez_burst_scan(
     jnp.ndarray,
     jnp.ndarray,
     jnp.ndarray,
+    jnp.ndarray,
     dict[str, jnp.ndarray],
 ]:
     def scan_step(
@@ -695,14 +771,18 @@ def _hypercez_burst_scan(
             jnp.ndarray,
             jnp.ndarray,
             jnp.ndarray,
+            jnp.ndarray,
         ],
-        inputs: tuple[dict[str, jnp.ndarray], jax.Array, jax.Array, jax.Array],
+        inputs: tuple[
+            dict[str, jnp.ndarray], jax.Array, jax.Array, jax.Array, jax.Array
+        ],
     ) -> tuple[
         tuple[
             dict[str, Any],
             optax.OptState,
             optax.OptState,
             optax.OptState,
+            jnp.ndarray,
             jnp.ndarray,
             jnp.ndarray,
             jnp.ndarray,
@@ -717,8 +797,9 @@ def _hypercez_burst_scan(
             current_obs_count,
             current_ema_task,
             current_ema_reg,
+            current_ema_reg_per_task,
         ) = carry
-        batch, rng, lr_scale, active = inputs
+        batch, rng, main_lr_scale, hyper_lr_scale, active = inputs
 
         def run_step(
             _: None,
@@ -728,6 +809,7 @@ def _hypercez_burst_scan(
                 optax.OptState,
                 optax.OptState,
                 optax.OptState,
+                jnp.ndarray,
                 jnp.ndarray,
                 jnp.ndarray,
                 jnp.ndarray,
@@ -744,6 +826,7 @@ def _hypercez_burst_scan(
                 metrics,
                 new_ema_task,
                 new_ema_reg,
+                new_ema_reg_per_task,
             ) = _hypercez_full_train_step(
                 current_state,
                 current_opt_state,
@@ -752,9 +835,11 @@ def _hypercez_burst_scan(
                 current_obs_count,
                 batch,
                 rng,
-                lr_scale,
+                main_lr_scale,
+                hyper_lr_scale,
                 current_ema_task,
                 current_ema_reg,
+                current_ema_reg_per_task,
                 task_id=task_id,
                 defer_theta=defer_theta,
                 reg_targets=reg_targets,
@@ -775,6 +860,7 @@ def _hypercez_burst_scan(
                     new_obs_count,
                     new_ema_task,
                     new_ema_reg,
+                    new_ema_reg_per_task,
                 ),
                 metrics,
             )
@@ -790,6 +876,7 @@ def _hypercez_burst_scan(
                 jnp.ndarray,
                 jnp.ndarray,
                 jnp.ndarray,
+                jnp.ndarray,
             ],
             dict[str, jnp.ndarray],
         ]:
@@ -797,7 +884,7 @@ def _hypercez_burst_scan(
 
         return jax.lax.cond(active > 0.0, run_step, skip_step, None)
 
-    scan_inputs = (stacked_batch, rngs, lr_scales, active_mask)
+    scan_inputs = (stacked_batch, rngs, main_lr_scales, hyper_lr_scales, active_mask)
     (
         train_state,
         opt_state,
@@ -806,6 +893,7 @@ def _hypercez_burst_scan(
         obs_count,
         ema_task_loss,
         ema_reg_loss,
+        ema_reg_per_task,
     ), metrics = jax.lax.scan(
         scan_step,
         (
@@ -816,6 +904,7 @@ def _hypercez_burst_scan(
             obs_count,
             ema_task_loss,
             ema_reg_loss,
+            ema_reg_per_task,
         ),
         scan_inputs,
     )
@@ -828,6 +917,7 @@ def _hypercez_burst_scan(
         obs_count,
         ema_task_loss,
         ema_reg_loss,
+        ema_reg_per_task,
         stacked_metrics,
     )
 
@@ -859,6 +949,8 @@ class HyperCEZLearner(EfficientZeroLearner):
         self._reg_targets: RegTargets | None = None
         self._ema_task_loss: float | None = None
         self._ema_reg_loss: float | None = None
+        self._task_train_steps = 0
+        self._shared_snapshots: dict[int, Any] = {}
 
         # Shared EZ wiring (params copies, planner sync, burst spec, discrete checks).
         super().__init__(context)
@@ -873,6 +965,18 @@ class HyperCEZLearner(EfficientZeroLearner):
             alphas=copy.deepcopy(self.world_model.alphas),
             live_ez=copy.deepcopy(self.world_model.live_ez),
             hnet_components=self.config.hnet_components,
+        )
+        self._ema_reg_per_task = jnp.zeros((self.config.num_tasks,), dtype=jnp.float32)
+        self._jit_materialize = jax.jit(
+            partial(
+                materialize_from_train_state,
+                frozen_ez=self.frozen_ez,
+                hnet_modules=self.hnet_modules,
+                hnet_components=self.config.hnet_components,
+                num_tasks=self.config.num_tasks,
+                alpha_max=self.config.alpha_max,
+            ),
+            static_argnums=(1,),
         )
         self._init_delayed_hnet_copies()
 
@@ -946,15 +1050,35 @@ class HyperCEZLearner(EfficientZeroLearner):
         self._recent_reanalyze_hnets = copy.deepcopy(self.train_state["hnets"])
         self._refresh_materialized_copies()
 
-    def _materialize_with_hnets(self, hnets: dict[str, Any]) -> Params:
-        return materialize_from_train_state(
-            {**self.train_state, "hnets": hnets},
-            self.task_id,
-            frozen_ez=self.frozen_ez,
-            hnet_modules=self.hnet_modules,
-            hnet_components=self.config.hnet_components,
-            num_tasks=self.config.num_tasks,
-            alpha_max=self.config.alpha_max,
+    def _materialize_with_hnets(
+        self,
+        hnets: dict[str, Any],
+        *,
+        task_id: int | None = None,
+        shared_override: dict[str, Any] | None = None,
+    ) -> Params:
+        tid = self.task_id if task_id is None else int(task_id)
+        state = {**self.train_state, "hnets": hnets}
+        if shared_override is not None:
+            state = {**state, "shared": shared_override}
+        return self._jit_materialize(state, tid)
+
+    def materialize_task(self, task_id: int) -> Params:
+        """Materialize EZ params for ``task_id``, using shared-leaf snapshots when set."""
+        task_id = int(task_id)
+        shared = None
+        if (
+            self.config.snapshot_shared_per_task
+            and task_id != self.task_id
+            and task_id in self._shared_snapshots
+        ):
+            shared = self._shared_snapshots[task_id]
+        return _strip_obs_running_count(
+            self._materialize_with_hnets(
+                self.train_state["hnets"],
+                task_id=task_id,
+                shared_override=shared,
+            )
         )
 
     def _refresh_materialized_copies(self) -> None:
@@ -972,9 +1096,11 @@ class HyperCEZLearner(EfficientZeroLearner):
 
     def _sync_delayed_hnet_copies(self) -> None:
         """Align delayed hypernet snapshots (e.g. after a task boundary)."""
-        self._self_play_hnets = copy.deepcopy(self.train_state["hnets"])
-        self._reanalyze_hnets = copy.deepcopy(self.train_state["hnets"])
-        self._recent_reanalyze_hnets = copy.deepcopy(self.train_state["hnets"])
+        self._self_play_hnets = jax.tree.map(lambda leaf: leaf, self.train_state["hnets"])
+        self._reanalyze_hnets = jax.tree.map(lambda leaf: leaf, self.train_state["hnets"])
+        self._recent_reanalyze_hnets = jax.tree.map(
+            lambda leaf: leaf, self.train_state["hnets"]
+        )
         self._refresh_materialized_copies()
 
     def _burst_reg_targets(self) -> RegTargets:
@@ -992,33 +1118,74 @@ class HyperCEZLearner(EfficientZeroLearner):
     def _ema_scalar(self, value: float | None) -> jnp.ndarray:
         return jnp.asarray(0.0 if value is None else value, dtype=jnp.float32)
 
-    def _sync_ema_from_scan(self, ema_task: jnp.ndarray, ema_reg: jnp.ndarray) -> None:
+    def _sync_ema_from_scan(
+        self,
+        ema_task: jnp.ndarray,
+        ema_reg: jnp.ndarray,
+        ema_reg_per_task: jnp.ndarray,
+    ) -> None:
         self._ema_task_loss = float(np.asarray(ema_task))
         self._ema_reg_loss = float(np.asarray(ema_reg))
+        self._ema_reg_per_task = ema_reg_per_task
 
-    def _effective_reg_beta(self, task_loss: float, reg_loss: float) -> float:
-        if self._ema_task_loss is None:
-            self._ema_task_loss = abs(task_loss)
-        else:
-            self._ema_task_loss = (
-                _EMA_MOMENTUM * self._ema_task_loss
-                + (1.0 - _EMA_MOMENTUM) * abs(task_loss)
-            )
-        if self._ema_reg_loss is None:
-            self._ema_reg_loss = abs(reg_loss)
-        else:
-            self._ema_reg_loss = (
-                _EMA_MOMENTUM * self._ema_reg_loss
-                + (1.0 - _EMA_MOMENTUM) * abs(reg_loss)
-            )
-        beta_dynamic = self.config.beta * (
-            self._ema_task_loss / (self._ema_reg_loss + 1e-8)
+    def _task_lr_horizon(self) -> int:
+        """Train-step horizon used for per-task LR warm/decay (reference-style)."""
+        if self.config.steps_per_task is not None and self.config.steps_per_task > 0:
+            return int(self.config.steps_per_task)
+        num_tasks = max(1, self.config.num_tasks)
+        return max(1, int(self.config.total_training_steps) // num_tasks)
+
+    def _learning_rate_scale_at(self, trained_steps: int) -> float:
+        """Per-task LR scale (resets each CW task), matching HyperCEZ-master."""
+        total = max(1, self._task_lr_horizon())
+        warm_steps = int(total * self.config.lr_warm_up)
+        if warm_steps > 0 and trained_steps < warm_steps:
+            return trained_steps / warm_steps
+        decay_steps = max(1, self.config.lr_decay_steps)
+        exponent = (trained_steps - warm_steps) // decay_steps
+        return float(self.config.lr_decay_rate**exponent)
+
+    def _learning_rate_scale(self) -> float:
+        return self._learning_rate_scale_at(self._task_train_steps)
+
+    def _hyper_lr_scale_value(self, main_scale: float) -> float:
+        return float(main_scale) if self.config.scale_hyper_lr else 1.0
+
+    def retention_target_metrics(self) -> dict[str, float]:
+        """Fix-target drift of previous tasks (0 = perfect retention of h(c_j))."""
+        if self.task_id <= 0 or self._reg_targets is None:
+            return {}
+        reg, per_task = calc_component_reg_loss(
+            self.train_state["hnets"],
+            hnet_modules=self.hnet_modules,
+            hnet_components=self.config.hnet_components,
+            task_id=self.task_id,
+            reg_targets=self._reg_targets,
+            dtheta=None,
+            return_per_task=True,
         )
-        return min(beta_dynamic, self.config.beta * 1000.0)
+        metrics = {"retention/fix_target_reg": float(np.asarray(reg))}
+        for index, value in enumerate(np.asarray(per_task).tolist()):
+            metrics[f"retention/task_{index}_reg"] = float(value)
+        return metrics
 
     def on_task_boundary(self, new_task_id: int) -> None:
         """Snapshot previous-task hypernet outputs and switch active task."""
         new_task_id = int(new_task_id)
+        finished_task = new_task_id - 1
+        if finished_task >= 0 and self.config.snapshot_shared_per_task:
+            self._shared_snapshots[finished_task] = copy.deepcopy(
+                self.train_state["shared"]
+            )
+        if new_task_id > 0 and self.config.warm_start_alpha and finished_task >= 0:
+            prev_alphas = self.train_state["alphas"][finished_task]
+            warmed = {
+                component: jnp.asarray(prev_alphas[component])
+                for component in self.config.hnet_components
+            }
+            alphas = dict(self.train_state["alphas"])
+            alphas[new_task_id] = warmed
+            self.train_state = {**self.train_state, "alphas": alphas}
         if new_task_id > 0:
             self._reg_targets = snapshot_reg_targets(
                 self.train_state["hnets"],
@@ -1028,9 +1195,17 @@ class HyperCEZLearner(EfficientZeroLearner):
             )
         else:
             self._reg_targets = None
-        self.set_task_id(new_task_id)
-        # ``reg_targets`` shape/content changed even when ``task_id`` is unchanged.
-        self._recompile_train_kernels()
+        self._task_train_steps = 0
+        self._ema_task_loss = None
+        self._ema_reg_loss = None
+        prev_task = self.task_id
+        self.task_id = new_task_id
+        self.world_model.set_task_id(self.task_id)
+        self.params = self.materialize_task(self.task_id)
+        self._sync_params()
+        # One recompile when task_id / reg_targets change (avoid double compile).
+        if new_task_id != prev_task or self._reg_targets is not None:
+            self._recompile_train_kernels()
         if new_task_id > 0:
             self._sync_delayed_hnet_copies()
 
@@ -1041,7 +1216,7 @@ class HyperCEZLearner(EfficientZeroLearner):
             return
         self.task_id = task_id
         self.world_model.set_task_id(self.task_id)
-        self.params = self.world_model.params
+        self.params = self.materialize_task(self.task_id)
         self._sync_params()
         self._recompile_train_kernels()
 
@@ -1079,7 +1254,11 @@ class HyperCEZLearner(EfficientZeroLearner):
             reanalyze_search_width=self._reanalyze_search_width,
         )
         self._maybe_refresh_model_copies()
-        lr_scale = jnp.asarray(self._learning_rate_scale(), dtype=jnp.float32)
+        main_lr = self._learning_rate_scale()
+        main_lr_scale = jnp.asarray(main_lr, dtype=jnp.float32)
+        hyper_lr_scale = jnp.asarray(
+            self._hyper_lr_scale_value(main_lr), dtype=jnp.float32
+        )
         defer_theta = self._defer_theta()
         (
             self.train_state,
@@ -1091,6 +1270,7 @@ class HyperCEZLearner(EfficientZeroLearner):
             metrics,
             ema_task,
             ema_reg,
+            ema_reg_per_task,
         ) = self._single_update(
             self.train_state,
             self._opt_state,
@@ -1099,24 +1279,19 @@ class HyperCEZLearner(EfficientZeroLearner):
             jnp.asarray(self._obs_running_count, dtype=jnp.int32),
             arrays,
             step_key,
-            lr_scale,
+            main_lr_scale,
+            hyper_lr_scale,
             self._ema_scalar(self._ema_task_loss),
             self._ema_scalar(self._ema_reg_loss),
+            self._ema_reg_per_task,
         )
         if defer_theta:
-            self._sync_ema_from_scan(ema_task, ema_reg)
+            self._sync_ema_from_scan(ema_task, ema_reg, ema_reg_per_task)
 
         self._obs_running_count = int(np.asarray(self._obs_running_count))
-        self.params = materialize_from_train_state(
-            self.train_state,
-            self.task_id,
-            frozen_ez=self.frozen_ez,
-            hnet_modules=self.hnet_modules,
-            hnet_components=self.config.hnet_components,
-            num_tasks=self.config.num_tasks,
-            alpha_max=self.config.alpha_max,
+        self.params = _strip_obs_running_count(
+            self._jit_materialize(self.train_state, self.task_id)
         )
-        self.params = _strip_obs_running_count(self.params)
         self._propagate_obs_norm_stats()
         self._sync_params()
         priorities = np.asarray(metrics["priorities"])
@@ -1126,11 +1301,16 @@ class HyperCEZLearner(EfficientZeroLearner):
                 priorities,
             )
         self._train_steps += 1
-        return {
+        self._task_train_steps += 1
+        out = {
             key: float(value)
             for key, value in metrics.items()
             if key != "priorities"
         }
+        interval = int(self.config.retention_log_interval)
+        if interval > 0 and self._task_train_steps % interval == 0:
+            out.update(self.retention_target_metrics())
+        return out
 
     def _run_burst_scan_chunk(
         self,
@@ -1150,9 +1330,20 @@ class HyperCEZLearner(EfficientZeroLearner):
             active_steps=chunk_steps,
         )
         stacked_batch = _stack_training_batches(padded_batches)
-        step_keys, lr_scales = _pad_burst_scan_inputs(
+        task_start = self._task_train_steps
+        main_scales = [
+            self._learning_rate_scale_at(task_start + offset)
+            for offset in range(chunk_steps)
+        ]
+        hyper_scales = [self._hyper_lr_scale_value(scale) for scale in main_scales]
+        step_keys, main_lr_scales = _pad_burst_scan_inputs(
             step_keys,
-            [self._learning_rate_scale_at(start_step + offset) for offset in range(chunk_steps)],
+            main_scales,
+            spec=self._burst_spec,
+        )
+        _, hyper_lr_scales = _pad_burst_scan_inputs(
+            step_keys,  # already padded length
+            hyper_scales,
             spec=self._burst_spec,
         )
         defer_theta = self._defer_theta()
@@ -1164,6 +1355,7 @@ class HyperCEZLearner(EfficientZeroLearner):
             self._obs_running_count,
             ema_task,
             ema_reg,
+            ema_reg_per_task,
             burst_metrics,
         ) = self._burst_update(
             self.train_state,
@@ -1173,30 +1365,28 @@ class HyperCEZLearner(EfficientZeroLearner):
             jnp.asarray(self._obs_running_count, dtype=jnp.int32),
             self._ema_scalar(self._ema_task_loss),
             self._ema_scalar(self._ema_reg_loss),
+            self._ema_reg_per_task,
             stacked_batch,
             step_keys,
-            lr_scales,
+            main_lr_scales,
+            hyper_lr_scales,
             active_mask,
         )
         self._obs_running_count = int(np.asarray(self._obs_running_count))
         if defer_theta:
-            self._sync_ema_from_scan(ema_task, ema_reg)
+            self._sync_ema_from_scan(ema_task, ema_reg, ema_reg_per_task)
         self._train_steps = start_step + chunk_steps
-        self.params = materialize_from_train_state(
-            self.train_state,
-            self.task_id,
-            frozen_ez=self.frozen_ez,
-            hnet_modules=self.hnet_modules,
-            hnet_components=self.config.hnet_components,
-            num_tasks=self.config.num_tasks,
-            alpha_max=self.config.alpha_max,
+        self._task_train_steps = task_start + chunk_steps
+        self.params = _strip_obs_running_count(
+            self._jit_materialize(self.train_state, self.task_id)
         )
-        self.params = _strip_obs_running_count(self.params)
         self._propagate_obs_norm_stats()
         for offset in range(chunk_steps):
             self._train_steps = start_step + offset + 1
+            self._task_train_steps = task_start + offset + 1
             self._maybe_refresh_model_copies()
         self._train_steps = start_step + chunk_steps
+        self._task_train_steps = task_start + chunk_steps
         self._sync_params()
 
         for offset in range(chunk_steps):
@@ -1209,11 +1399,15 @@ class HyperCEZLearner(EfficientZeroLearner):
         if on_progress is not None:
             on_progress(completed_steps + chunk_steps, total_steps)
 
-        return {
+        out = {
             key: float(burst_metrics[key][chunk_steps - 1])
             for key in burst_metrics
             if key != "priorities"
         }
+        interval = int(self.config.retention_log_interval)
+        if interval > 0 and self._task_train_steps % interval < max(1, chunk_steps):
+            out.update(self.retention_target_metrics())
+        return out
 
     def _warmup_train_compile(self) -> None:
         if not hasattr(self, "train_state"):
@@ -1232,6 +1426,7 @@ class HyperCEZLearner(EfficientZeroLearner):
             _,
             _,
             _,
+            _,
         ) = self._single_update(
             self.train_state,
             self._opt_state,
@@ -1241,8 +1436,10 @@ class HyperCEZLearner(EfficientZeroLearner):
             dummy_batch,
             warmup_key,
             lr_scale,
+            lr_scale,
             self._ema_scalar(self._ema_task_loss),
             self._ema_scalar(self._ema_reg_loss),
+            self._ema_reg_per_task,
         )
         if spec.burst_steps <= 1:
             return
@@ -1262,6 +1459,7 @@ class HyperCEZLearner(EfficientZeroLearner):
             _,
             _,
             _,
+            _,
         ) = self._burst_update(
             self.train_state,
             self._opt_state,
@@ -1270,16 +1468,22 @@ class HyperCEZLearner(EfficientZeroLearner):
             jnp.asarray(self._obs_running_count, dtype=jnp.int32),
             self._ema_scalar(self._ema_task_loss),
             self._ema_scalar(self._ema_reg_loss),
+            self._ema_reg_per_task,
             stacked_batch,
             step_keys,
+            lr_scales,
             lr_scales,
             active_mask,
         )
 
     def _maybe_refresh_model_copies(self) -> None:
+        # Use per-task steps so copy cadence matches reference HyperCEZ.
+        steps = self._task_train_steps
         self_play_interval = max(1, self.config.self_play_update_interval)
-        if self._train_steps > 0 and self._train_steps % self_play_interval == 0:
-            self._self_play_hnets = copy.deepcopy(self.train_state["hnets"])
+        if steps > 0 and steps % self_play_interval == 0:
+            self._self_play_hnets = jax.tree.map(
+                lambda leaf: leaf, self.train_state["hnets"]
+            )
             self._self_play_params = _strip_obs_running_count(
                 self._materialize_with_hnets(self._self_play_hnets)
             )
@@ -1287,9 +1491,11 @@ class HyperCEZLearner(EfficientZeroLearner):
                 self.planner.self_play_params = self._self_play_params
 
         reanalyze_interval = max(1, self.config.reanalyze_update_interval)
-        if self._train_steps > 0 and self._train_steps % reanalyze_interval == 0:
-            self._reanalyze_hnets = copy.deepcopy(self._recent_reanalyze_hnets)
-            self._recent_reanalyze_hnets = copy.deepcopy(self.train_state["hnets"])
+        if steps > 0 and steps % reanalyze_interval == 0:
+            self._reanalyze_hnets = self._recent_reanalyze_hnets
+            self._recent_reanalyze_hnets = jax.tree.map(
+                lambda leaf: leaf, self.train_state["hnets"]
+            )
             self._reanalyze_params = _strip_obs_running_count(
                 self._materialize_with_hnets(self._reanalyze_hnets)
             )

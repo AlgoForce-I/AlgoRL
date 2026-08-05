@@ -18,7 +18,9 @@ from algorl.backends.jax.nn.hypercez.regularizer import (
     RegTargets,
     calc_component_reg_loss,
     calc_fix_target_reg,
+    reg_scaling_from_ema,
     snapshot_reg_targets,
+    update_per_task_reg_ema,
 )
 from algorl.backends.jax.nn.hypercez.shapes import (
     generated_treedef,
@@ -48,6 +50,8 @@ __all__ = [
     "calc_fix_target_reg",
     "partition_params",
     "path_strings",
+    "reg_scaling_from_ema",
     "snapshot_reg_targets",
     "target_shapes",
+    "update_per_task_reg_ema",
 ]

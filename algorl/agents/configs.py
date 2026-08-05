@@ -382,6 +382,15 @@ class HyperCEZConfig(EfficientZeroConfig):
     plastic_prev_tembs: bool = False
     ewc_weight_importance: bool = False
     hnet_grad_max_norm: float = 5.0
+    # Continual-learning schedule / retention knobs
+    steps_per_task: int | None = None  # per-task LR warm/decay horizon
+    scale_hyper_lr: bool = False  # False: hypernet/α keep full lr_hyper
+    warm_start_alpha: bool = True  # α_t ← α_{t-1} at task boundary
+    snapshot_shared_per_task: bool = True  # snapshot LN / obs-norm per task
+    use_per_task_reg_scaling: bool = False  # off: dynamic β is enough; inv-EMA fights retention
+    reg_scaling_min: float = 0.25
+    reg_scaling_max: float = 4.0
+    retention_log_interval: int = 500  # log fix-target drift; 0 disables
 
 
 @dataclass(frozen=True)

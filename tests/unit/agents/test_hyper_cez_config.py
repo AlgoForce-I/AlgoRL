@@ -31,6 +31,10 @@ def test_hypercez_config_defaults() -> None:
     assert config.use_sgd_change is False
     assert config.plastic_prev_tembs is False
     assert config.ewc_weight_importance is False
+    assert config.scale_hyper_lr is False
+    assert config.warm_start_alpha is True
+    assert config.snapshot_shared_per_task is True
+    assert config.use_per_task_reg_scaling is False
 
 
 def test_hypercez_config_chunked_override() -> None:
