@@ -32,7 +32,6 @@ from algorl.backends.jax.planners.mcts.core import (
     mcts_config_from_agent,
     normalize_observation_batch,
     run_muzero_search,
-    run_muzero_search_single,
     validate_root_batch,
     validate_search_batch_size,
 )
@@ -65,7 +64,6 @@ __all__ = [
     "mcts_config_from_agent",
     "normalize_observation_batch",
     "run_muzero_search",
-    "run_muzero_search_single",
     "validate_root_batch",
     "validate_search_batch_size",
 ]

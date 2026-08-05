@@ -263,29 +263,6 @@ def run_muzero_search(
     return _policy_output_to_batched_result(policy_output)
 
 
-def run_muzero_search_single(
-    *,
-    params: Any,
-    rng_key: Any,
-    root: mctx.RootFnOutput,
-    recurrent_fn: RecurrentFn,
-    config: MCTSConfig,
-    invalid_actions: InvalidActionsMask = None,
-    max_depth: int | None = None,
-    index: int = 0,
-) -> MCTSResult:
-    """Convenience wrapper for ``B == 1`` or extracting one item from a batch."""
-    return run_muzero_search(
-        params=params,
-        rng_key=rng_key,
-        root=root,
-        recurrent_fn=recurrent_fn,
-        config=config,
-        invalid_actions=invalid_actions,
-        max_depth=max_depth,
-    ).to_single(index)
-
-
 # ---------------------------------------------------------------------------
 # Planner base class
 # ---------------------------------------------------------------------------

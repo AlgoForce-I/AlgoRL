@@ -324,16 +324,6 @@ class EfficientZeroConfig(SearchAgentConfig):
         return config.with_overrides(**overrides) if overrides else config
 
     @classmethod
-    def for_dmc_state_batched_cl(
-        cls,
-        *,
-        num_envs: int,
-        **overrides: object,
-    ) -> EfficientZeroConfig:
-        """Alias for :meth:`for_batched`."""
-        return cls.for_batched(num_envs=num_envs, **overrides)
-
-    @classmethod
     def for_dmc_state_batched_cl_gpu(
         cls,
         *,
@@ -351,17 +341,56 @@ class EfficientZeroConfig(SearchAgentConfig):
         """Alias for :meth:`for_sequential`."""
         return cls.for_sequential(**overrides)
 
-    @classmethod
-    def for_dmc_state_throughput(cls, **overrides: object) -> EfficientZeroConfig:
-        """Vector-control preset tuned for maximum JAX throughput (no reanalyze)."""
-        config = cls.for_dmc_state(
-            reanalyze_ratio=0.0,
-            batch_size=256,
-            mcts_simulations=32,
-            jax_rollout_chunk=256,
-            search_batch_size=8,
-        )
-        return config.with_overrides(**overrides) if overrides else config
+
+DEFAULT_HYPERCEZ_HNET_COMPONENTS: tuple[str, ...] = (
+    "representation_model",
+    "dynamics_model",
+    "reward_prediction_model",
+    "value_policy_model",
+)
+
+
+@dataclass(frozen=True)
+class HyperCEZConfig(EfficientZeroConfig):
+    """HyperCEZDelta on top of EfficientZero.
+
+    Task-conditioned hypernetworks emit weight deltas for selected EZ
+    components; LayerNorm / obs-norm stats and projection nets stay shared.
+    Continual-learning fields (``beta``, lookahead, …) are consumed by the
+    HyperCEZ learner once registered.
+
+    ``hnet_type`` selects unchunked (one head per weight tensor; default) or
+    chunked HyperCL-style generators (``chunk_dim`` / ``cemb_size``).
+    """
+
+    hnet_components: tuple[str, ...] = DEFAULT_HYPERCEZ_HNET_COMPONENTS
+    hnet_arch: tuple[int, ...] = (100, 100)
+    hnet_type: str = "unchunked"
+    chunk_dim: int = 2000
+    cemb_size: int = 20
+    cemb_init_std: float = 1.0
+    emb_size: int = 10
+    num_tasks: int = 10
+    lr_hyper: float = 3e-4
+    beta: float = 1.0
+    alpha_max: float = 0.2
+    alpha_init: float = 1e-3
+    emb_init_std: float = 1.0
+    no_look_ahead: bool = False
+    dt_scale: float = 1.0
+    use_sgd_change: bool = False
+    plastic_prev_tembs: bool = False
+    ewc_weight_importance: bool = False
+    hnet_grad_max_norm: float = 5.0
+    # Continual-learning schedule / retention knobs
+    steps_per_task: int | None = None  # per-task LR warm/decay horizon
+    scale_hyper_lr: bool = False  # False: hypernet/α keep full lr_hyper
+    warm_start_alpha: bool = True  # α_t ← α_{t-1} at task boundary
+    snapshot_shared_per_task: bool = True  # snapshot LN / obs-norm per task
+    use_per_task_reg_scaling: bool = False  # off: dynamic β is enough; inv-EMA fights retention
+    reg_scaling_min: float = 0.25
+    reg_scaling_max: float = 4.0
+    retention_log_interval: int = 500  # log fix-target drift; 0 disables
 
 
 @dataclass(frozen=True)

@@ -17,6 +17,7 @@ from algorl.backends.jax.learners.efficientzero import (
     EfficientZeroLearner,
     build_efficient_zero_learner,
 )
+from algorl.backends.jax.learners.hypercez import build_hyper_cez_learner
 from algorl.core.component_context import ComponentContext
 from algorl.core.learner import Learner
 from algorl.core.planner import Planner
@@ -53,6 +54,7 @@ def _register_stub(kind: str) -> None:
 
 
 registry.register("efficient_zero", build_efficient_zero_learner, stub=False)
+registry.register("hyper_cez", build_hyper_cez_learner, stub=False)
 
 for _kind in ("muzero", "alphazero", "dreamer", "planet", "td_mpc"):
     _register_stub(_kind)

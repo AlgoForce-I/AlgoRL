@@ -71,8 +71,10 @@ def _register_stub(kind: str) -> None:
 registry.register("none", _NullWorldModel, stub=False)
 
 from algorl.backends.jax.world_models.efficientzero import build_efficient_zero_world_model
+from algorl.backends.jax.world_models.hypercez import build_hyper_cez_world_model
 
 registry.register("efficient_zero", build_efficient_zero_world_model, stub=False)
+registry.register("hyper_cez", build_hyper_cez_world_model, stub=False)
 
 for _kind in ("muzero", "rssm", "td_mpc"):
     _register_stub(_kind)

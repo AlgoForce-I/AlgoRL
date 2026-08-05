@@ -64,6 +64,13 @@ _register(
     buffer_kind="efficient_zero",
 )
 _register(
+    "hyper_cez",
+    world_model_kind="hyper_cez",
+    planner_kind="mcts",
+    learner_kind="hyper_cez",
+    buffer_kind="efficient_zero",
+)
+_register(
     "muzero",
     world_model_kind="muzero",
     planner_kind="mcts",

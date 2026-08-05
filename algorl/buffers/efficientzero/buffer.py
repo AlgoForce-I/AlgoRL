@@ -26,14 +26,6 @@ ROOT_CANDIDATES_INFO_KEY = "root_candidates"
 BEST_ACTION_INFO_KEY = "best_action"
 ENV_ID_INFO_KEY = "env_id"
 
-INFO_KEYS = (
-    POLICY_TARGET_INFO_KEY,
-    SEARCH_VALUE_INFO_KEY,
-    PRED_VALUE_INFO_KEY,
-    ROOT_CANDIDATES_INFO_KEY,
-    BEST_ACTION_INFO_KEY,
-)
-
 # Matches ``clip_inference_values`` in the learner priority computation.
 _PRIORITY_VALUE_CLIP = 1e5
 
