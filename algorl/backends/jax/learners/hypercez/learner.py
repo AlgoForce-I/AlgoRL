@@ -15,7 +15,9 @@ import optax
 from algorl.agents.configs import HyperCEZConfig
 from algorl.backends.jax.learners.efficientzero.learner import (
     EfficientZeroLearner,
+    _apply_reanalyze_outputs,
     _dummy_training_batch,
+    _finalize_value_targets,
     _loss_from_batch,
     _pad_burst_batches,
     _pad_burst_scan_inputs,
@@ -24,6 +26,11 @@ from algorl.backends.jax.learners.efficientzero.learner import (
     _strip_obs_running_count,
     _zeroed_step_metrics,
 )
+from algorl.backends.jax.learners.efficientzero.reanalyze import (
+    mcts_temperature,
+    reanalyze_fused_policy_batches,
+)
+from algorl.core.types import Batch
 from algorl.backends.jax.learners.hypercez.train_state import (
     build_train_state,
     join_live_ez,
@@ -1151,6 +1158,19 @@ class HyperCEZLearner(EfficientZeroLearner):
     def _hyper_lr_scale_value(self, main_scale: float) -> float:
         return float(main_scale) if self.config.scale_hyper_lr else 1.0
 
+    def _priority_beta(self) -> float:
+        """Priority-β anneal over the per-task horizon (match EZ within a task)."""
+        if not self.config.use_priority:
+            return 1.0
+        total = max(1, self._task_lr_horizon())
+        initial = self.config.priority_prob_beta
+        progress = min(1.0, self._task_train_steps / total)
+        return float(initial + (1.0 - initial) * progress)
+
+    def _curriculum_train_steps(self) -> int:
+        """Steps used for mix / TD / MCTS-temperature (reset each CW task)."""
+        return self._task_train_steps
+
     def retention_target_metrics(self) -> dict[str, float]:
         """Fix-target drift of previous tasks (0 = perfect retention of h(c_j))."""
         if self.task_id <= 0 or self._reg_targets is None:
@@ -1233,10 +1253,11 @@ class HyperCEZLearner(EfficientZeroLearner):
             )
 
         beta = self._priority_beta()
+        curriculum_step = self._curriculum_train_steps()
         batch = replay_buffer.sample(
             self.config.batch_size,
             beta=beta,
-            trained_steps=self._train_steps,
+            trained_steps=curriculum_step,
         )
         self._rng_key, step_key = jax.random.split(self._rng_key)
         arrays = _prepare_training_batch(
@@ -1245,7 +1266,7 @@ class HyperCEZLearner(EfficientZeroLearner):
             config=self.config,
             model=self.model,
             reanalyze_params=self._reanalyze_params,
-            trained_steps=self._train_steps,
+            trained_steps=curriculum_step,
             total_transitions=replay_buffer.total_transitions,
             rng_key=step_key,
             on_reanalyze_progress=getattr(self, "_on_reanalyze_progress", None),
@@ -1311,6 +1332,102 @@ class HyperCEZLearner(EfficientZeroLearner):
         if interval > 0 and self._task_train_steps % interval == 0:
             out.update(self.retention_target_metrics())
         return out
+
+    def _train_burst_chunk(
+        self,
+        replay_buffer: EfficientZeroReplayBuffer,
+        steps: int,
+        *,
+        on_progress: Callable[[int, int], None] | None,
+        completed_steps: int,
+        total_steps: int,
+    ) -> dict[str, float]:
+        """Like EZ burst prep, but mix / TD / temperature use per-task steps."""
+        beta = self._priority_beta()
+        global_start = self._train_steps
+        curriculum_start = self._curriculum_train_steps()
+        batches: list[Batch] = []
+        for offset in range(steps):
+            batches.append(
+                replay_buffer.sample(
+                    self.config.batch_size,
+                    beta=beta,
+                    trained_steps=curriculum_start + offset,
+                )
+            )
+
+        self._rng_key, burst_key = jax.random.split(self._rng_key)
+        step_keys = jax.random.split(burst_key, steps)
+        prepared_batches: list[dict[str, jnp.ndarray]] = []
+        observation_windows: list[np.ndarray] = []
+        window = self.config.unroll_steps + 1
+        reanalyze_count = int(self.config.batch_size * self.config.reanalyze_ratio)
+
+        for offset, batch in enumerate(batches):
+            trained_steps = curriculum_start + offset
+            arrays = _prepare_training_batch(
+                batch,
+                planner=self.planner,
+                config=self.config,
+                model=self.model,
+                reanalyze_params=self._reanalyze_params,
+                trained_steps=trained_steps,
+                total_transitions=replay_buffer.total_transitions,
+                rng_key=step_keys[offset],
+                skip_reanalyze=True,
+                value_infer_fn=self._value_infer_fn,
+            )
+            prepared_batches.append(arrays)
+            observation_windows.append(
+                np.asarray(batch.data["observations"], dtype=np.float32)[:, :window]
+            )
+
+        if (
+            reanalyze_count > 0
+            and isinstance(self.planner, EfficientZeroPlanner)
+            and observation_windows
+        ):
+            temperature = mcts_temperature(self.config, curriculum_start)
+            reanalyze_outputs = reanalyze_fused_policy_batches(
+                self.planner,
+                observation_windows,
+                params=self._reanalyze_params,
+                reanalyze_count=reanalyze_count,
+                temperature=temperature,
+                search_batch_size=self._reanalyze_search_width,
+                on_progress=getattr(self, "_on_reanalyze_progress", None),
+            )
+            for offset, refreshed in enumerate(reanalyze_outputs):
+                prepared_batches[offset] = _apply_reanalyze_outputs(
+                    prepared_batches[offset],
+                    refreshed,
+                    reanalyze_count,
+                )
+                prepared_batches[offset] = _finalize_value_targets(
+                    prepared_batches[offset],
+                    batches[offset],
+                    config=self.config,
+                    trained_steps=curriculum_start + offset,
+                )
+        else:
+            for offset in range(steps):
+                prepared_batches[offset] = _finalize_value_targets(
+                    prepared_batches[offset],
+                    batches[offset],
+                    config=self.config,
+                    trained_steps=curriculum_start + offset,
+                )
+
+        return self._run_burst_scan_chunk(
+            replay_buffer,
+            prepared_batches=prepared_batches,
+            step_keys=step_keys,
+            start_step=global_start,
+            chunk_steps=steps,
+            on_progress=on_progress,
+            completed_steps=completed_steps,
+            total_steps=total_steps,
+        )
 
     def _run_burst_scan_chunk(
         self,

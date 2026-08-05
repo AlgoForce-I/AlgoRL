@@ -20,12 +20,13 @@ def for_cw10_hypercez_batched(
     num_envs: int = 32,
     **overrides: object,
 ) -> arl.HyperCEZConfig:
-    """CW10 HyperCEZ config: EZ knobs + retention-first CL settings.
+    """CW10 HyperCEZ config: match ``example.py`` task-0 learning, then CL.
 
-    EfficientZero fields match ``example.py``. Continual-learning fields follow
-    HyperCEZ-master ``main.py`` strength (β=0.5, no plastic prev embeddings)
-    while keeping a chunked hypernet for throughput. Per-task LR reset and
-    unscaled ``lr_hyper`` are handled in the learner.
+    Critical for matching EfficientZero on task 0:
+    - EZ mix / TD / priority horizons are derived from ``STEPS_PER_TASK`` (not
+      the full 10-task run), same as ``example.py``.
+    - ``alpha_init`` is large enough that ``α_max·tanh(α)`` starts near full
+      residual capacity. The old ``1e-3`` left the net ≈ frozen at ``W0``.
     """
     config = arl.HyperCEZConfig.for_batched(num_envs=num_envs).with_overrides(
         # --- EfficientZero (same as example.py) ---
@@ -41,12 +42,13 @@ def for_cw10_hypercez_batched(
         entropy_coeff=0.1,
         std_magnification=4.0,
     ).with_schedule_for_run(
-        TOTAL_TIMESTEPS,
+        # Per-task horizon — must match example.py, not TOTAL_TIMESTEPS.
+        STEPS_PER_TASK,
         num_envs=num_envs,
     )
 
     return config.with_overrides(
-        # --- EfficientZero schedule: applied *per task* by HyperCEZLearner ---
+        # --- EfficientZero schedule (per-task; learner also resets each task) ---
         schedule_horizon="fixed",
         lr_decay_steps=300_000,
         lr_decay_rate=0.5,
@@ -60,12 +62,13 @@ def for_cw10_hypercez_batched(
         emb_size=10,
         cemb_init_std=1.0,
         emb_init_std=1.0,
+        # Match main-net Adam rate; keep hyper updates unscaled by EZ lr_scale.
         lr_hyper=3e-4,
         scale_hyper_lr=False,
-        # Match reference main.py CW10 β (was 0.005 chunked smoke default).
         beta=0.5,
         alpha_max=0.2,
-        alpha_init=1e-3,
+        # Near-full residual at start: 0.2 * tanh(2) ≈ 0.193 (was ~2e-4).
+        alpha_init=2.0,
         no_look_ahead=False,
         dt_scale=1.0,
         use_sgd_change=False,
@@ -90,7 +93,7 @@ def main() -> None:
     agent = arl.HyperCEZ(env, config=config)
     # TrainingLoop syncs learner.task_id from env.current_task_index and calls
     # on_task_boundary (snapshot reg targets + shared leaves, warm-start α,
-    # reset per-task LR) at each CW task switch; the replay buffer is cleared.
+    # reset per-task LR / curriculum) at each CW task switch; replay is cleared.
     agent.learn(
         total_timesteps=TOTAL_TIMESTEPS,
         tensorboard_log_dir=TENSORBOARD_LOG_DIR,

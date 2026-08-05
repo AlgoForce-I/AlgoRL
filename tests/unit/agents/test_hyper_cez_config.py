@@ -26,7 +26,7 @@ def test_hypercez_config_defaults() -> None:
     assert config.lr_hyper == 3e-4
     assert config.beta == 1.0
     assert config.alpha_max == 0.2
-    assert config.alpha_init == 1e-3
+    assert config.alpha_init == 2.0
     assert config.no_look_ahead is False
     assert config.use_sgd_change is False
     assert config.plastic_prev_tembs is False

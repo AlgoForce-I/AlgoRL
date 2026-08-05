@@ -374,7 +374,8 @@ class HyperCEZConfig(EfficientZeroConfig):
     lr_hyper: float = 3e-4
     beta: float = 1.0
     alpha_max: float = 0.2
-    alpha_init: float = 1e-3
+    # Near-full residual at start (α_max·tanh(2)≈0.19). 1e-3 leaves the net ≈W0.
+    alpha_init: float = 2.0
     emb_init_std: float = 1.0
     no_look_ahead: bool = False
     dt_scale: float = 1.0
