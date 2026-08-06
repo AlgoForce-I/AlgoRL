@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from pathlib import Path
 from typing import Any
 
 import jax
@@ -10,12 +11,18 @@ import numpy as np
 
 from algorl.agents.configs import BaseAgentConfig
 from algorl.common.callbacks import Callback, CallbackList
-from algorl.common.checkpoints import save_checkpoint
+from algorl.common.checkpoints import (
+    load_run_checkpoint,
+    prune_step_checkpoints,
+    save_run_checkpoint,
+    write_json,
+)
 from algorl.common.episode_metrics import (
     BatchedEpisodeMetricsTracker,
     EpisodeMetricsTracker,
     batched_episode_summary_metrics,
 )
+from algorl.backends.jax.memory import collect_memory_metrics
 from algorl.common.logger import Logger
 from algorl.common.progress_bar import TqdmProgressBar
 from algorl.common.tensorboard_logger import TensorboardLogger
@@ -40,12 +47,14 @@ class TrainingLoop:
         config: BaseAgentConfig,
         callbacks: Callback | CallbackList | None = None,
         logger: Logger | None = None,
+        agent_name: str = "agent",
     ) -> None:
         self.env = env
         self.planner = planner
         self.learner = learner
         self.replay_buffer = replay_buffer
         self.config = config
+        self.agent_name = agent_name
         self.callbacks = callbacks if isinstance(callbacks, CallbackList) else CallbackList(
             [callbacks] if callbacks is not None else []
         )
@@ -61,16 +70,51 @@ class TrainingLoop:
         # First global step at which training may run; pushed forward at
         # continual-learning task switches to replay the learning_starts warmup.
         self._min_train_step = 0
+        self._last_memory_log_step = -1
+        self._checkpoint_dir: str | None = getattr(config, "checkpoint_dir", None)
+        self._recent_returns: list[float] = []
+        self._best_score = float("-inf")
+        self._skip_initial_env_reset = False
+
+    def restore_run_checkpoint(self, directory: str | Path) -> dict[str, Any]:
+        """Load learner/buffer/env/logger state from a multi-file checkpoint."""
+        payload = load_run_checkpoint(
+            directory=directory,
+            learner=self.learner,
+            replay_buffer=self.replay_buffer,
+            env=self.env,
+            rng_key=self._key,
+        )
+        loop = payload["loop"]
+        self._min_train_step = int(loop.get("min_train_step", 0))
+        self._last_memory_log_step = int(loop.get("last_memory_log_step", -1))
+        self._best_score = float(loop.get("best_score", float("-inf")))
+        self._recent_returns = [float(v) for v in loop.get("recent_returns", [])]
+        key_data = loop.get("rng_key")
+        if key_data is not None:
+            self._key = jnp.asarray(key_data, dtype=jnp.uint32)
+        logger_payload = payload.get("logger")
+        if logger_payload is not None and "history" in logger_payload:
+            self.logger.history = list(logger_payload["history"])
+        self._skip_initial_env_reset = True
+        return payload
 
     def run(
         self,
         total_timesteps: int,
         *,
         checkpoint_path: str | None = None,
+        checkpoint_dir: str | None = None,
+        start_step: int = 0,
         extra_step_info: dict[str, Any] | None = None,
         progress_bar: TqdmProgressBar | None = None,
     ) -> None:
         """Interact with the environment and call ``learner.train_step`` on schedule."""
+        if checkpoint_dir is not None:
+            self._checkpoint_dir = checkpoint_dir
+        elif checkpoint_path is not None and self._checkpoint_dir is None:
+            # Treat legacy path as a checkpoint directory root.
+            self._checkpoint_dir = checkpoint_path
         self._progress_bar = progress_bar
         if progress_bar is not None:
             progress_bar.start(total_timesteps)
@@ -78,14 +122,14 @@ class TrainingLoop:
             if self.env.is_batched:
                 self._run_batched(
                     total_timesteps,
-                    checkpoint_path=checkpoint_path,
+                    start_step=start_step,
                     extra_step_info=extra_step_info,
                     progress_bar=progress_bar,
                 )
                 return
             self._run_sequential(
                 total_timesteps,
-                checkpoint_path=checkpoint_path,
+                start_step=start_step,
                 extra_step_info=extra_step_info,
                 progress_bar=progress_bar,
             )
@@ -99,16 +143,19 @@ class TrainingLoop:
         self,
         total_timesteps: int,
         *,
-        checkpoint_path: str | None,
+        start_step: int,
         extra_step_info: dict[str, Any] | None,
         progress_bar: TqdmProgressBar | None,
     ) -> None:
-        observation, reset_info = self.env.reset(seed=self.config.seed)
+        if self._skip_initial_env_reset and start_step > 0:
+            observation, reset_info = self.env.reset(seed=None)
+        else:
+            observation, reset_info = self.env.reset(seed=self.config.seed)
         self._episode_tracker.begin_episode(reset_info)
         metrics: dict[str, Any] = {}
         self._sync_rollout_task_id()
 
-        for step in range(total_timesteps):
+        for step in range(start_step, total_timesteps):
             self._sync_rollout_task_id()
             action = self._select_action(observation)
             next_observation, reward, terminated, truncated, info = self.env.step(action)
@@ -136,6 +183,7 @@ class TrainingLoop:
                 if callable(clear_buffer):
                     clear_buffer()
                 self._min_train_step = step + 1 + self.config.learning_starts
+                self._maybe_boundary_checkpoint(step, metrics)
 
             if done:
                 observation, reset_info = self.env.reset()
@@ -151,7 +199,7 @@ class TrainingLoop:
                 metrics=metrics,
                 extra_step_info=extra_step_info,
             )
-            self._maybe_checkpoint(step, metrics, checkpoint_path)
+            self._maybe_checkpoint(step, metrics)
             if progress_bar is not None:
                 progress_bar.update(step_info)
 
@@ -159,14 +207,14 @@ class TrainingLoop:
         self,
         total_timesteps: int,
         *,
-        checkpoint_path: str | None,
+        start_step: int,
         extra_step_info: dict[str, Any] | None,
         progress_bar: TqdmProgressBar | None,
     ) -> None:
         chunk_size = max(1, self.config.jax_rollout_chunk)
         metrics: dict[str, Any] = {}
-        steps_collected = 0
-        step_counter = 0
+        steps_collected = max(0, int(start_step))
+        step_counter = max(0, int(start_step))
 
         while steps_collected < total_timesteps:
             chunk_steps = min(chunk_size, total_timesteps - steps_collected)
@@ -227,7 +275,7 @@ class TrainingLoop:
                         metrics,
                         progress_bar=progress_bar,
                     )
-                    self._maybe_checkpoint(current_step, metrics, checkpoint_path)
+                    self._maybe_checkpoint(current_step, metrics)
                 if num_added == 0:
                     continue
             else:
@@ -247,7 +295,6 @@ class TrainingLoop:
                 metrics = self._run_gradient_burst(
                     train_steps,
                     metrics,
-                    checkpoint_path=checkpoint_path,
                     progress_bar=progress_bar,
                 )
 
@@ -280,6 +327,7 @@ class TrainingLoop:
             clear_buffer()
         boundary_step = chunk_start_step + boundary + 1
         self._min_train_step = boundary_step + self.config.learning_starts
+        self._maybe_boundary_checkpoint(boundary_step, {})
         return transitions[boundary + 1:], boundary + 1
 
     def _notify_task_boundary(self, info: dict[str, Any]) -> None:
@@ -353,7 +401,6 @@ class TrainingLoop:
         train_steps: list[int],
         metrics: dict[str, Any],
         *,
-        checkpoint_path: str | None,
         progress_bar: TqdmProgressBar | None,
     ) -> dict[str, Any]:
         """Run a capped post-rollout training burst (batched throughput path)."""
@@ -401,14 +448,16 @@ class TrainingLoop:
                             }
                         )
                     trained_metrics = self.learner.train_step(self.replay_buffer)
-                    self._maybe_checkpoint(train_step, {**metrics, **trained_metrics}, checkpoint_path)
+                    self._maybe_checkpoint(train_step, {**metrics, **trained_metrics})
         finally:
             if progress_bar is not None and hasattr(self.learner, "_on_reanalyze_progress"):
                 delattr(self.learner, "_on_reanalyze_progress")
             self._release_rollout_search_cache([])
 
         merged = {**metrics, **trained_metrics}
-        self._maybe_checkpoint(train_steps[-1], merged, checkpoint_path)
+        # Post-train sample: captures VRAM after the heavy AD / rematerialize peak.
+        self._maybe_record_memory(train_steps[-1], force=True)
+        self._maybe_checkpoint(train_steps[-1], merged)
         if progress_bar is not None:
             progress_bar.pulse({**trained_metrics, "phase": "buffer"})
         return merged
@@ -587,7 +636,9 @@ class TrainingLoop:
             episode_metrics = self.logger.record_episode(step, event)
         else:
             episode_metrics = episode_metrics_from_event(event)
-        return {**metrics, **episode_metrics}
+        merged = {**metrics, **episode_metrics}
+        self._maybe_autosave_best(step, float(event.episode_return), merged)
+        return merged
 
     def _close_logger(self) -> None:
         self._flush_logger()
@@ -628,6 +679,7 @@ class TrainingLoop:
                 delattr(self.learner, "_on_reanalyze_progress")
             self._release_rollout_search_cache([])
         merged = {**metrics, **trained_metrics}
+        self._maybe_record_memory(step, force=True)
         if progress_bar is not None:
             progress_bar.pulse({**trained_metrics, "phase": "buffer"})
         return merged
@@ -637,6 +689,30 @@ class TrainingLoop:
         search_results.clear()
         if hasattr(self.planner, "last_result"):
             self.planner.last_result = None
+
+    def _maybe_record_memory(self, step: int, *, force: bool = False) -> None:
+        """Write RAM/VRAM scalars to the logger (TensorBoard when enabled).
+
+        ``memory_log_interval <= 0`` disables all memory logging.
+        ``force=True`` logs even if the interval has not elapsed (used after
+        gradient bursts to capture post-train VRAM peaks).
+        """
+        interval = int(getattr(self.config, "memory_log_interval", 1_000))
+        if interval <= 0:
+            return
+        if (
+            not force
+            and self._last_memory_log_step >= 0
+            and step - self._last_memory_log_step < interval
+        ):
+            return
+        metrics = collect_memory_metrics()
+        if not metrics:
+            return
+        self.logger.record(int(step), metrics)
+        if isinstance(self.logger, TensorboardLogger):
+            self.logger.flush()
+        self._last_memory_log_step = int(step)
 
     def _log_step(
         self,
@@ -658,28 +734,123 @@ class TrainingLoop:
         # Callbacks may enrich ``step_info`` before it is recorded (e.g. CL retention).
         self.callbacks.on_step(step, step_info)
         self.logger.record(step, step_info)
+        self._maybe_record_memory(step)
         return step_info
 
-    def _maybe_checkpoint(
+    def _loop_checkpoint_state(self, step: int) -> dict[str, Any]:
+        task_id = getattr(self.learner, "task_id", self._env_current_task_index())
+        return {
+            "step": int(step),
+            "min_train_step": int(self._min_train_step),
+            "last_memory_log_step": int(self._last_memory_log_step),
+            "task_id": None if task_id is None else int(task_id),
+            "best_score": float(self._best_score),
+            "recent_returns": list(self._recent_returns),
+            "rng_key": np.asarray(self._key).tolist(),
+        }
+
+    def _write_run_checkpoint(
         self,
         step: int,
-        metrics: dict[str, Any],
-        checkpoint_path: str | None,
-    ) -> None:
+        *,
+        tag: str | None = None,
+        subdirectory: str | None = None,
+        extra_meta: dict[str, Any] | None = None,
+    ) -> Path | None:
+        if not self._checkpoint_dir:
+            return None
+        root = Path(self._checkpoint_dir)
+        target = root / subdirectory if subdirectory else root / f"step_{int(step):09d}"
+        return save_run_checkpoint(
+            directory=target,
+            agent_name=self.agent_name,
+            step=step,
+            config=self.config,
+            learner=self.learner,
+            replay_buffer=self.replay_buffer,
+            env=self.env,
+            loop_state=self._loop_checkpoint_state(step),
+            logger_history=list(getattr(self.logger, "history", [])),
+            tag=tag,
+            extra_meta=extra_meta,
+        )
+
+    def _maybe_checkpoint(self, step: int, metrics: dict[str, Any]) -> None:
+        del metrics  # reserved for future metric-tagged snapshots
+        freq = getattr(self.config, "checkpoint_freq", None)
         if (
-            checkpoint_path is not None
-            and self.config.checkpoint_freq is not None
+            self._checkpoint_dir is not None
+            and freq is not None
             and step > 0
-            and step % self.config.checkpoint_freq == 0
+            and step % int(freq) == 0
         ):
-            save_checkpoint(
-                checkpoint_path,
-                {
-                    "step": step,
-                    "metrics": metrics,
-                    "buffer_size": len(self.replay_buffer),
-                },
-            )
+            self._write_run_checkpoint(step, tag="periodic")
+            keep = getattr(self.config, "checkpoint_keep_last", None)
+            if keep is not None:
+                prune_step_checkpoints(self._checkpoint_dir, keep_last=int(keep))
+
+    def _maybe_boundary_checkpoint(self, step: int, metrics: dict[str, Any]) -> None:
+        del metrics
+        if not self._checkpoint_dir:
+            return
+        if not getattr(self.config, "checkpoint_at_task_boundary", True):
+            return
+        finished = int(getattr(self.learner, "task_id", 1)) - 1
+        if finished < 0:
+            finished = 0
+        self._write_run_checkpoint(
+            step,
+            tag=f"boundary_task_{finished}",
+            subdirectory=f"boundary_task_{finished}",
+            extra_meta={"buffer_cleared": True, "finished_task": finished},
+        )
+
+    def _maybe_autosave_best(
+        self,
+        step: int,
+        episode_return: float,
+        metrics: dict[str, Any],
+    ) -> None:
+        if not getattr(self.config, "autosave_best", False):
+            return
+        if not self._checkpoint_dir:
+            return
+        min_step = int(getattr(self.config, "autosave_best_min_step", 0))
+        if step < min_step:
+            return
+        window = max(1, int(getattr(self.config, "autosave_best_window", 10)))
+        self._recent_returns.append(float(episode_return))
+        if len(self._recent_returns) > window:
+            self._recent_returns = self._recent_returns[-window:]
+        metric_name = str(getattr(self.config, "autosave_best_metric", "mean_episode_return"))
+        if metric_name == "mean_episode_return":
+            score = float(np.mean(self._recent_returns))
+        elif metric_name in metrics:
+            score = float(metrics[metric_name])
+        else:
+            score = float(episode_return)
+        if score <= self._best_score:
+            return
+        self._best_score = score
+        self._write_run_checkpoint(
+            step,
+            tag="best",
+            subdirectory="best",
+            extra_meta={
+                "best_score": score,
+                "best_metric": metric_name,
+                "best_window": window,
+            },
+        )
+        write_json(
+            Path(self._checkpoint_dir) / "best_score.json",
+            {
+                "best_score": score,
+                "best_step": int(step),
+                "metric": metric_name,
+                "window": window,
+            },
+        )
 
     def _select_action(self, observation: Observation) -> Action:
         if self._progress_bar is not None:

@@ -344,6 +344,37 @@ class BatchedContinualLearningJaxEnv:
     def current_task_name(self) -> str:
         return self.task_names[self._seq_idx]
 
+    def curriculum_checkpoint_state(self) -> dict[str, Any]:
+        """Persist CW task index / global step (training-exact resume)."""
+        return {
+            "seq_idx": int(self._seq_idx),
+            "global_step": int(self._global_step),
+            "steps_per_task": int(self.steps_per_task),
+            "num_tasks": int(self.num_tasks),
+            "seed": int(self.seed),
+        }
+
+    def load_curriculum_checkpoint_state(
+        self,
+        state: dict[str, Any],
+        *,
+        key: jnp.ndarray,
+    ) -> None:
+        """Restore curriculum counters and rebuild the active task vector env."""
+        if int(state.get("steps_per_task", self.steps_per_task)) != int(self.steps_per_task):
+            raise ValueError(
+                "steps_per_task mismatch on env resume: "
+                f"checkpoint={state.get('steps_per_task')} live={self.steps_per_task}."
+            )
+        self._seq_idx = int(state["seq_idx"])
+        self._global_step = int(state["global_step"])
+        if self._seq_idx < 0 or self._seq_idx >= self.num_tasks:
+            raise ValueError(
+                f"Invalid seq_idx={self._seq_idx} for num_tasks={self.num_tasks}."
+            )
+        self._vector_env = self._make_task_vector_env(self._seq_idx)
+        self._state = self._vector_env.reset(key)
+
     def reset(self, key: jnp.ndarray) -> JaxState:
         self._seq_idx = 0
         self._global_step = 0

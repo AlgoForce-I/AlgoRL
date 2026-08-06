@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from collections import deque
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Deque
 
 import numpy as np
@@ -277,6 +278,18 @@ class EfficientZeroReplayBuffer(ReplayBuffer):
         self._base_traj_idx = 0
         self._active.clear()
         self._pending_commit.clear()
+
+    def save(self, directory: str | Path) -> None:
+        """Persist stored and in-flight trajectories to a directory (no pickle)."""
+        from algorl.buffers.efficientzero.checkpoint import save_efficient_zero_buffer
+
+        save_efficient_zero_buffer(self, directory)
+
+    def load(self, directory: str | Path) -> None:
+        """Restore buffer contents from :meth:`save` into this instance."""
+        from algorl.buffers.efficientzero.checkpoint import load_efficient_zero_buffer
+
+        load_efficient_zero_buffer(self, directory)
 
     def update_priorities(self, indices: np.ndarray, priorities: np.ndarray) -> None:
         min_prior = float(self.config.min_prior)

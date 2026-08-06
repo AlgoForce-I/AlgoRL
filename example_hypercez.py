@@ -13,7 +13,10 @@ NUM_ENVS = 32
 NUM_TASKS = 10  # CW10
 STEPS_PER_TASK = 1_000_000
 TOTAL_TIMESTEPS = NUM_TASKS * STEPS_PER_TASK
-TENSORBOARD_LOG_DIR = "runs/cw10_hypercez_cl"
+TENSORBOARD_LOG_DIR = "runs/cw10_hypercez_cl_unchuncked"
+CHECKPOINT_DIR = "runs/cw10_hypercez_cl_unchuncked/checkpoints"
+# Set to e.g. f"{CHECKPOINT_DIR}/boundary_task_0" to continue after task 0.
+RESUME_FROM: str | None = None
 
 
 def for_cw10_hypercez_batched(
@@ -25,8 +28,8 @@ def for_cw10_hypercez_batched(
     Critical for matching EfficientZero on task 0:
     - EZ mix / TD / priority horizons are derived from ``STEPS_PER_TASK`` (not
       the full 10-task run), same as ``example.py``.
-    - Zero-init hypernet heads keep ``W(0)=W0``; ``alpha_max=1`` / open
-      ``alpha_init`` give unit-scale plasticity without 5× ΔW blow-up.
+    - Unchunked heads scale outputs by ``1/sqrt(H)`` so the first Adam step
+      does not dump a full-scale residual onto W0 (see hyper_model.py).
     """
     config = arl.HyperCEZConfig.for_batched(num_envs=num_envs).with_overrides(
         # --- EfficientZero (same as example.py) ---
@@ -55,19 +58,16 @@ def for_cw10_hypercez_batched(
         # --- HyperCEZDelta / continual learning ---
         num_tasks=NUM_TASKS,
         steps_per_task=STEPS_PER_TASK,
-        hnet_type="chunked",
-        hnet_arch=(20, 20),
-        chunk_dim=2000,
-        cemb_size=20,
+        
+        hnet_type="unchunked",
+        hnet_arch=(128, 128),
         emb_size=10,
-        cemb_init_std=1.0,
         emb_init_std=1.0,
+        head_init_std=0.0,  # identity residual at step 0; 1/sqrt(H) keeps updates sane
         # Match main-net Adam rate; keep hyper updates unscaled by EZ lr_scale.
         lr_hyper=3e-4,
         scale_hyper_lr=False,
         beta=0.5,
-        # Unit-scale residual: ΔW ~ same magnitude as EZ updates (not 5×).
-        # Zero-init hnet heads keep W(0)=W0 despite open α.
         alpha_max=1.0,
         alpha_init=2.0,
         no_look_ahead=False,
@@ -90,14 +90,25 @@ def main() -> None:
         seed=42,
         config=CWConfig(seed=42, steps_per_task=STEPS_PER_TASK),
     )
-    config = for_cw10_hypercez_batched(num_envs=NUM_ENVS)
+    config = for_cw10_hypercez_batched(
+        num_envs=NUM_ENVS,
+        checkpoint_dir=CHECKPOINT_DIR,
+        checkpoint_at_task_boundary=True,
+        checkpoint_freq=STEPS_PER_TASK,
+        autosave_best=True,
+        autosave_best_window=20,
+    )
     agent = arl.HyperCEZ(env, config=config)
     # TrainingLoop syncs learner.task_id from env.current_task_index and calls
     # on_task_boundary (snapshot reg targets + shared leaves, warm-start α,
     # reset per-task LR / curriculum) at each CW task switch; replay is cleared.
+    # To resume after task 0: set RESUME_FROM above and optionally pass
+    # config_overrides={"beta": 1.0} into learn().
     agent.learn(
         total_timesteps=TOTAL_TIMESTEPS,
         tensorboard_log_dir=TENSORBOARD_LOG_DIR,
+        checkpoint_dir=CHECKPOINT_DIR,
+        resume_from=RESUME_FROM,
         progress_bar=True,
         callbacks=HyperCEZRetentionCallback(
             agent.learner,

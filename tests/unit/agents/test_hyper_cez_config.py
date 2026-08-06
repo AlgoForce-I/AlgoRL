@@ -27,11 +27,14 @@ def test_hypercez_config_defaults() -> None:
     assert config.beta == 1.0
     assert config.alpha_max == 1.0
     assert config.alpha_init == 2.0
+    assert config.head_init_std == 1e-3
     assert config.no_look_ahead is False
     assert config.use_sgd_change is False
     assert config.plastic_prev_tembs is False
     assert config.ewc_weight_importance is False
     assert config.scale_hyper_lr is False
+    assert config.frozen_base_weights is True
+    assert config.lr_main_to_lr_hyper_ratio == 50.0
     assert config.warm_start_alpha is True
     assert config.snapshot_shared_per_task is True
     assert config.use_per_task_reg_scaling is False

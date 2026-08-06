@@ -6,7 +6,26 @@ import multiprocessing as mp
 import os
 from unittest import mock
 
-from algorl.backends.jax.memory import configure_jax_gpu_memory
+from algorl.backends.jax.memory import (
+    collect_memory_metrics,
+    collect_ram_metrics,
+    collect_vram_metrics,
+    configure_jax_gpu_memory,
+)
+
+
+def test_collect_ram_metrics_reports_rss() -> None:
+    metrics = collect_ram_metrics()
+    assert "system/ram_rss_gb" in metrics
+    assert metrics["system/ram_rss_gb"] > 0.0
+
+
+def test_collect_memory_metrics_includes_ram() -> None:
+    metrics = collect_memory_metrics()
+    assert "system/ram_rss_gb" in metrics
+    # VRAM keys are optional on CPU-only / unavailable devices.
+    assert all(key.startswith("system/") for key in metrics)
+    _ = collect_vram_metrics()  # smoke; may be empty
 
 
 def test_configure_jax_gpu_memory_sets_allocator_env() -> None:

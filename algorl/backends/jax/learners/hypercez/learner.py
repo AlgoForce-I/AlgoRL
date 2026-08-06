@@ -5,6 +5,7 @@ from __future__ import annotations
 import copy
 from collections.abc import Callable
 from functools import partial
+from pathlib import Path
 from typing import Any
 
 import jax
@@ -34,6 +35,7 @@ from algorl.core.types import Batch
 from algorl.backends.jax.learners.hypercez.train_state import (
     build_train_state,
     join_live_ez,
+    rebuild_frozen_ez,
 )
 from algorl.backends.jax.nn.efficientzero.model import EfficientZero as EfficientZeroNetwork
 from algorl.backends.jax.nn.efficientzero.model import Params
@@ -46,6 +48,7 @@ from algorl.backends.jax.nn.hypercez.hyper_model import (
     component_outputs_to_tree,
 )
 from algorl.backends.jax.nn.hypercez.materialize import materialize_ez_params
+from algorl.backends.jax.nn.hypercez.shapes import partition_params
 from algorl.backends.jax.nn.hypercez.regularizer import (
     RegTargets,
     calc_component_reg_loss,
@@ -210,11 +213,20 @@ def materialize_from_train_state(
     alpha_max: float,
     shared_override: dict[str, Any] | None = None,
 ) -> Params:
-    """Build EZ params from Optax train state (differentiable w.r.t. train_state)."""
+    """Build EZ params from Optax train state (differentiable w.r.t. train_state).
+
+    Generated base weights come from ``train_state['base']`` when present (slow
+    W0 path); otherwise from the closed-over ``frozen_ez`` snapshot.
+    """
+    base = (
+        train_state["base"]
+        if "base" in train_state
+        else {name: partition_params(frozen_ez[name])[0] for name in hnet_components}
+    )
     live_ez = join_live_ez(
         shared=train_state["shared"] if shared_override is None else shared_override,
         projections=train_state["projections"],
-        frozen_ez=frozen_ez,
+        base=base,
         hnet_components=hnet_components,
     )
     component_deltas: dict[str, Any] = {}
@@ -226,7 +238,7 @@ def materialize_from_train_state(
         )
         component_deltas[component_name] = component_outputs_to_tree(
             outputs,
-            frozen_ez[component_name],
+            live_ez[component_name],
         )
     task_alphas = _task_alphas_from_state(
         train_state["alphas"],
@@ -234,9 +246,11 @@ def materialize_from_train_state(
         hnet_components,
         num_tasks,
     )
+    # ``live_ez`` already merges current base + shared; materialize reads
+    # generated W0 from frozen_ez and shared leaves from live_ez.
     return materialize_ez_params(
         component_deltas=component_deltas,
-        frozen_ez=frozen_ez,
+        frozen_ez=live_ez,
         live_ez=live_ez,
         alphas=task_alphas,
         hnet_components=hnet_components,
@@ -250,8 +264,12 @@ def _scale_train_state_updates(
     main_lr_scale: jnp.ndarray,
     hyper_lr_scale: jnp.ndarray,
 ) -> dict[str, Any]:
-    """Apply separate LR scales to main-net vs hypernet / alpha leaves."""
-    return {
+    """Apply separate LR scales to main-net vs hypernet / alpha leaves.
+
+    Base (W0) LR is set directly in the optimizer
+    (``lr_hyper / lr_main_to_lr_hyper_ratio``); no extra schedule scale.
+    """
+    scaled = {
         "hnets": jax.tree.map(lambda update: update * hyper_lr_scale, updates["hnets"]),
         "alphas": jax.tree.map(lambda update: update * hyper_lr_scale, updates["alphas"]),
         "shared": jax.tree.map(lambda update: update * main_lr_scale, updates["shared"]),
@@ -259,6 +277,9 @@ def _scale_train_state_updates(
             lambda update: update * main_lr_scale, updates["projections"]
         ),
     }
+    if "base" in updates:
+        scaled["base"] = updates["base"]
+    return scaled
 
 
 def _hypercez_task_step(
@@ -967,11 +988,17 @@ class HyperCEZLearner(EfficientZeroLearner):
         self.task_id = int(self.world_model.task_id)
         self.frozen_ez: Params = copy.deepcopy(self.world_model.frozen_ez)
         self.hnet_modules = self.world_model.hnet_modules
+        if self.config.lr_main_to_lr_hyper_ratio <= 0.0:
+            raise ValueError(
+                "lr_main_to_lr_hyper_ratio must be > 0, "
+                f"got {self.config.lr_main_to_lr_hyper_ratio}."
+            )
         self.train_state = build_train_state(
             hnet_params=copy.deepcopy(self.world_model.hnet_params),
             alphas=copy.deepcopy(self.world_model.alphas),
             live_ez=copy.deepcopy(self.world_model.live_ez),
             hnet_components=self.config.hnet_components,
+            base_ez=copy.deepcopy(self.frozen_ez),
         )
         self._ema_reg_per_task = jnp.zeros((self.config.num_tasks,), dtype=jnp.float32)
         self._jit_materialize = jax.jit(
@@ -1024,6 +1051,12 @@ class HyperCEZLearner(EfficientZeroLearner):
         )
         self._warmup_train_compile()
 
+    def _base_learning_rate(self) -> float:
+        """Slow W0 LR: ``lr_hyper / lr_main_to_lr_hyper_ratio``."""
+        return float(self.config.lr_hyper) / float(
+            self.config.lr_main_to_lr_hyper_ratio
+        )
+
     def _build_task_optimizer(self) -> optax.GradientTransformation:
         hyper_opt = optax.chain(
             optax.clip_by_global_norm(self.config.hnet_grad_max_norm),
@@ -1034,14 +1067,23 @@ class HyperCEZLearner(EfficientZeroLearner):
             optax.add_decayed_weights(self.config.weight_decay),
             optax.adam(self.config.learning_rate),
         )
+        if self.config.frozen_base_weights:
+            base_opt: optax.GradientTransformation = optax.set_to_zero()
+        else:
+            base_opt = optax.chain(
+                optax.clip_by_global_norm(self.config.max_grad_norm),
+                optax.add_decayed_weights(self.config.weight_decay),
+                optax.adam(self._base_learning_rate()),
+            )
         label_tree = {
             "hnets": "hyper",
             "alphas": "hyper",
+            "base": "base",
             "shared": "main",
             "projections": "main",
         }
         return optax.multi_transform(
-            {"hyper": hyper_opt, "main": main_opt},
+            {"hyper": hyper_opt, "main": main_opt, "base": base_opt},
             label_tree,
         )
 
@@ -1199,8 +1241,10 @@ class HyperCEZLearner(EfficientZeroLearner):
             )
         if new_task_id > 0 and self.config.warm_start_alpha and finished_task >= 0:
             prev_alphas = self.train_state["alphas"][finished_task]
+            # Copy so new-task α leaves are not aliased with the previous task
+            # (donate_argnums rejects duplicate buffers in the train-state tree).
             warmed = {
-                component: jnp.asarray(prev_alphas[component])
+                component: jnp.array(prev_alphas[component], copy=True)
                 for component in self.config.hnet_components
             }
             alphas = dict(self.train_state["alphas"])
@@ -1627,9 +1671,16 @@ class HyperCEZLearner(EfficientZeroLearner):
         live_ez = join_live_ez(
             shared=self.train_state["shared"],
             projections=self.train_state["projections"],
-            frozen_ez=self.frozen_ez,
+            base=self.train_state["base"],
             hnet_components=self.config.hnet_components,
         )
+        # Keep learner / world-model W0 snapshots aligned with trainable base.
+        self.frozen_ez = rebuild_frozen_ez(
+            base=self.train_state["base"],
+            template_ez=self.frozen_ez,
+            hnet_components=self.config.hnet_components,
+        )
+        self.world_model.frozen_ez = self.frozen_ez
         self.world_model.hnet_params = self.train_state["hnets"]
         self.world_model.alphas = self.train_state["alphas"]
         self.world_model.live_ez = live_ez
@@ -1646,6 +1697,44 @@ class HyperCEZLearner(EfficientZeroLearner):
         if isinstance(self.planner, EfficientZeroPlanner):
             self.planner.self_play_params = self._self_play_params
             self.planner.params = self.params
+
+    def checkpoint_state(self) -> dict[str, Any]:
+        """Structured HyperCEZ learner state for multi-file checkpoints."""
+        from algorl.backends.jax.learners.hypercez.checkpoint import (
+            hypercez_checkpoint_state,
+        )
+
+        return {
+            "meta": {
+                "train_steps": int(self._train_steps),
+                "task_train_steps": int(self._task_train_steps),
+                "task_id": int(self.task_id),
+                "obs_running_count": int(self._obs_running_count),
+                "ema_task_loss": self._ema_task_loss,
+                "ema_reg_loss": self._ema_reg_loss,
+            },
+            "data": hypercez_checkpoint_state(self),
+        }
+
+    def load_checkpoint_state(self, state: dict[str, Any]) -> None:
+        """Restore from :meth:`checkpoint_state`."""
+        from algorl.backends.jax.learners.hypercez.checkpoint import (
+            apply_hypercez_learner_state,
+        )
+
+        apply_hypercez_learner_state(self, meta=state["meta"], data=state["data"])
+
+    def save(self, directory: str | Path) -> None:
+        """Persist HyperCEZ train state, opts, CL snapshots, and RNGs."""
+        from algorl.backends.jax.learners.hypercez.checkpoint import save_hypercez_learner
+
+        save_hypercez_learner(self, directory)
+
+    def load(self, directory: str | Path) -> None:
+        """Restore HyperCEZ learner state written by :meth:`save`."""
+        from algorl.backends.jax.learners.hypercez.checkpoint import load_hypercez_learner
+
+        load_hypercez_learner(self, directory)
 
 
 def build_hyper_cez_learner(context: ComponentContext) -> HyperCEZLearner:

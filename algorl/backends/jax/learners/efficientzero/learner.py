@@ -3,9 +3,10 @@
 from __future__ import annotations
 
 import copy
+from collections.abc import Callable
 from dataclasses import dataclass
 from functools import partial
-from collections.abc import Callable
+from pathlib import Path
 from typing import Any
 
 import jax
@@ -755,6 +756,48 @@ class EfficientZeroLearner(Learner):
         self.world_model.params = self.params
         if isinstance(self.planner, EfficientZeroPlanner):
             self.planner.params = self.params
+
+    def checkpoint_state(self) -> dict[str, Any]:
+        """Structured learner state for multi-file checkpoints."""
+        from algorl.backends.jax.learners.efficientzero.checkpoint import (
+            efficient_zero_checkpoint_state,
+        )
+
+        return {
+            "meta": {
+                "train_steps": int(self._train_steps),
+                "obs_running_count": int(self._obs_running_count),
+            },
+            "data": efficient_zero_checkpoint_state(self),
+        }
+
+    def load_checkpoint_state(self, state: dict[str, Any]) -> None:
+        """Restore from :meth:`checkpoint_state` (in-memory helper)."""
+        from algorl.backends.jax.learners.efficientzero.checkpoint import (
+            apply_efficient_zero_learner_state,
+        )
+
+        apply_efficient_zero_learner_state(
+            self,
+            meta=state["meta"],
+            data=state["data"],
+        )
+
+    def save(self, directory: str | Path) -> None:
+        """Persist learner weights, optimizer state, and RNGs to ``directory``."""
+        from algorl.backends.jax.learners.efficientzero.checkpoint import (
+            save_efficient_zero_learner,
+        )
+
+        save_efficient_zero_learner(self, directory)
+
+    def load(self, directory: str | Path) -> None:
+        """Restore learner state written by :meth:`save`."""
+        from algorl.backends.jax.learners.efficientzero.checkpoint import (
+            load_efficient_zero_learner,
+        )
+
+        load_efficient_zero_learner(self, directory)
 
 
 def _prepare_training_batch(

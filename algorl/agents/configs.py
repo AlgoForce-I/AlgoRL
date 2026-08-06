@@ -18,7 +18,19 @@ class BaseAgentConfig:
     gradient_steps_per_rollout: int | None = None
     burst_compile_steps: int | None = None
     checkpoint_freq: int | None = None
+    # Directory for multi-file run checkpoints (periodic, boundary, best/).
+    checkpoint_dir: str | None = None
+    checkpoint_at_task_boundary: bool = True
+    checkpoint_keep_last: int | None = None
+    # When True, keep ``{checkpoint_dir}/best/`` for the highest return so far.
+    autosave_best: bool = False
+    autosave_best_metric: str = "mean_episode_return"
+    autosave_best_window: int = 10
+    autosave_best_min_step: int = 0
     jax_rollout_chunk: int = 64
+    # Log host RAM + device VRAM scalars to TensorBoard every N env steps (0=off).
+    # Also forced once after each post-rollout gradient burst (captures train peaks).
+    memory_log_interval: int = 1_000
     require_implemented: bool = True
 
     def with_overrides(self, **overrides: object) -> BaseAgentConfig:
@@ -376,9 +388,11 @@ class HyperCEZConfig(EfficientZeroConfig):
     # Unit-scale residual cap so ΔW stays on the same order as EZ weight updates
     # (α_max=0.2 forced hypernet outputs ~5× larger for the same ΔW_eff).
     alpha_max: float = 1.0
-    # Open the residual path; zero-init hnet heads keep W(0)=W0.
+    # Open residual path; pair with tiny head_init_std (not exact-zero heads).
     alpha_init: float = 2.0
     emb_init_std: float = 1.0
+    # Exact-zero heads + open α → first Adam step applies a huge residual.
+    head_init_std: float = 1e-3
     no_look_ahead: bool = False
     dt_scale: float = 1.0
     use_sgd_change: bool = False
@@ -388,6 +402,10 @@ class HyperCEZConfig(EfficientZeroConfig):
     # Continual-learning schedule / retention knobs
     steps_per_task: int | None = None  # per-task LR warm/decay horizon
     scale_hyper_lr: bool = False  # False: hypernet/α keep full lr_hyper
+    # True: W0 (generated base) stays frozen. False: optimize W0 slowly with
+    # lr_W0 = lr_hyper / lr_main_to_lr_hyper_ratio (task-shared backbone).
+    frozen_base_weights: bool = True
+    lr_main_to_lr_hyper_ratio: float = 50.0
     warm_start_alpha: bool = True  # α_t ← α_{t-1} at task boundary
     snapshot_shared_per_task: bool = True  # snapshot LN / obs-norm per task
     use_per_task_reg_scaling: bool = False  # off: dynamic β is enough; inv-EMA fights retention
