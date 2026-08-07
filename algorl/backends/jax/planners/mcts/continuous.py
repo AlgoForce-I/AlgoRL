@@ -37,11 +37,6 @@ RecurrentStepFn = Callable[
 ]
 
 
-# ---------------------------------------------------------------------------
-# Config, state, and results
-# ---------------------------------------------------------------------------
-
-
 @dataclass(frozen=True)
 class ContinuousSearchConfig:
     """Continuous candidate-set MCTS settings."""
@@ -85,7 +80,6 @@ class ContinuousSearchExtraData:
     visit_num_for_next_phase: Array
     used_visit_num: Array
 
-
 jax.tree_util.register_dataclass(
     ContinuousSearchState,
     data_fields=["latent_state", "candidates", "depth"],
@@ -121,7 +115,6 @@ class ContinuousSearchResult:
     search_tree: ContinuousMCTSTree
     root_candidates: Array
 
-
 jax.tree_util.register_dataclass(
     ContinuousSearchResult,
     data_fields=[
@@ -143,11 +136,6 @@ SimulationStepFn = Callable[
     [Array, tuple[ContinuousSearchParams, Array, ContinuousMCTSTree, ContinuousSearchExtraData]],
     tuple[ContinuousSearchParams, Array, ContinuousMCTSTree, ContinuousSearchExtraData],
 ]
-
-
-# ---------------------------------------------------------------------------
-# World-model bindings (eager helpers for tests and debugging)
-# ---------------------------------------------------------------------------
 
 
 class SupportsRecurrentStep(Protocol):
@@ -186,11 +174,6 @@ def initial_step_fn_from_world_model(world_model: SupportsRecurrentStep) -> Init
         return world_model.initial_step(observation, training=False)
 
     return step
-
-
-# ---------------------------------------------------------------------------
-# Candidate sampling and root construction
-# ---------------------------------------------------------------------------
 
 
 def _squashed_normal_log_prob(mean: Array, std: Array, actions: Array) -> Array:
@@ -391,11 +374,6 @@ def _build_continuous_roots_batch(
         embedding=_to_recurrent_embedding(embedding),
     )
     return root, candidates, extra_data
-
-
-# ---------------------------------------------------------------------------
-# MCTX adapters (fully traceable)
-# ---------------------------------------------------------------------------
 
 
 class ModelContinuousRecurrentFn(RecurrentFn):
@@ -652,11 +630,6 @@ def _recurrent_output(
     )
 
 
-# ---------------------------------------------------------------------------
-# Search loop
-# ---------------------------------------------------------------------------
-
-
 def _simulation_body(
     *,
     params: ContinuousSearchParams,
@@ -858,18 +831,8 @@ def _run_continuous_search_impl(
     )
 
 
-# ---------------------------------------------------------------------------
-# Embedding helpers
-# ---------------------------------------------------------------------------
-
-
 def _to_recurrent_embedding(state: ContinuousSearchState) -> RecurrentState:
     return state  # type: ignore[return-value]
-
-
-# ---------------------------------------------------------------------------
-# EfficientZero-V2 selection and Q transforms
-# ---------------------------------------------------------------------------
 
 
 def _initial_extra_data(
@@ -1192,11 +1155,6 @@ def _select_root_actions(
     """Pick chosen root actions from ``[B, num_actions, action_dim]`` candidates."""
     batch_indices = jnp.arange(action_indices.shape[0])
     return root_candidates[batch_indices, action_indices]
-
-
-# ---------------------------------------------------------------------------
-# Tree accessors (unbatched MCTX simulate slices)
-# ---------------------------------------------------------------------------
 
 
 def _tree_gather_node_values(tree: ContinuousMCTSTree, node_indices: Array) -> Array:

@@ -133,6 +133,7 @@ def test_learn_rejects_structural_overrides() -> None:
         learning_starts=10_000,
         mcts_simulations=2,
         reanalyze_ratio=0.0,
+        head_init_std=1e-3,
     )
     agent = HyperCEZ(env, config=config)
     with pytest.raises(ValueError, match="hnet_arch"):

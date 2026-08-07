@@ -111,10 +111,7 @@ def continuous_policy_loss(
     entropy_rng: jax.Array | None = None,
     entropy_samples: int = 1024,
 ) -> tuple[jnp.ndarray, jnp.ndarray]:
-    """Squashed-Gaussian policy loss (Eq. 6 full pi or Eq. 7 simple pi).
-
-    Squashed-Gaussian policy loss (full pi for 1-D actions, simple pi otherwise).
-    """
+    """Squashed-Gaussian policy loss (Eq. 6 full pi or Eq. 7 simple pi)."""
     action_dim = policy.shape[-1] // 2
     mean = policy[..., :action_dim]
     std = policy[..., action_dim:]

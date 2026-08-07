@@ -30,7 +30,7 @@ from algorl.core.learner import Learner
 from algorl.core.planner import BatchedPlanner, Planner
 from algorl.core.replay_buffer import ReplayBuffer
 from algorl.core.types import Action, Observation, Transition
-from algorl.envs.jax_env import JaxRolloutBatch, PolicyFn, RolloutStepCallback
+from algorl.envs.jax_env import JaxRolloutBatch, PolicyFn
 from algorl.envs.training_env import TrainingEnv
 
 
@@ -776,7 +776,7 @@ class TrainingLoop:
         )
 
     def _maybe_checkpoint(self, step: int, metrics: dict[str, Any]) -> None:
-        del metrics  # reserved for future metric-tagged snapshots
+        del metrics
         freq = getattr(self.config, "checkpoint_freq", None)
         if (
             self._checkpoint_dir is not None

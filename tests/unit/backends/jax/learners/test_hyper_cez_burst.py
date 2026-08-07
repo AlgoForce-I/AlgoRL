@@ -45,6 +45,7 @@ def burst_context() -> ComponentContext:
         lr_warm_up=0.0,
         self_play_update_interval=1,
         reanalyze_update_interval=1,
+        head_init_std=1e-3,
     )
     context = ComponentContext(
         backend=get_backend("jax"),

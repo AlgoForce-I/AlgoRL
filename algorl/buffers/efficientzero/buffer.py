@@ -454,7 +454,6 @@ class EfficientZeroReplayBuffer(ReplayBuffer):
 
             chunk = traj_steps[step_idx : step_idx + ext_window]
 
-            # --- extended observation / reward context (zero-padded past data) ---
             obs_rows = [step.observation.astype(np.float32) for step in chunk]
             has_terminal_obs = False
             if (
@@ -483,7 +482,6 @@ class EfficientZeroReplayBuffer(ReplayBuffer):
             valid_lengths.append(valid_len)
             bootstrap_limits.append(bootstrap_limit)
 
-            # --- training window tensors (zero-padded past trajectory end) ---
             window_chunk = chunk[:window]
             n_window = len(window_chunk)
 

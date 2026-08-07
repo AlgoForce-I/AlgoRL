@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import copy
+
 import gymnasium as gym
 import jax.numpy as jnp
 import numpy as np
@@ -51,6 +52,7 @@ def learner_context(cartpole_training_env: TrainingEnv) -> ComponentContext:
         burst_compile_steps=1,
         gradient_steps_per_rollout=1,
         lr_warm_up=0.0,
+        head_init_std=1e-3,
     )
     context = ComponentContext(
         backend=get_backend("jax"),
@@ -98,6 +100,7 @@ def test_compose_hypercez_agent(cartpole_training_env: TrainingEnv) -> None:
         hnet_arch=(32, 32),
         mcts_simulations=2,
         reanalyze_ratio=0.0,
+        head_init_std=1e-3,
     )
     agent = HyperCEZ(cartpole_training_env, config=config)
     assert isinstance(agent.world_model, HyperCEZWorldModel)
@@ -163,6 +166,7 @@ def test_unfrozen_base_weights_update_slowly(
         frozen_base_weights=False,
         lr_hyper=3e-4,
         lr_main_to_lr_hyper_ratio=50.0,
+        head_init_std=1e-3,
     )
     context = ComponentContext(
         backend=get_backend("jax"),
@@ -313,9 +317,3 @@ def _leaves(tree):
     import jax
 
     return jax.tree_util.tree_leaves(tree)
-
-
-def jax_tree_clone(tree):
-    import copy
-
-    return copy.deepcopy(tree)

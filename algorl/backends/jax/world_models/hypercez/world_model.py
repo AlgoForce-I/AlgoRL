@@ -78,8 +78,7 @@ class HyperCEZWorldModel(EfficientZeroWorldModel):
             self.hnet_modules[component_name] = module
             self.hnet_params[component_name] = init_hypernetwork_params(module, subkey)
 
-        # One distinct array per (task, component) so donate_argnums on the
-        # train-state pytree does not see aliased leaves.
+        # Distinct arrays per (task, component) — avoid aliased α leaves.
         for task_id in range(self.config.num_tasks):
             self.alphas[task_id] = {
                 component_name: jnp.asarray(

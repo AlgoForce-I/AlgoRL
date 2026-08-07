@@ -2,10 +2,7 @@
 
 from __future__ import annotations
 
-from unittest import mock
-
 import numpy as np
-import pytest
 
 from algorl.backends.jax.learners.efficientzero.reanalyze import reanalyze_fused_policy_batches
 from algorl.backends.jax.planners.efficientzero import EfficientZeroBatchedResult

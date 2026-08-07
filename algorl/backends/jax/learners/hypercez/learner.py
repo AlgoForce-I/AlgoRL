@@ -1241,8 +1241,7 @@ class HyperCEZLearner(EfficientZeroLearner):
             )
         if new_task_id > 0 and self.config.warm_start_alpha and finished_task >= 0:
             prev_alphas = self.train_state["alphas"][finished_task]
-            # Copy so new-task α leaves are not aliased with the previous task
-            # (donate_argnums rejects duplicate buffers in the train-state tree).
+            # Copy so new-task α leaves are not aliased with the previous task.
             warmed = {
                 component: jnp.array(prev_alphas[component], copy=True)
                 for component in self.config.hnet_components

@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import gymnasium as gym
-import jax
 import jax.numpy as jnp
 import pytest
 

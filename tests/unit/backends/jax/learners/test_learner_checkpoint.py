@@ -6,7 +6,6 @@ from pathlib import Path
 
 import gymnasium as gym
 import jax
-import jax.numpy as jnp
 import numpy as np
 import pytest
 
@@ -100,6 +99,7 @@ def hyper_context() -> ComponentContext:
         emb_size=8,
         hnet_arch=(32, 32),
         burst_compile_steps=1,
+        head_init_std=1e-3,
     )
     context = ComponentContext(backend=get_backend("jax"), config=config, env=env)
     context.world_model = build_hyper_cez_world_model(context)

@@ -9,7 +9,6 @@ from pathlib import Path
 from typing import Any
 
 import jax
-import numpy as np
 
 from algorl.common.checkpoints.atomic import commit_staging_dir, prepare_staging_dir
 from algorl.common.checkpoints.manifest import (

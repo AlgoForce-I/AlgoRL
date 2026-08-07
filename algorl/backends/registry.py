@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING, Callable, Type
+from typing import TYPE_CHECKING, Type
 
 if TYPE_CHECKING:
     from algorl.core.backend import Backend

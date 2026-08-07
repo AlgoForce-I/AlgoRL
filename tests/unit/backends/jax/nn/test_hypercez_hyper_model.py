@@ -105,7 +105,6 @@ def test_unchunked_head_outputs_are_scaled_by_inv_sqrt_hidden(
     # than an unscaled estimate: ‖out‖ should be O(head_std * ‖h‖ / sqrt(H)).
     assert all(jnp.isfinite(leaf).all() for leaf in out32)
     scale = 1.0 / (hidden[-1] ** 0.5)
-    # Sanity: scale constant used in module matches expectation.
     assert abs(scale - 1.0 / (32 ** 0.5)) < 1e-9
     del module16
 

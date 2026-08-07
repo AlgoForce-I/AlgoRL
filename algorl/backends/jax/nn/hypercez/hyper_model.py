@@ -137,7 +137,6 @@ class ChunkedHyperNetwork(nn.Module):
             task_emb[None, :],
             (self.num_chunks, self.emb_size),
         )
-        # Batch over chunks with shared Dense weights (HyperCL-style).
         h = jnp.concatenate([task_tiled, chunk_embeddings], axis=-1)
         for index, width in enumerate(self.hidden_dims):
             h = nn.Dense(width, name=f"hidden_{index}")(h)
