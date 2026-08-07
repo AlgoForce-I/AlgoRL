@@ -13,7 +13,7 @@ class TqdmProgressBar:
         self._kwargs = kwargs
         self._bar: Any | None = None
 
-    def start(self, total: int, **kwargs: Any) -> None:
+    def start(self, total: int, *, initial: int = 0, **kwargs: Any) -> None:
         from tqdm import tqdm
 
         merged = {
@@ -23,7 +23,9 @@ class TqdmProgressBar:
             **self._kwargs,
             **kwargs,
         }
-        self._bar = tqdm(total=total, desc=self._desc, **merged)
+        start_at = max(0, min(int(initial), int(total)))
+        merged.pop("initial", None)
+        self._bar = tqdm(total=total, desc=self._desc, **merged, initial=start_at)
 
     def update(self, step_info: dict[str, Any] | None = None, *, n: int = 1) -> None:
         if self._bar is None:

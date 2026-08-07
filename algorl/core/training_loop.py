@@ -117,7 +117,7 @@ class TrainingLoop:
             self._checkpoint_dir = checkpoint_path
         self._progress_bar = progress_bar
         if progress_bar is not None:
-            progress_bar.start(total_timesteps)
+            progress_bar.start(total_timesteps, initial=max(0, int(start_step)))
         try:
             if self.env.is_batched:
                 self._run_batched(
@@ -183,6 +183,7 @@ class TrainingLoop:
                 if callable(clear_buffer):
                     clear_buffer()
                 self._min_train_step = step + 1 + self.config.learning_starts
+                self._reset_autosave_best_for_new_task()
                 self._maybe_boundary_checkpoint(step, metrics)
 
             if done:
@@ -327,6 +328,7 @@ class TrainingLoop:
             clear_buffer()
         boundary_step = chunk_start_step + boundary + 1
         self._min_train_step = boundary_step + self.config.learning_starts
+        self._reset_autosave_best_for_new_task()
         self._maybe_boundary_checkpoint(boundary_step, {})
         return transitions[boundary + 1:], boundary + 1
 
@@ -805,6 +807,22 @@ class TrainingLoop:
             extra_meta={"buffer_cleared": True, "finished_task": finished},
         )
 
+    def _reset_autosave_best_for_new_task(self) -> None:
+        """Clear the global best bar so each CL task can claim its own best."""
+        if not getattr(self.config, "autosave_best_per_task", False):
+            return
+        self._best_score = float("-inf")
+        self._recent_returns = []
+
+    def _autosave_best_target(self) -> tuple[str, str]:
+        """Return ``(tag, subdirectory)`` for the next autosave-best write."""
+        if getattr(self.config, "autosave_best_per_task", False):
+            task_id = getattr(self.learner, "task_id", self._env_current_task_index())
+            if task_id is not None:
+                name = f"best_task_{int(task_id)}"
+                return name, name
+        return "best", "best"
+
     def _maybe_autosave_best(
         self,
         step: int,
@@ -832,23 +850,30 @@ class TrainingLoop:
         if score <= self._best_score:
             return
         self._best_score = score
+        tag, subdirectory = self._autosave_best_target()
         self._write_run_checkpoint(
             step,
-            tag="best",
-            subdirectory="best",
+            tag=tag,
+            subdirectory=subdirectory,
             extra_meta={
                 "best_score": score,
                 "best_metric": metric_name,
                 "best_window": window,
             },
         )
+        score_name = (
+            f"{subdirectory}_score.json"
+            if subdirectory != "best"
+            else "best_score.json"
+        )
         write_json(
-            Path(self._checkpoint_dir) / "best_score.json",
+            Path(self._checkpoint_dir) / score_name,
             {
                 "best_score": score,
                 "best_step": int(step),
                 "metric": metric_name,
                 "window": window,
+                "subdirectory": subdirectory,
             },
         )
 

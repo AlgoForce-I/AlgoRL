@@ -24,6 +24,9 @@ class BaseAgentConfig:
     checkpoint_keep_last: int | None = None
     # When True, keep ``{checkpoint_dir}/best/`` for the highest return so far.
     autosave_best: bool = False
+    # When True with autosave_best, reset the score bar at each task boundary and
+    # write ``{checkpoint_dir}/best_task_{k}/`` (multitask / CL only; no-op without boundaries).
+    autosave_best_per_task: bool = False
     autosave_best_metric: str = "mean_episode_return"
     autosave_best_window: int = 10
     autosave_best_min_step: int = 0

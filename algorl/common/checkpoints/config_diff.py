@@ -33,6 +33,7 @@ RESUME_ALLOWLIST: frozenset[str] = frozenset(
         "checkpoint_at_task_boundary",
         "checkpoint_keep_last",
         "autosave_best",
+        "autosave_best_per_task",
         "autosave_best_metric",
         "autosave_best_window",
         "autosave_best_min_step",
