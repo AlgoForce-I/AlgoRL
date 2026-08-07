@@ -29,7 +29,6 @@ from algorl.backends.jax.planners.mcts.continuous import (
     make_continuous_recurrent_fn,
     make_jitted_continuous_search,
     make_model_continuous_recurrent_fn,
-    recurrent_step_fn_from_world_model,
     run_continuous_search,
     sample_actions,
 )

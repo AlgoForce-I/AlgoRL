@@ -20,11 +20,6 @@ ObservationBatch = Observation | jnp.ndarray | np.ndarray | list[Observation]
 InvalidActionsMask = jnp.ndarray | None
 
 
-# ---------------------------------------------------------------------------
-# Recurrent dynamics (MCTX)
-# ---------------------------------------------------------------------------
-
-
 class RecurrentFn(ABC):
     """Object-oriented dynamics object for MCTX tree expansion.
 
@@ -55,11 +50,6 @@ class RecurrentFn(ABC):
         embedding: Any,
     ) -> tuple[mctx.RecurrentFnOutput, Any]:
         """Run one batched expansion step used inside MCTS."""
-
-
-# ---------------------------------------------------------------------------
-# Config and results
-# ---------------------------------------------------------------------------
 
 
 @dataclass(frozen=True)
@@ -145,11 +135,6 @@ class _SearchOptions:
         )
 
 
-# ---------------------------------------------------------------------------
-# Batch helpers
-# ---------------------------------------------------------------------------
-
-
 def normalize_observation_batch(observations: ObservationBatch) -> NormalizedObservationBatch:
     """Normalize single, list, or pre-stacked observations into one batch object."""
     if isinstance(observations, list):
@@ -227,11 +212,6 @@ def validate_root_batch(root: mctx.RootFnOutput) -> int:
     return batch_size
 
 
-# ---------------------------------------------------------------------------
-# Search entry points
-# ---------------------------------------------------------------------------
-
-
 def run_muzero_search(
     *,
     params: Any,
@@ -261,11 +241,6 @@ def run_muzero_search(
         max_depth=max_depth,
     )
     return _policy_output_to_batched_result(policy_output)
-
-
-# ---------------------------------------------------------------------------
-# Planner base class
-# ---------------------------------------------------------------------------
 
 
 class BaseMCTSPlanner(BatchedPlanner):
@@ -358,11 +333,6 @@ class BaseMCTSPlanner(BatchedPlanner):
         if config.use_gumbel:
             updates["gumbel_scale"] = 0.0
         return replace(config, **updates)
-
-
-# ---------------------------------------------------------------------------
-# Internal helpers
-# ---------------------------------------------------------------------------
 
 
 def _run_mctx_policy(

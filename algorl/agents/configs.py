@@ -18,7 +18,19 @@ class BaseAgentConfig:
     gradient_steps_per_rollout: int | None = None
     burst_compile_steps: int | None = None
     checkpoint_freq: int | None = None
+    # Directory for multi-file run checkpoints (periodic, boundary, best/).
+    checkpoint_dir: str | None = None
+    checkpoint_at_task_boundary: bool = True
+    checkpoint_keep_last: int | None = None
+    # When True, keep ``{checkpoint_dir}/best/`` for the highest return so far.
+    autosave_best: bool = False
+    autosave_best_metric: str = "mean_episode_return"
+    autosave_best_window: int = 10
+    autosave_best_min_step: int = 0
     jax_rollout_chunk: int = 64
+    # Log host RAM + device VRAM scalars to TensorBoard every N env steps (0=off).
+    # Also forced once after each post-rollout gradient burst (captures train peaks).
+    memory_log_interval: int = 1_000
     require_implemented: bool = True
 
     def with_overrides(self, **overrides: object) -> BaseAgentConfig:
@@ -354,17 +366,33 @@ DEFAULT_HYPERCEZ_HNET_COMPONENTS: tuple[str, ...] = (
 class HyperCEZConfig(EfficientZeroConfig):
     """HyperCEZDelta on top of EfficientZero.
 
-    Task-conditioned hypernetworks emit weight deltas for selected EZ
-    components; LayerNorm / obs-norm stats and projection nets stay shared.
-    Continual-learning fields (``beta``, lookahead, …) are consumed by the
-    HyperCEZ learner once registered.
+    Defaults match the CW10 continual-learning recipe used by
+    ``example_hypercez.py``. Task-conditioned hypernetworks emit weight
+    deltas for selected EZ components; LayerNorm / obs-norm stats and
+    projection nets stay shared.
 
     ``hnet_type`` selects unchunked (one head per weight tensor; default) or
     chunked HyperCL-style generators (``chunk_dim`` / ``cemb_size``).
     """
 
+    # EZ training knobs (re-applied in presets: ``for_dmc_state`` overrides some).
+    use_bn: bool = True
+    lr_warm_up: float = 0.01
+    clip_inference_values: bool = True
+    change_temperature: bool = False
+    reward_support_range: tuple[float, float] = (-10.0, 10.0)
+    discount: float = 0.99
+    value_support_range: tuple[float, float] = (-1000.0, 1000.0)
+    mcts_simulations: int = 64
+    max_num_considered_actions: int | None = 16
+    entropy_coeff: float = 0.1
+    std_magnification: float = 4.0
+    schedule_horizon: str = "fixed"
+    lr_decay_steps: int = 300_000
+    lr_decay_rate: float = 0.5
+
     hnet_components: tuple[str, ...] = DEFAULT_HYPERCEZ_HNET_COMPONENTS
-    hnet_arch: tuple[int, ...] = (100, 100)
+    hnet_arch: tuple[int, ...] = (128, 128)
     hnet_type: str = "unchunked"
     chunk_dim: int = 2000
     cemb_size: int = 20
@@ -372,25 +400,96 @@ class HyperCEZConfig(EfficientZeroConfig):
     emb_size: int = 10
     num_tasks: int = 10
     lr_hyper: float = 3e-4
-    beta: float = 1.0
-    alpha_max: float = 0.2
-    alpha_init: float = 1e-3
+    beta: float = 0.5
+    # Unit-scale residual cap so ΔW stays on the same order as EZ weight updates
+    # (α_max=0.2 forced hypernet outputs ~5× larger for the same ΔW_eff).
+    alpha_max: float = 1.0
+    # Open residual path; unchunked heads scale by 1/sqrt(H) at init.
+    alpha_init: float = 2.0
     emb_init_std: float = 1.0
+    # Identity residual at step 0; pair with unchunked 1/sqrt(H) head scale.
+    head_init_std: float = 0.0
     no_look_ahead: bool = False
     dt_scale: float = 1.0
     use_sgd_change: bool = False
     plastic_prev_tembs: bool = False
     ewc_weight_importance: bool = False
     hnet_grad_max_norm: float = 5.0
-    # Continual-learning schedule / retention knobs
-    steps_per_task: int | None = None  # per-task LR warm/decay horizon
+    steps_per_task: int | None = 1_000_000  # per-task schedule / LR horizon
     scale_hyper_lr: bool = False  # False: hypernet/α keep full lr_hyper
+    # True: W0 (generated base) stays frozen. False: optimize W0 slowly with
+    # lr_W0 = lr_hyper / lr_main_to_lr_hyper_ratio (task-shared backbone).
+    frozen_base_weights: bool = True
+    lr_main_to_lr_hyper_ratio: float = 50.0
     warm_start_alpha: bool = True  # α_t ← α_{t-1} at task boundary
     snapshot_shared_per_task: bool = True  # snapshot LN / obs-norm per task
     use_per_task_reg_scaling: bool = False  # off: dynamic β is enough; inv-EMA fights retention
     reg_scaling_min: float = 0.25
     reg_scaling_max: float = 4.0
     retention_log_interval: int = 500  # log fix-target drift; 0 disables
+
+    @classmethod
+    def _cw_training_overrides(cls) -> dict[str, object]:
+        """CW10-style EZ knobs (parent presets may overwrite dataclass defaults)."""
+        return {
+            "use_bn": True,
+            "lr_warm_up": 0.01,
+            "clip_inference_values": True,
+            "change_temperature": False,
+            "reward_support_range": (-10.0, 10.0),
+            "discount": 0.99,
+            "value_support_range": (-1000.0, 1000.0),
+            "mcts_simulations": 64,
+            "max_num_considered_actions": 16,
+            "entropy_coeff": 0.1,
+            "std_magnification": 4.0,
+            "schedule_horizon": "fixed",
+            "lr_decay_steps": 300_000,
+            "lr_decay_rate": 0.5,
+        }
+
+    @classmethod
+    def for_sequential(cls, **overrides: object) -> HyperCEZConfig:
+        """Single-env HyperCEZ with CW10 training defaults."""
+        config = super().for_sequential().with_overrides(**cls._cw_training_overrides())
+        return config.with_overrides(**overrides) if overrides else config
+
+    @classmethod
+    def for_batched(
+        cls,
+        *,
+        num_envs: int,
+        **overrides: object,
+    ) -> HyperCEZConfig:
+        """Batched HyperCEZ with CW10 defaults and a per-task mix/TD schedule.
+
+        Schedule horizons are derived from ``steps_per_task`` (default 1M),
+        matching task-0 EfficientZero rather than the full multi-task run.
+        ``lr_decay_*`` stay fixed afterward.
+        """
+        steps_per_task = int(overrides.get("steps_per_task", 1_000_000))
+        cw = {
+            key: value
+            for key, value in cls._cw_training_overrides().items()
+            if key not in {"schedule_horizon", "lr_decay_steps", "lr_decay_rate"}
+        }
+        config = (
+            super()
+            .for_batched(num_envs=num_envs)
+            .with_overrides(
+                **cw,
+                # Resolve mix/TD against the per-task horizon while horizon is auto.
+                schedule_horizon="auto",
+                steps_per_task=steps_per_task,
+            )
+            .with_schedule_for_run(steps_per_task, num_envs=num_envs)
+            .with_overrides(
+                schedule_horizon="fixed",
+                lr_decay_steps=300_000,
+                lr_decay_rate=0.5,
+            )
+        )
+        return config.with_overrides(**overrides) if overrides else config
 
 
 @dataclass(frozen=True)

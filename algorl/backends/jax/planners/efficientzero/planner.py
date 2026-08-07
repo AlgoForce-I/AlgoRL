@@ -359,7 +359,6 @@ def build_efficient_zero_planner(context: ComponentContext) -> EfficientZeroPlan
             from algorl.backends.jax.planners import _StubPlanner
 
             return _StubPlanner("mcts", context)
-        # Caller requested stubs to be rejected; fail fast.
         raise TypeError(
             "EfficientZeroPlanner requires EfficientZeroConfig, "
             f"got {type(context.config)!r}."

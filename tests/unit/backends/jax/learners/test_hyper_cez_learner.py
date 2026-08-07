@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import copy
+
 import gymnasium as gym
 import jax.numpy as jnp
 import numpy as np
@@ -51,6 +52,7 @@ def learner_context(cartpole_training_env: TrainingEnv) -> ComponentContext:
         burst_compile_steps=1,
         gradient_steps_per_rollout=1,
         lr_warm_up=0.0,
+        head_init_std=1e-3,
     )
     context = ComponentContext(
         backend=get_backend("jax"),
@@ -98,6 +100,7 @@ def test_compose_hypercez_agent(cartpole_training_env: TrainingEnv) -> None:
         hnet_arch=(32, 32),
         mcts_simulations=2,
         reanalyze_ratio=0.0,
+        head_init_std=1e-3,
     )
     agent = HyperCEZ(cartpole_training_env, config=config)
     assert isinstance(agent.world_model, HyperCEZWorldModel)
@@ -123,18 +126,78 @@ def test_train_step_updates_hnets_and_syncs_world_model(
     before_theta = np.array(
         learner.train_state["hnets"]["dynamics_model"]["hidden_0"]["kernel"]
     )
+    before_base = np.array(
+        learner.train_state["base"]["dynamics_model"]["Dense_0"]["kernel"]
+    )
     metrics = learner.train_step(buffer, skip_reanalyze=True)
     after_shared = learner.train_state["shared"]["representation_model"]["LayerNorm_0"]["scale"]
     after_emb = learner.train_state["hnets"]["dynamics_model"]["task_embeddings"][0]
     after_theta = learner.train_state["hnets"]["dynamics_model"]["hidden_0"]["kernel"]
+    after_base = learner.train_state["base"]["dynamics_model"]["Dense_0"]["kernel"]
 
     assert "loss" in metrics
     assert np.isfinite(metrics["loss"])
     assert float(np.max(np.abs(np.asarray(before_shared) - np.asarray(after_shared)))) > 0.0
     assert float(np.max(np.abs(before_emb - np.asarray(after_emb)))) > 0.0
     assert float(np.max(np.abs(before_theta - np.asarray(after_theta)))) > 0.0
+    # Default frozen_base_weights=True ⇒ W0 must not move.
+    assert float(np.max(np.abs(before_base - np.asarray(after_base)))) == 0.0
     assert learner.world_model.params is not None
     assert learner.world_model.task_id == 0
+
+
+def test_unfrozen_base_weights_update_slowly(
+    cartpole_training_env: TrainingEnv,
+) -> None:
+    config = HyperCEZConfig.for_dmc_state(
+        batch_size=2,
+        unroll_steps=2,
+        trajectory_size=4,
+        learning_starts=0,
+        mcts_simulations=2,
+        reanalyze_ratio=0.0,
+        use_priority=False,
+        num_tasks=3,
+        emb_size=8,
+        hnet_arch=(32, 32),
+        burst_compile_steps=1,
+        gradient_steps_per_rollout=1,
+        lr_warm_up=0.0,
+        frozen_base_weights=False,
+        lr_hyper=3e-4,
+        lr_main_to_lr_hyper_ratio=50.0,
+        head_init_std=1e-3,
+    )
+    context = ComponentContext(
+        backend=get_backend("jax"),
+        config=config,
+        env=cartpole_training_env,
+    )
+    context.world_model = build_hyper_cez_world_model(context)
+    context.planner = build_efficient_zero_planner(context)
+    learner = build_hyper_cez_learner(context)
+    assert learner.config.frozen_base_weights is False
+    assert np.isclose(learner._base_learning_rate(), 3e-4 / 50.0)
+
+    buffer = EfficientZeroReplayBuffer(
+        capacity=100,
+        config=config,
+        unroll_steps=config.unroll_steps,
+        trajectory_size=config.trajectory_size,
+    )
+    _fill_buffer(buffer)
+
+    before_base = np.array(
+        learner.train_state["base"]["dynamics_model"]["Dense_0"]["kernel"]
+    )
+    learner.train_step(buffer, skip_reanalyze=True)
+    after_base = np.array(
+        learner.train_state["base"]["dynamics_model"]["Dense_0"]["kernel"]
+    )
+    assert float(np.max(np.abs(before_base - after_base))) > 0.0
+    # World-model W0 snapshot tracks the trainable base.
+    wm_gen = learner.world_model.frozen_ez["dynamics_model"]["Dense_0"]["kernel"]
+    assert np.allclose(np.asarray(wm_gen), after_base)
 
 
 def test_set_task_id_switches_materialization(learner_context: ComponentContext) -> None:
@@ -254,9 +317,3 @@ def _leaves(tree):
     import jax
 
     return jax.tree_util.tree_leaves(tree)
-
-
-def jax_tree_clone(tree):
-    import copy
-
-    return copy.deepcopy(tree)

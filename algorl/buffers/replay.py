@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from collections import deque
+from pathlib import Path
 from typing import Deque
 
 from algorl.core.replay_buffer import ReplayBuffer
@@ -32,3 +33,15 @@ class UniformReplayBuffer(ReplayBuffer):
 
     def __len__(self) -> int:
         return len(self._storage)
+
+    def save(self, directory: str | Path) -> None:
+        """Persist transitions to a directory (no pickle)."""
+        from algorl.buffers.uniform_checkpoint import save_uniform_buffer
+
+        save_uniform_buffer(self, directory)
+
+    def load(self, directory: str | Path) -> None:
+        """Restore transitions from :meth:`save` into this instance."""
+        from algorl.buffers.uniform_checkpoint import load_uniform_buffer
+
+        load_uniform_buffer(self, directory)

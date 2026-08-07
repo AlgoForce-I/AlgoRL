@@ -28,7 +28,12 @@ def cartpole_training_env() -> TrainingEnv:
 
 @pytest.fixture
 def hypercez_world_model(cartpole_training_env: TrainingEnv) -> HyperCEZWorldModel:
-    config = HyperCEZConfig.for_dmc_state(num_tasks=3, emb_size=8, hnet_arch=(32, 32))
+    config = HyperCEZConfig.for_dmc_state(
+        num_tasks=3,
+        emb_size=8,
+        hnet_arch=(32, 32),
+        head_init_std=1e-3,
+    )
     context = ComponentContext(
         backend=get_backend("jax"),
         config=config,
@@ -128,6 +133,7 @@ def test_chunked_world_model_materializes(cartpole_training_env: TrainingEnv) ->
         hnet_type="chunked",
         chunk_dim=512,
         cemb_size=8,
+        head_init_std=1e-3,
     )
     context = ComponentContext(
         backend=get_backend("jax"),

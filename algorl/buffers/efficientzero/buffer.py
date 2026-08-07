@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from collections import deque
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Deque
 
 import numpy as np
@@ -278,6 +279,18 @@ class EfficientZeroReplayBuffer(ReplayBuffer):
         self._active.clear()
         self._pending_commit.clear()
 
+    def save(self, directory: str | Path) -> None:
+        """Persist stored and in-flight trajectories to a directory (no pickle)."""
+        from algorl.buffers.efficientzero.checkpoint import save_efficient_zero_buffer
+
+        save_efficient_zero_buffer(self, directory)
+
+    def load(self, directory: str | Path) -> None:
+        """Restore buffer contents from :meth:`save` into this instance."""
+        from algorl.buffers.efficientzero.checkpoint import load_efficient_zero_buffer
+
+        load_efficient_zero_buffer(self, directory)
+
     def update_priorities(self, indices: np.ndarray, priorities: np.ndarray) -> None:
         min_prior = float(self.config.min_prior)
         for index, priority in zip(indices.reshape(-1), priorities.reshape(-1), strict=True):
@@ -441,7 +454,6 @@ class EfficientZeroReplayBuffer(ReplayBuffer):
 
             chunk = traj_steps[step_idx : step_idx + ext_window]
 
-            # --- extended observation / reward context (zero-padded past data) ---
             obs_rows = [step.observation.astype(np.float32) for step in chunk]
             has_terminal_obs = False
             if (
@@ -470,7 +482,6 @@ class EfficientZeroReplayBuffer(ReplayBuffer):
             valid_lengths.append(valid_len)
             bootstrap_limits.append(bootstrap_limit)
 
-            # --- training window tensors (zero-padded past trajectory end) ---
             window_chunk = chunk[:window]
             n_window = len(window_chunk)
 

@@ -11,6 +11,7 @@ from algorl.backends.jax.nn.hypercez.shapes import merge_params, partition_param
 # {
 #   "hnets": {component: hnet_params},
 #   "alphas": {task_id: {component: scalar}},
+#   "base": {component: generated_W0_leaves},
 #   "shared": {component: shared_leaves},
 #   "projections": {component: full_params},
 # }
@@ -32,19 +33,47 @@ def split_live_for_train(
     return shared, projections
 
 
+def extract_base_generated(
+    ez_params: Params,
+    hnet_components: tuple[str, ...],
+) -> dict[str, Any]:
+    """Generated (W0) partition for each hypernet-wrapped component."""
+    return {
+        name: partition_params(ez_params[name])[0]
+        for name in hnet_components
+    }
+
+
 def join_live_ez(
     *,
     shared: dict[str, Any],
     projections: dict[str, Any],
-    frozen_ez: Params,
+    base: dict[str, Any],
     hnet_components: tuple[str, ...],
 ) -> Params:
     """Rebuild a full live EZ params tree for materialize / world-model sync."""
     live: dict[str, Any] = dict(projections)
     for name in hnet_components:
-        frozen_generated, _ = partition_params(frozen_ez[name])
-        live[name] = merge_params(frozen_generated, shared[name])
+        live[name] = merge_params(base[name], shared[name])
     return live
+
+
+def rebuild_frozen_ez(
+    *,
+    base: dict[str, Any],
+    template_ez: Params,
+    hnet_components: tuple[str, ...],
+) -> Params:
+    """Write updated W0 generated leaves into a full EZ params tree.
+
+    Shared leaves in ``template_ez`` are kept (materialize reads shared from
+    live state separately); only generated base weights are replaced.
+    """
+    out: dict[str, Any] = dict(template_ez)
+    for name in hnet_components:
+        _, shared = partition_params(template_ez[name])
+        out[name] = merge_params(base[name], shared)
+    return out
 
 
 def build_train_state(
@@ -53,11 +82,20 @@ def build_train_state(
     alphas: dict[int, dict[str, Any]],
     live_ez: Params,
     hnet_components: tuple[str, ...],
+    base_ez: Params | None = None,
 ) -> dict[str, Any]:
+    """Pack Optax train state.
+
+    ``base`` holds generated W0 leaves (from ``base_ez`` if given, else
+    ``live_ez``). When ``frozen_base_weights`` is True the learner still
+    stores ``base`` but applies ``optax.set_to_zero`` so it does not move.
+    """
     shared, projections = split_live_for_train(live_ez, hnet_components)
+    source = live_ez if base_ez is None else base_ez
     return {
         "hnets": hnet_params,
         "alphas": alphas,
+        "base": extract_base_generated(source, hnet_components),
         "shared": shared,
         "projections": projections,
     }

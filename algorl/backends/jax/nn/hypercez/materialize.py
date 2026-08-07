@@ -17,7 +17,7 @@ def materialize_delta_component(
     frozen_base: Any,
     shared_live: Any,
     alpha: jnp.ndarray | float,
-    alpha_max: float = 0.2,
+    alpha_max: float = 1.0,
 ) -> Any:
     """Build one component: ``W = W0_gen + alpha_max * tanh(alpha) * dW``.
 
@@ -43,7 +43,7 @@ def materialize_ez_params(
     live_ez: Mapping[str, Any],
     alphas: Mapping[str, jnp.ndarray | float],
     hnet_components: tuple[str, ...] = DEFAULT_HYPERCEZ_HNET_COMPONENTS,
-    alpha_max: float = 0.2,
+    alpha_max: float = 1.0,
 ) -> dict[str, Any]:
     """Build a full EfficientZero params dict for one task.
 

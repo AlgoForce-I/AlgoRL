@@ -41,10 +41,7 @@ def _emit_rollout_step(
 
 def _observation_shape_from_space(space: gym.Space) -> tuple[int, ...]:
     if isinstance(space, gym.spaces.Box):
-        shape = tuple(int(dim) for dim in space.shape)
-        if len(shape) == 1:
-            return shape
-        return shape
+        return tuple(int(dim) for dim in space.shape)
     if isinstance(space, gym.spaces.Discrete):
         return (int(space.n),)
     raise TypeError(f"Unsupported observation space type: {type(space)!r}")

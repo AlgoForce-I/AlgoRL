@@ -9,7 +9,6 @@ import numpy as np
 import numpy.typing as npt
 import jax.numpy as jnp
 
-# Gymnasium observations and actions are typically NumPy arrays or scalars.
 Observation: TypeAlias = npt.NDArray[Any] | Mapping[str, npt.NDArray[Any]] | int | float
 Action: TypeAlias = int | npt.NDArray[np.floating[Any]] | jnp.ndarray
 Reward: TypeAlias = float

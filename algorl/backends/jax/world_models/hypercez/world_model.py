@@ -68,6 +68,7 @@ class HyperCEZWorldModel(EfficientZeroWorldModel):
                 emb_size=self.config.emb_size,
                 num_tasks=self.config.num_tasks,
                 emb_init_std=self.config.emb_init_std,
+                head_init_std=self.config.head_init_std,
                 hnet_type=self.config.hnet_type,  # type: ignore[arg-type]
                 chunk_dim=self.config.chunk_dim,
                 cemb_size=self.config.cemb_size,
@@ -77,10 +78,12 @@ class HyperCEZWorldModel(EfficientZeroWorldModel):
             self.hnet_modules[component_name] = module
             self.hnet_params[component_name] = init_hypernetwork_params(module, subkey)
 
-        alpha_init = jnp.asarray(self.config.alpha_init, dtype=jnp.float32)
+        # Distinct arrays per (task, component) — avoid aliased α leaves.
         for task_id in range(self.config.num_tasks):
             self.alphas[task_id] = {
-                component_name: alpha_init
+                component_name: jnp.asarray(
+                    self.config.alpha_init, dtype=jnp.float32
+                )
                 for component_name in self.config.hnet_components
             }
 

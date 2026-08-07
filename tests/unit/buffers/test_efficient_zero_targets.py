@@ -7,7 +7,6 @@ from algorl.agents.configs import EfficientZeroConfig
 from algorl.buffers.efficientzero import (
     bootstrapped_values,
     extended_target_window,
-    gae_values,
     mix_value_targets,
     prepare_bootstrapped_batch_values,
     prepare_gae_batch_values,

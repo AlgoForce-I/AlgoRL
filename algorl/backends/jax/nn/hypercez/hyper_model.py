@@ -27,6 +27,9 @@ class HyperNetwork(nn.Module):
     emb_size: int = 10
     num_tasks: int = 10
     emb_init_std: float = 1.0
+    # Exact-zero heads + open α make the first Adam step apply a full-scale
+    # residual (policy collapse). Tiny Gaussian keeps W≈W0 but softens that jump.
+    head_init_std: float = 1e-3
 
     def setup(self) -> None:
         if not self.target_shapes:
@@ -35,6 +38,8 @@ class HyperNetwork(nn.Module):
             raise ValueError(f"num_tasks must be >= 1, got {self.num_tasks}.")
         if self.emb_size < 1:
             raise ValueError(f"emb_size must be >= 1, got {self.emb_size}.")
+        if self.head_init_std < 0.0:
+            raise ValueError(f"head_init_std must be >= 0, got {self.head_init_std}.")
 
     @nn.compact
     def __call__(self, task_id: int | jnp.ndarray) -> tuple[jnp.ndarray, ...]:
@@ -50,15 +55,28 @@ class HyperNetwork(nn.Module):
             h = nn.relu(h)
         h = nn.LayerNorm(name="trunk_norm")(h)
 
+        head_std = self.head_init_std
+        # Unchunked heads map a width-H trunk onto full weight tensors. After one
+        # Adam step, ΔW ≈ η‖h‖²·g_ΔW with ‖h‖²~H (LayerNorm), so without this
+        # scale the first update collapses the policy for large H (e.g. 128).
+        head_out_scale = jnp.asarray(
+            1.0 / math.sqrt(self.hidden_dims[-1]) if self.hidden_dims else 1.0,
+            dtype=jnp.float32,
+        )
         outputs: list[jnp.ndarray] = []
         for index, shape in enumerate(self.target_shapes):
             flat_size = math.prod(shape)
             flat = nn.Dense(
                 flat_size,
+                kernel_init=(
+                    nn.initializers.zeros
+                    if head_std == 0.0
+                    else nn.initializers.normal(stddev=head_std)
+                ),
                 bias_init=nn.initializers.zeros,
                 name=f"head_{index}",
             )(h)
-            outputs.append(jnp.reshape(flat, shape))
+            outputs.append(jnp.reshape(flat * head_out_scale, shape))
         return tuple(outputs)
 
 
@@ -78,6 +96,7 @@ class ChunkedHyperNetwork(nn.Module):
     chunk_dim: int = 2000
     cemb_size: int = 20
     cemb_init_std: float = 1.0
+    head_init_std: float = 1e-3
 
     def setup(self) -> None:
         if not self.target_shapes:
@@ -90,6 +109,8 @@ class ChunkedHyperNetwork(nn.Module):
             raise ValueError(f"chunk_dim must be >= 1, got {self.chunk_dim}.")
         if self.cemb_size < 1:
             raise ValueError(f"cemb_size must be >= 1, got {self.cemb_size}.")
+        if self.head_init_std < 0.0:
+            raise ValueError(f"head_init_std must be >= 0, got {self.head_init_std}.")
 
     @property
     def num_outputs(self) -> int:
@@ -116,14 +137,19 @@ class ChunkedHyperNetwork(nn.Module):
             task_emb[None, :],
             (self.num_chunks, self.emb_size),
         )
-        # Batch over chunks with shared Dense weights (HyperCL-style).
         h = jnp.concatenate([task_tiled, chunk_embeddings], axis=-1)
         for index, width in enumerate(self.hidden_dims):
             h = nn.Dense(width, name=f"hidden_{index}")(h)
             h = nn.relu(h)
         h = nn.LayerNorm(name="trunk_norm")(h)
+        head_std = self.head_init_std
         chunks = nn.Dense(
             self.chunk_dim,
+            kernel_init=(
+                nn.initializers.zeros
+                if head_std == 0.0
+                else nn.initializers.normal(stddev=head_std)
+            ),
             bias_init=nn.initializers.zeros,
             name="chunk_head",
         )(h)
@@ -145,6 +171,7 @@ def build_hypernetwork_for_component(
     emb_size: int = 10,
     num_tasks: int = 10,
     emb_init_std: float = 1.0,
+    head_init_std: float = 1e-3,
     hnet_type: Literal["unchunked", "chunked"] = "unchunked",
     chunk_dim: int = 2000,
     cemb_size: int = 20,
@@ -162,6 +189,7 @@ def build_hypernetwork_for_component(
             chunk_dim=chunk_dim,
             cemb_size=cemb_size,
             cemb_init_std=cemb_init_std,
+            head_init_std=head_init_std,
         )
     if hnet_type != "unchunked":
         raise ValueError(
@@ -173,6 +201,7 @@ def build_hypernetwork_for_component(
         emb_size=emb_size,
         num_tasks=num_tasks,
         emb_init_std=emb_init_std,
+        head_init_std=head_init_std,
     )
 
 
