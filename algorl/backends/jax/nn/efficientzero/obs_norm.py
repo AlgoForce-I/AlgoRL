@@ -7,6 +7,19 @@ from typing import Any
 import jax.numpy as jnp
 import numpy as np
 
+# Welford count is a scalar JIT carry, not a Flax parameter. int32 overflows at
+# 2^31 (two CW tasks at batch 256 × unroll 6). JAX defaults to 32-bit dtypes, so
+# the carry is float32: it cannot wrap to a negative count. Precision eventually
+# freezes the stats instead of destroying them; HyperCEZ also resets the counter
+# at each task boundary.
+OBS_RUNNING_COUNT_DTYPE = jnp.float32
+INITIAL_OBS_RUNNING_COUNT = 1000
+
+
+def as_obs_running_count(count: jnp.ndarray | int | float | np.integer) -> jnp.ndarray:
+    """Cast the Welford observation counter to the JIT carry dtype."""
+    return jnp.asarray(count, dtype=OBS_RUNNING_COUNT_DTYPE)
+
 
 def _observation_batch_matrix(observations: np.ndarray) -> np.ndarray:
     if observations.ndim == 3:
@@ -123,7 +136,7 @@ def _merge_obs_stats_jax(
     count: jnp.ndarray,
     flat: jnp.ndarray,
 ) -> tuple[jnp.ndarray, jnp.ndarray, jnp.ndarray]:
-    batch_count = jnp.int32(flat.shape[0])
+    batch_count = jnp.asarray(flat.shape[0], dtype=count.dtype)
     batch_mean = jnp.mean(flat, axis=0)
     batch_var = jnp.var(flat, axis=0)
 
@@ -151,7 +164,7 @@ def compute_tentative_obs_stats_jax(
     flat = _observation_batch_matrix_jax(observations)
     mean = jnp.asarray(rep_params["running_mean"], dtype=jnp.float32)
     var = jnp.asarray(rep_params["running_var"], dtype=jnp.float32)
-    count_i = jnp.asarray(count, dtype=jnp.int32)
+    count_i = as_obs_running_count(count)
     return _merge_obs_stats_jax(mean, var, count_i, flat)
 
 

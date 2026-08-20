@@ -29,6 +29,8 @@ from algorl.buffers.efficientzero.targets import (
     prepare_gae_batch_values,
 )
 from algorl.backends.jax.nn.efficientzero.obs_norm import (
+    INITIAL_OBS_RUNNING_COUNT,
+    as_obs_running_count,
     with_representation_obs_stats,
     compute_tentative_obs_stats_jax,
 )
@@ -322,7 +324,7 @@ def _extract_obs_running_count(params: Params) -> int:
     rep = params.get("representation_model", {})
     count = rep.get("running_count")
     if count is None:
-        return 1000
+        return INITIAL_OBS_RUNNING_COUNT
     return int(np.asarray(count, dtype=np.int64))
 
 
@@ -447,7 +449,7 @@ class EfficientZeroLearner(Learner):
         self.params, self._opt_state, self._obs_running_count, metrics = self._update(
             self.params,
             self._opt_state,
-            jnp.asarray(self._obs_running_count, dtype=jnp.int32),
+            as_obs_running_count(self._obs_running_count),
             arrays,
             step_key,
             jnp.asarray(self._learning_rate_scale(), dtype=jnp.float32),
@@ -628,7 +630,7 @@ class EfficientZeroLearner(Learner):
         self.params, self._opt_state, self._obs_running_count, burst_metrics = self._burst_update(
             self.params,
             self._opt_state,
-            jnp.asarray(self._obs_running_count, dtype=jnp.int32),
+            as_obs_running_count(self._obs_running_count),
             stacked_batch,
             step_keys,
             lr_scales,
@@ -675,7 +677,7 @@ class EfficientZeroLearner(Learner):
         _, _, _, _ = self._burst_update(
             self.params,
             self._opt_state,
-            jnp.asarray(self._obs_running_count, dtype=jnp.int32),
+            as_obs_running_count(self._obs_running_count),
             stacked_batch,
             step_keys,
             lr_scales,

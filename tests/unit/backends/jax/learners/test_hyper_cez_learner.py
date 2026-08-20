@@ -3,8 +3,10 @@
 from __future__ import annotations
 
 import copy
+from unittest import mock
 
 import gymnasium as gym
+import jax
 import jax.numpy as jnp
 import numpy as np
 import pytest
@@ -13,6 +15,8 @@ from algorl.agents.configs import HyperCEZConfig
 from algorl.agents.search.hyper_cez import HyperCEZ
 from algorl.backends.jax.factory import JAXComponentFactory
 from algorl.backends.jax.learners.hypercez import HyperCEZLearner, build_hyper_cez_learner
+from algorl.backends.jax.learners.hypercez.learner import _clip_tree_by_global_norm
+from algorl.backends.jax.nn.efficientzero.obs_norm import INITIAL_OBS_RUNNING_COUNT
 from algorl.backends.jax.planners.efficientzero import build_efficient_zero_planner
 from algorl.backends.jax.world_models.hypercez import (
     HyperCEZWorldModel,
@@ -296,6 +300,75 @@ def test_train_step_no_look_ahead_skips_dtheta_metric(
     metrics = learner.train_step(buffer, skip_reanalyze=True)
     assert "reg_loss" in metrics
     assert metrics.get("dtheta_norm", 0.0) == 0.0
+
+
+def test_on_task_boundary_resets_live_obs_norm_and_keeps_snapshot(
+    learner_context: ComponentContext,
+) -> None:
+    learner = build_hyper_cez_learner(learner_context)
+    shared = dict(learner.train_state["shared"])
+    rep = dict(shared["representation_model"])
+    poisoned_var = jnp.zeros_like(rep["running_var"])
+    poisoned_mean = jnp.ones_like(rep["running_mean"])
+    rep["running_var"] = poisoned_var
+    rep["running_mean"] = poisoned_mean
+    shared["representation_model"] = rep
+    learner.train_state = {**learner.train_state, "shared": shared}
+    learner._obs_running_count = 1_827_406_824
+
+    learner.on_task_boundary(1)
+
+    live_rep = learner.train_state["shared"]["representation_model"]
+    np.testing.assert_allclose(np.asarray(live_rep["running_mean"]), 0.0)
+    np.testing.assert_allclose(np.asarray(live_rep["running_var"]), 1.0)
+    assert learner._obs_running_count == INITIAL_OBS_RUNNING_COUNT
+    snapped = learner._shared_snapshots[0]["representation_model"]
+    np.testing.assert_allclose(np.asarray(snapped["running_mean"]), 1.0)
+    np.testing.assert_allclose(np.asarray(snapped["running_var"]), 0.0)
+
+
+def test_non_finite_loss_does_not_update_hnets_via_reg(
+    learner_context: ComponentContext,
+) -> None:
+    learner = build_hyper_cez_learner(learner_context)
+    learner.on_task_boundary(1)
+    buffer = EfficientZeroReplayBuffer(
+        capacity=100,
+        config=learner_context.config,
+        unroll_steps=learner_context.config.unroll_steps,
+        trajectory_size=learner_context.config.trajectory_size,
+    )
+    _fill_buffer(buffer)
+    hnets_before = copy.deepcopy(jax.tree.map(np.asarray, learner.train_state["hnets"]))
+
+    with mock.patch(
+        "algorl.backends.jax.learners.hypercez.learner._loss_from_batch",
+        return_value=(
+            jnp.asarray(float("nan"), dtype=jnp.float32),
+            {"priorities": jnp.full((2,), float("nan"), dtype=jnp.float32)},
+        ),
+    ):
+        learner._recompile_train_kernels()
+        metrics = learner.train_step(buffer, skip_reanalyze=True)
+
+    assert not np.isfinite(metrics["loss"])
+    hnets_after = jax.tree.map(np.asarray, learner.train_state["hnets"])
+    assert all(
+        np.allclose(before, after)
+        for before, after in zip(
+            jax.tree.leaves(hnets_before),
+            jax.tree.leaves(hnets_after),
+            strict=True,
+        )
+    )
+
+
+def test_lookahead_clip_zeros_non_finite_grads() -> None:
+    clipped = _clip_tree_by_global_norm(
+        {"g": jnp.asarray([jnp.inf, jnp.nan, 1.0], dtype=jnp.float32)},
+        5.0,
+    )
+    assert np.all(np.isfinite(np.asarray(clipped["g"])))
 
 
 def calc_fix_target_reg_from_learner(learner: HyperCEZLearner) -> float:

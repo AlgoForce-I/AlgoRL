@@ -40,6 +40,8 @@ from algorl.backends.jax.learners.hypercez.train_state import (
 from algorl.backends.jax.nn.efficientzero.model import EfficientZero as EfficientZeroNetwork
 from algorl.backends.jax.nn.efficientzero.model import Params
 from algorl.backends.jax.nn.efficientzero.obs_norm import (
+    INITIAL_OBS_RUNNING_COUNT,
+    as_obs_running_count,
     compute_tentative_obs_stats_jax,
     with_representation_obs_stats,
 )
@@ -170,9 +172,15 @@ def _clip_tree_by_global_norm(tree: Any, max_norm: float, *, safe_max: float = 1
     leaves = jax.tree_util.tree_leaves(tree)
     if not leaves:
         return tree
-    global_norm = optax.tree.norm(tree)
+    # ``0 * Inf`` is NaN; zero non-finite grads before the scale so a skipped
+    # non-finite task loss cannot poison lookahead / fix-target.
+    finite = jax.tree.map(
+        lambda leaf: jnp.nan_to_num(leaf, nan=0.0, posinf=0.0, neginf=0.0),
+        tree,
+    )
+    global_norm = optax.tree.norm(finite)
     scale = jnp.minimum(1.0, max_norm / (global_norm + 1e-6))
-    clipped = jax.tree.map(lambda leaf: leaf * scale, tree)
+    clipped = jax.tree.map(lambda leaf: leaf * scale, finite)
     return jax.tree.map(
         lambda leaf: jnp.clip(leaf, -safe_max, safe_max),
         clipped,
@@ -648,111 +656,155 @@ def _hypercez_full_train_step(
             ema_reg_per_task,
         )
 
-    task_theta_grads = _theta_grads_for_lookahead(
-        hnet_grads,
-        hnet_components=config.hnet_components,
-        task_id=task_id,
-        plastic_prev_tembs=config.plastic_prev_tembs,
-    )
-    if config.no_look_ahead:
-        dtheta = jax.tree.map(jnp.zeros_like, task_theta_grads)
-        dtheta_for_reg = None
-    else:
-        dtheta = calc_delta_theta(
-            train_state["hnets"],
-            task_theta_grads,
-            optimizer=reg_optimizer,
-            opt_state=reg_hnet_opt_state,
-            lr_hyper=config.lr_hyper,
-            dt_scale=config.dt_scale,
-            max_norm=config.hnet_grad_max_norm,
-            use_sgd_change=config.use_sgd_change,
-        )
-        dtheta_for_reg = dtheta
-
-    # Provisional beta from previous EMA (avoids a second reg forward).
-    beta_eff = jnp.where(
-        ema_reg_loss <= 0.0,
-        jnp.asarray(config.beta, dtype=jnp.float32),
-        jnp.minimum(
-            jnp.asarray(config.beta, dtype=jnp.float32)
-            * (ema_task_loss / (ema_reg_loss + 1e-8)),
-            jnp.asarray(config.beta * 1000.0, dtype=jnp.float32),
-        ),
-    )
-    (
-        new_hnets,
-        new_alphas,
-        reg_hnet_opt_state,
-        reg_alpha_opt_state,
-        reg_loss,
-        reg_loss_raw,
-        per_task_regs,
-    ) = _hypercez_reg_step(
-        train_state["hnets"],
-        train_state["alphas"],
-        alpha_grads,
-        task_theta_grads,
-        reg_targets,
-        dtheta_for_reg,
-        task_id,
-        beta_eff,
-        hyper_lr_scale,
-        reg_hnet_opt_state,
-        reg_alpha_opt_state,
-        ema_reg_per_task,
-        hnet_modules=hnet_modules,
-        hnet_components=config.hnet_components,
-        plastic_prev_tembs=config.plastic_prev_tembs,
-        use_per_task_reg_scaling=config.use_per_task_reg_scaling,
-        reg_scaling_min=config.reg_scaling_min,
-        reg_scaling_max=config.reg_scaling_max,
-        reg_optimizer=reg_optimizer,
-    )
-    ema_task_loss, ema_reg_loss, beta_logged = _update_reg_beta_ema(
-        ema_task_loss,
-        ema_reg_loss,
-        metrics["loss"],
-        reg_loss_raw,
-        config.beta,
-    )
-    ema_reg_per_task = update_per_task_reg_ema(
-        ema_reg_per_task,
-        per_task_regs,
-        task_id,
-        momentum=_EMA_MOMENTUM,
-    )
-    train_state = {**train_state, "hnets": new_hnets, "alphas": new_alphas}
-    if materialize_params:
-        params = materialize_from_train_state(
+    def skip_reg(
+        _: None,
+    ) -> tuple[
+        dict[str, Any],
+        optax.OptState,
+        optax.OptState,
+        optax.OptState,
+        jnp.ndarray,
+        Params,
+        dict[str, jnp.ndarray],
+        jnp.ndarray,
+        jnp.ndarray,
+        jnp.ndarray,
+    ]:
+        return (
             train_state,
+            opt_state,
+            reg_hnet_opt_state,
+            reg_alpha_opt_state,
+            obs_count,
+            params,
+            _with_cl_metric_placeholders(metrics),
+            ema_task_loss,
+            ema_reg_loss,
+            ema_reg_per_task,
+        )
+
+    def apply_reg(
+        _: None,
+    ) -> tuple[
+        dict[str, Any],
+        optax.OptState,
+        optax.OptState,
+        optax.OptState,
+        jnp.ndarray,
+        Params,
+        dict[str, jnp.ndarray],
+        jnp.ndarray,
+        jnp.ndarray,
+        jnp.ndarray,
+    ]:
+        task_theta_grads = _theta_grads_for_lookahead(
+            hnet_grads,
+            hnet_components=config.hnet_components,
+            task_id=task_id,
+            plastic_prev_tembs=config.plastic_prev_tembs,
+        )
+        if config.no_look_ahead:
+            dtheta = jax.tree.map(jnp.zeros_like, task_theta_grads)
+            dtheta_for_reg = None
+        else:
+            dtheta = calc_delta_theta(
+                train_state["hnets"],
+                task_theta_grads,
+                optimizer=reg_optimizer,
+                opt_state=reg_hnet_opt_state,
+                lr_hyper=config.lr_hyper,
+                dt_scale=config.dt_scale,
+                max_norm=config.hnet_grad_max_norm,
+                use_sgd_change=config.use_sgd_change,
+            )
+            dtheta_for_reg = dtheta
+
+        # Provisional beta from previous EMA (avoids a second reg forward).
+        beta_eff = jnp.where(
+            ema_reg_loss <= 0.0,
+            jnp.asarray(config.beta, dtype=jnp.float32),
+            jnp.minimum(
+                jnp.asarray(config.beta, dtype=jnp.float32)
+                * (ema_task_loss / (ema_reg_loss + 1e-8)),
+                jnp.asarray(config.beta * 1000.0, dtype=jnp.float32),
+            ),
+        )
+        (
+            new_hnets,
+            new_alphas,
+            new_reg_hnet_opt_state,
+            new_reg_alpha_opt_state,
+            reg_loss,
+            reg_loss_raw,
+            per_task_regs,
+        ) = _hypercez_reg_step(
+            train_state["hnets"],
+            train_state["alphas"],
+            alpha_grads,
+            task_theta_grads,
+            reg_targets,
+            dtheta_for_reg,
             task_id,
-            frozen_ez=frozen_ez,
+            beta_eff,
+            hyper_lr_scale,
+            reg_hnet_opt_state,
+            reg_alpha_opt_state,
+            ema_reg_per_task,
             hnet_modules=hnet_modules,
             hnet_components=config.hnet_components,
-            num_tasks=config.num_tasks,
-            alpha_max=config.alpha_max,
+            plastic_prev_tembs=config.plastic_prev_tembs,
+            use_per_task_reg_scaling=config.use_per_task_reg_scaling,
+            reg_scaling_min=config.reg_scaling_min,
+            reg_scaling_max=config.reg_scaling_max,
+            reg_optimizer=reg_optimizer,
         )
-    metrics = dict(metrics)
-    metrics["reg_loss"] = reg_loss
-    metrics["cl_beta"] = beta_logged
-    metrics["dtheta_norm"] = (
-        optax.tree.norm(dtheta)
-        if not config.no_look_ahead
-        else jnp.asarray(0.0, dtype=jnp.float32)
-    )
-    return (
-        train_state,
-        opt_state,
-        reg_hnet_opt_state,
-        reg_alpha_opt_state,
-        obs_count,
-        params,
-        metrics,
-        ema_task_loss,
-        ema_reg_loss,
-        ema_reg_per_task,
-    )
+        new_ema_task, new_ema_reg, beta_logged = _update_reg_beta_ema(
+            ema_task_loss,
+            ema_reg_loss,
+            metrics["loss"],
+            reg_loss_raw,
+            config.beta,
+        )
+        new_ema_reg_per_task = update_per_task_reg_ema(
+            ema_reg_per_task,
+            per_task_regs,
+            task_id,
+            momentum=_EMA_MOMENTUM,
+        )
+        new_state = {**train_state, "hnets": new_hnets, "alphas": new_alphas}
+        new_params = params
+        if materialize_params:
+            new_params = materialize_from_train_state(
+                new_state,
+                task_id,
+                frozen_ez=frozen_ez,
+                hnet_modules=hnet_modules,
+                hnet_components=config.hnet_components,
+                num_tasks=config.num_tasks,
+                alpha_max=config.alpha_max,
+            )
+        new_metrics = dict(metrics)
+        new_metrics["reg_loss"] = reg_loss
+        new_metrics["cl_beta"] = beta_logged
+        new_metrics["dtheta_norm"] = (
+            optax.tree.norm(dtheta)
+            if not config.no_look_ahead
+            else jnp.asarray(0.0, dtype=jnp.float32)
+        )
+        return (
+            new_state,
+            opt_state,
+            new_reg_hnet_opt_state,
+            new_reg_alpha_opt_state,
+            obs_count,
+            new_params,
+            new_metrics,
+            new_ema_task,
+            new_ema_reg,
+            new_ema_reg_per_task,
+        )
+
+    return jax.lax.cond(jnp.isfinite(metrics["loss"]), apply_reg, skip_reg, None)
 
 
 def _hypercez_burst_scan(
@@ -1239,6 +1291,7 @@ class HyperCEZLearner(EfficientZeroLearner):
             self._shared_snapshots[finished_task] = copy.deepcopy(
                 self.train_state["shared"]
             )
+        self._reset_live_obs_norm()
         if new_task_id > 0 and self.config.warm_start_alpha and finished_task >= 0:
             prev_alphas = self.train_state["alphas"][finished_task]
             # Copy so new-task α leaves are not aliased with the previous task.
@@ -1271,6 +1324,23 @@ class HyperCEZLearner(EfficientZeroLearner):
             self._recompile_train_kernels()
         if new_task_id > 0:
             self._sync_delayed_hnet_copies()
+        self._propagate_obs_norm_stats()
+
+    def _reset_live_obs_norm(self) -> None:
+        """Re-init Welford stats so a new task one-hot is not 316×-scaled.
+
+        Shared-leaf snapshots (taken just above) keep the finished task's stats
+        for retention eval. Live stats must not carry a huge frozen count or
+        zero-variance unused one-hot slots into the next task.
+        """
+        shared = dict(self.train_state["shared"])
+        rep = dict(shared["representation_model"])
+        mean = jnp.asarray(rep["running_mean"])
+        rep["running_mean"] = jnp.zeros_like(mean)
+        rep["running_var"] = jnp.ones_like(mean)
+        shared["representation_model"] = rep
+        self.train_state = {**self.train_state, "shared": shared}
+        self._obs_running_count = INITIAL_OBS_RUNNING_COUNT
 
     def set_task_id(self, task_id: int) -> None:
         """Switch the active task embedding used for materialize / rollouts."""
@@ -1340,7 +1410,7 @@ class HyperCEZLearner(EfficientZeroLearner):
             self._opt_state,
             self._reg_hnet_opt_state,
             self._reg_alpha_opt_state,
-            jnp.asarray(self._obs_running_count, dtype=jnp.int32),
+            as_obs_running_count(self._obs_running_count),
             arrays,
             step_key,
             main_lr_scale,
@@ -1522,7 +1592,7 @@ class HyperCEZLearner(EfficientZeroLearner):
             self._opt_state,
             self._reg_hnet_opt_state,
             self._reg_alpha_opt_state,
-            jnp.asarray(self._obs_running_count, dtype=jnp.int32),
+            as_obs_running_count(self._obs_running_count),
             self._ema_scalar(self._ema_task_loss),
             self._ema_scalar(self._ema_reg_loss),
             self._ema_reg_per_task,
@@ -1592,7 +1662,7 @@ class HyperCEZLearner(EfficientZeroLearner):
             self._opt_state,
             self._reg_hnet_opt_state,
             self._reg_alpha_opt_state,
-            jnp.asarray(self._obs_running_count, dtype=jnp.int32),
+            as_obs_running_count(self._obs_running_count),
             dummy_batch,
             warmup_key,
             lr_scale,
@@ -1625,7 +1695,7 @@ class HyperCEZLearner(EfficientZeroLearner):
             self._opt_state,
             self._reg_hnet_opt_state,
             self._reg_alpha_opt_state,
-            jnp.asarray(self._obs_running_count, dtype=jnp.int32),
+            as_obs_running_count(self._obs_running_count),
             self._ema_scalar(self._ema_task_loss),
             self._ema_scalar(self._ema_reg_loss),
             self._ema_reg_per_task,

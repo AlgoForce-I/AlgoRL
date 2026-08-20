@@ -13,7 +13,7 @@ NUM_ENVS = 32
 NUM_TASKS = 10
 STEPS_PER_TASK = 1_000_000
 TOTAL_TIMESTEPS = NUM_TASKS * STEPS_PER_TASK
-TENSORBOARD_LOG_DIR = "runs/cw10_hypercez_cl_unchuncked"
+TENSORBOARD_LOG_DIR = "/home/algoritmi/data/HyperCEZ_data/runs/cw10_hypercez_cl_unchuncked_fixes"
 CHECKPOINT_DIR = f"{TENSORBOARD_LOG_DIR}/checkpoints"
 # Set to e.g. f"{CHECKPOINT_DIR}/boundary_task_0" to continue after task 0.
 RESUME_FROM: str | None = None
