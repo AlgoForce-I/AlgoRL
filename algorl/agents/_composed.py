@@ -49,6 +49,8 @@ class ComposedAgent(Agent):
         tensorboard_log_dir = kwargs.pop("tensorboard_log_dir", None)
         progress_bar = kwargs.pop("progress_bar", None)
         progress_bar_kwargs = kwargs.pop("progress_bar_kwargs", None)
+        eval_period = kwargs.pop("eval_period", None)
+        eval_env_factory = kwargs.pop("eval_env_factory", None)
 
         if config_overrides:
             allowed, rejected = split_resume_overrides(dict(config_overrides))
@@ -114,6 +116,8 @@ class ComposedAgent(Agent):
             start_step=start_step,
             extra_step_info=kwargs or None,
             progress_bar=progress_bar,
+            eval_period=eval_period,
+            eval_env_factory=eval_env_factory,
         )
 
     def save(self, path: str) -> None:

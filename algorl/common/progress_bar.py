@@ -68,6 +68,8 @@ def _postfix_from_step_info(step_info: dict[str, Any] | None) -> dict[str, str]:
         "consistency_loss": "cons_loss",
         "train/episode_return": "ep_ret",
         "train/episode_success": "success",
+        "eval/mean_return": "eval_ret",
+        "eval/mean_success": "eval_suc",
     }
     postfix: dict[str, str] = {}
     phase = step_info.get("phase")
@@ -79,6 +81,12 @@ def _postfix_from_step_info(step_info: dict[str, Any] | None) -> dict[str, str]:
     train_burst = step_info.get("train_burst")
     if isinstance(train_burst, str) and train_burst:
         postfix["train"] = train_burst
+    eval_task = step_info.get("eval")
+    if isinstance(eval_task, str) and eval_task:
+        postfix["eval"] = eval_task
+    eval_step = step_info.get("eval_step")
+    if isinstance(eval_step, str) and eval_step:
+        postfix["eval_step"] = eval_step
     for key, label in labels.items():
         value = step_info.get(key)
         if isinstance(value, (int, float)) and not isinstance(value, bool):

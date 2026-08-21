@@ -36,13 +36,14 @@ def main() -> None:
     agent = arl.HyperCEZ(env, config=config)
     agent.learn(
         total_timesteps=TOTAL_TIMESTEPS,
+        eval_period=100_000,
         tensorboard_log_dir=TENSORBOARD_LOG_DIR,
         checkpoint_dir=CHECKPOINT_DIR,
         resume_from=RESUME_FROM,
         progress_bar=True,
         callbacks=HyperCEZRetentionCallback(
             agent.learner,
-            eval_every_steps=STEPS_PER_TASK // 10,
+            retention_every_steps=STEPS_PER_TASK // 10,
         ),
     )
 

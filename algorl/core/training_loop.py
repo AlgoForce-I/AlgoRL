@@ -75,6 +75,7 @@ class TrainingLoop:
         self._recent_returns: list[float] = []
         self._best_score = float("-inf")
         self._skip_initial_env_reset = False
+        self._evaluator = None
 
     def restore_run_checkpoint(self, directory: str | Path) -> dict[str, Any]:
         """Load learner/buffer/env/logger state from a multi-file checkpoint."""
@@ -108,6 +109,8 @@ class TrainingLoop:
         start_step: int = 0,
         extra_step_info: dict[str, Any] | None = None,
         progress_bar: TqdmProgressBar | None = None,
+        eval_period: int | None = None,
+        eval_env_factory: Any | None = None,
     ) -> None:
         """Interact with the environment and call ``learner.train_step`` on schedule."""
         if checkpoint_dir is not None:
@@ -116,8 +119,24 @@ class TrainingLoop:
             # Treat legacy path as a checkpoint directory root.
             self._checkpoint_dir = checkpoint_path
         self._progress_bar = progress_bar
+        self._evaluator = None
+        period = None if eval_period is None else int(eval_period)
+        if period is not None and period > 0:
+            from algorl.core.evaluation import PeriodicEvaluator
+
+            self._evaluator = PeriodicEvaluator(
+                period=period,
+                train_env=self.env,
+                planner=self.planner,
+                learner=self.learner,
+                logger=self.logger,
+                seed=int(self.config.seed),
+                start_step=start_step,
+                env_factory=eval_env_factory,
+            )
         if progress_bar is not None:
             progress_bar.start(total_timesteps, initial=max(0, int(start_step)))
+        completed_ok = False
         try:
             if self.env.is_batched:
                 self._run_batched(
@@ -126,14 +145,20 @@ class TrainingLoop:
                     extra_step_info=extra_step_info,
                     progress_bar=progress_bar,
                 )
-                return
-            self._run_sequential(
-                total_timesteps,
-                start_step=start_step,
-                extra_step_info=extra_step_info,
-                progress_bar=progress_bar,
-            )
+            else:
+                self._run_sequential(
+                    total_timesteps,
+                    start_step=start_step,
+                    extra_step_info=extra_step_info,
+                    progress_bar=progress_bar,
+                )
+            completed_ok = True
         finally:
+            if completed_ok:
+                self._maybe_eval(total_timesteps, total_timesteps, at_end=True)
+            if self._evaluator is not None:
+                self._evaluator.close()
+            self._evaluator = None
             self._progress_bar = None
             if progress_bar is not None:
                 progress_bar.close()
@@ -203,6 +228,7 @@ class TrainingLoop:
             self._maybe_checkpoint(step, metrics)
             if progress_bar is not None:
                 progress_bar.update(step_info)
+            self._maybe_eval(step + 1, total_timesteps)
 
     def _run_batched(
         self,
@@ -298,6 +324,7 @@ class TrainingLoop:
                     metrics,
                     progress_bar=progress_bar,
                 )
+            self._maybe_eval(steps_collected, total_timesteps)
 
     def _apply_task_boundary(
         self,
@@ -738,6 +765,23 @@ class TrainingLoop:
         self.logger.record(step, step_info)
         self._maybe_record_memory(step)
         return step_info
+
+    def _maybe_eval(
+        self,
+        completed_steps: int,
+        total_timesteps: int,
+        *,
+        at_end: bool = False,
+    ) -> None:
+        evaluator = getattr(self, "_evaluator", None)
+        if evaluator is None:
+            return
+        evaluator.maybe_run(
+            int(completed_steps),
+            total_timesteps=int(total_timesteps),
+            at_end=at_end,
+            progress_bar=self._progress_bar,
+        )
 
     def _loop_checkpoint_state(self, step: int) -> dict[str, Any]:
         task_id = getattr(self.learner, "task_id", self._env_current_task_index())

@@ -32,7 +32,7 @@ def main() -> None:
         progress_bar=True,
         callbacks=HyperCEZRetentionCallback(
             agent.learner,
-            eval_every_steps=STEPS_PER_TASK // 10,
+            retention_every_steps=STEPS_PER_TASK // 10,
         ),
     )
 
