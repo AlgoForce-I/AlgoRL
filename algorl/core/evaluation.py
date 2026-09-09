@@ -152,6 +152,7 @@ class PeriodicEvaluator:
         num_episodes: int = EVAL_EPISODES,
         env_factory: EvalEnvFactory | None = None,
         tasks: tuple[EvalTask, ...] | list[EvalTask] | None = None,
+        reuse_envs: bool = True,
     ) -> None:
         if period <= 0:
             raise ValueError(f"eval period must be > 0, got {period}.")
@@ -178,7 +179,12 @@ class PeriodicEvaluator:
                 )
         else:
             self.tasks = discover_eval_tasks(train_env)
+        self.reuse_envs = bool(reuse_envs)
         self._cached_envs: dict[str, EvalVectorEnv] = {}
+        # Continual World eval envs are built from a benchmark whose
+        # construction instantiates every MJX task model. Share the training
+        # env's benchmark (same goal pools) instead of building one per task.
+        self._cw_bench: Any | None = _cw_benchmark_from_train_env(train_env)
 
     def maybe_run(
         self,
@@ -212,7 +218,13 @@ class PeriodicEvaluator:
         return metrics
 
     def run(self, *, progress_bar: TqdmProgressBar | None = None) -> dict[str, float]:
-        """Evaluate every task; does not step the training env or write replay."""
+        """Evaluate every task against frozen learner weights.
+
+        Nothing here mutates the agent: the training env is never stepped, the
+        replay buffer is never written, learner task state is left untouched,
+        and the planner's ``last_result`` is restored on exit. Only read-only
+        materialized parameter snapshots are used for action selection.
+        """
         last_result = getattr(self.planner, "last_result", _MISSING)
         try:
             task_results: list[tuple[EvalTask, list[_EpisodeStats]]] = []
@@ -234,6 +246,7 @@ class PeriodicEvaluator:
             if callable(closer):
                 closer()
         self._cached_envs.clear()
+        self._cw_bench = None
 
     def _run_task(
         self,
@@ -243,6 +256,24 @@ class PeriodicEvaluator:
         progress_bar: TqdmProgressBar | None,
     ) -> list[_EpisodeStats]:
         eval_env = self._eval_env_for_task(task)
+        try:
+            return self._rollout_task(
+                task,
+                eval_env,
+                task_offset=task_offset,
+                progress_bar=progress_bar,
+            )
+        finally:
+            self._retire_eval_env(task, eval_env)
+
+    def _rollout_task(
+        self,
+        task: EvalTask,
+        eval_env: EvalVectorEnv,
+        *,
+        task_offset: int,
+        progress_bar: TqdmProgressBar | None,
+    ) -> list[_EpisodeStats]:
         params = _materialized_params(self.learner, task)
         seed = self.seed + 17_000 + 97 * self._eval_count + int(task.task_index or 0)
         observations = np.asarray(eval_env.reset(seed=seed), dtype=np.float32)
@@ -301,11 +332,8 @@ class PeriodicEvaluator:
                     success=float(successes[lane] >= 0.5) if bool(has_success[lane]) else None,
                 )
             )
-        if self._env_factory is None and task.kind != "gym":
-            closer = getattr(eval_env, "close", None)
-            if callable(closer):
-                closer()
-            self._cached_envs.pop(_cache_key(task), None)
+        # Drop the parameter snapshot before the next task materializes its own.
+        del params
         return episodes
 
     def _eval_env_for_task(self, task: EvalTask) -> EvalVectorEnv:
@@ -315,10 +343,51 @@ class PeriodicEvaluator:
         cached = self._cached_envs.get(key)
         if cached is not None:
             return cached
-        env = _make_eval_env(task, num_envs=self.num_episodes, seed=self.seed)
-        if task.kind == "gym":
+        env = _make_eval_env(
+            task,
+            num_envs=self.num_episodes,
+            seed=self.seed,
+            bench=self._cw_bench_for(task),
+        )
+        if self.reuse_envs or task.kind == "gym":
             self._cached_envs[key] = env
         return env
+
+    def _retire_eval_env(self, task: EvalTask, eval_env: EvalVectorEnv) -> None:
+        """Free per-episode device state, keeping the env itself reusable.
+
+        Rebuilding a Continual World eval env re-instantiates every MJX task
+        model on the GPU; doing that on each eval leaks device memory until
+        training OOMs. Cached envs are kept alive and only their simulation
+        state (and any stray planner search payload) is released.
+        """
+        if hasattr(self.planner, "last_result"):
+            self.planner.last_result = None
+        if self._env_factory is not None:
+            # Caller-provided envs keep their own lifecycle.
+            return
+        if _cache_key(task) in self._cached_envs:
+            release = getattr(eval_env, "release", None)
+            if callable(release):
+                release()
+            return
+        closer = getattr(eval_env, "close", None)
+        if callable(closer):
+            closer()
+
+    def _cw_bench_for(self, task: EvalTask) -> Any | None:
+        """Shared CW benchmark for eval env construction (built at most once)."""
+        if task.kind != "cw" or not task.benchmark:
+            return None
+        if self._cw_bench is None:
+            from MTCWorldMJX.cw_benchmarks import CWBenchmark
+
+            self._cw_bench = CWBenchmark(
+                task.benchmark,
+                config=task.cw_config,
+                seed=self.seed,
+            )
+        return self._cw_bench
 
 
 @dataclass(frozen=True)
@@ -416,7 +485,13 @@ def _eval_actions(
     return np.stack(actions, axis=0)
 
 
-def _make_eval_env(task: EvalTask, *, num_envs: int, seed: int) -> EvalVectorEnv:
+def _make_eval_env(
+    task: EvalTask,
+    *,
+    num_envs: int,
+    seed: int,
+    bench: Any | None = None,
+) -> EvalVectorEnv:
     if task.kind == "gym":
         if not task.env_id:
             raise TypeError("Gymnasium eval task is missing env_id.")
@@ -430,6 +505,7 @@ def _make_eval_env(task: EvalTask, *, num_envs: int, seed: int) -> EvalVectorEnv
             num_envs=num_envs,
             seed=seed,
             config=task.cw_config,
+            bench=bench,
         )
     if task.kind == "mtcworld":
         if not task.env_id:
@@ -512,6 +588,7 @@ class _MtcworldEvalEnv:
         num_envs: int,
         seed: int,
         config: Any = None,
+        bench: Any = None,
     ) -> _MtcworldEvalEnv:
         from algorl.backends.jax.envs.mtcworld_jax import MtcworldCWRolloutCollector
 
@@ -521,6 +598,7 @@ class _MtcworldEvalEnv:
             num_envs=num_envs,
             seed=seed + task_index,
             config=config,
+            bench=bench,
         )
         return cls(collector.jax_env, seed=seed)
 
@@ -580,11 +658,17 @@ class _MtcworldEvalEnv:
             infos.append(info)
         return observation, reward, done, infos
 
+    def release(self) -> None:
+        """Free the MJX simulation state; the model stays loaded for reuse."""
+        self._state = None
+
     def close(self) -> None:
+        self._state = None
         vector_env = getattr(self._adapter, "vector_env", None)
         closer = getattr(vector_env, "close", None)
         if callable(closer):
             closer()
+        self._adapter = None
 
 
 def _gym_vector_actions(actions: np.ndarray, *, action_space: Any, num_envs: int) -> np.ndarray:
@@ -617,6 +701,18 @@ def _env_objects(train_env: TrainingEnv) -> list[Any]:
         if isinstance(envs, (list, tuple)):
             stack.extend(envs)
     return ordered
+
+
+def _cw_benchmark_from_train_env(train_env: TrainingEnv) -> Any | None:
+    """Return the training env's ``CWBenchmark`` so eval can share goal pools."""
+    for obj in _env_objects(train_env):
+        for attr in ("benchmark", "_bench"):
+            bench = getattr(obj, attr, None)
+            if bench is None or isinstance(bench, str):
+                continue
+            if hasattr(bench, "task_names") and hasattr(bench, "tasks"):
+                return bench
+    return None
 
 
 def _gym_env_id(train_env: TrainingEnv) -> str | None:

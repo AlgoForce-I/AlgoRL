@@ -269,6 +269,98 @@ def test_periodic_evaluator_pulses_progress_bar() -> None:
     assert any("eval_step" in pulse for pulse in bar.pulses)
 
 
+class _ReleasableEvalEnv(_FakeEvalEnv):
+    def __init__(self) -> None:
+        super().__init__(episode_len=1)
+        self.release_calls = 0
+        self.close_calls = 0
+
+    def release(self) -> None:
+        self.release_calls += 1
+
+    def close(self) -> None:
+        self.close_calls += 1
+
+
+def _cw_train_env(benchmark: object | None = None) -> TrainingEnv:
+    class _CWRaw:
+        benchmark_name = "CW10"
+        num_tasks = 2
+        task_names = ("hammer-v3", "push-v3")
+        config = None
+
+    raw = _CWRaw()
+    if benchmark is not None:
+        raw.benchmark = benchmark
+    return TrainingEnv(
+        observation_space=gym.spaces.Box(low=-1.0, high=1.0, shape=(3,), dtype=np.float32),
+        action_space=gym.spaces.Box(low=-1.0, high=1.0, shape=(1,), dtype=np.float32),
+        raw=raw,
+    )
+
+
+def test_periodic_evaluator_builds_each_eval_env_once(monkeypatch) -> None:
+    built: list[EvalTask] = []
+    envs: dict[int, _ReleasableEvalEnv] = {}
+
+    def fake_make_eval_env(task: EvalTask, *, num_envs: int, seed: int, bench=None):
+        del num_envs, seed, bench
+        built.append(task)
+        env = _ReleasableEvalEnv()
+        envs[int(task.task_index or 0)] = env
+        return env
+
+    monkeypatch.setattr("algorl.core.evaluation._make_eval_env", fake_make_eval_env)
+    evaluator = PeriodicEvaluator(
+        period=5,
+        train_env=_cw_train_env(),
+        planner=_FakePlanner(),
+        learner=_NoOpLearner(),
+        logger=Logger(),
+        seed=0,
+    )
+
+    assert evaluator.maybe_run(5, total_timesteps=20) is not None
+    assert evaluator.maybe_run(10, total_timesteps=20) is not None
+
+    # Rebuilding a CW eval env reloads every MJX task model onto the device.
+    assert len(built) == 2
+    assert all(env.reset_calls == 2 for env in envs.values())
+    assert all(env.release_calls == 2 for env in envs.values())
+    assert all(env.close_calls == 0 for env in envs.values())
+
+    evaluator.close()
+    assert all(env.close_calls == 1 for env in envs.values())
+
+
+def test_periodic_evaluator_reuses_train_env_cw_benchmark(monkeypatch) -> None:
+    class _Bench:
+        task_names = ("hammer-v3", "push-v3")
+        tasks: list[object] = []
+        num_tasks = 2
+
+    bench = _Bench()
+    seen_benches: list[object] = []
+
+    def fake_make_eval_env(task: EvalTask, *, num_envs: int, seed: int, bench=None):
+        del task, num_envs, seed
+        seen_benches.append(bench)
+        return _ReleasableEvalEnv()
+
+    monkeypatch.setattr("algorl.core.evaluation._make_eval_env", fake_make_eval_env)
+    evaluator = PeriodicEvaluator(
+        period=5,
+        train_env=_cw_train_env(benchmark=bench),
+        planner=_FakePlanner(),
+        learner=_NoOpLearner(),
+        logger=Logger(),
+        seed=0,
+    )
+    evaluator.maybe_run(5, total_timesteps=20)
+
+    assert seen_benches == [bench, bench]
+
+
 class _SequentialPlanner(Planner):
     def __init__(self) -> None:
         self.calls = 0

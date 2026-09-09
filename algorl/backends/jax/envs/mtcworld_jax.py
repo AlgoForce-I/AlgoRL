@@ -271,6 +271,10 @@ def _build_cw_vector_jax_env(
         vector_env=vector_env,
         seed=seed,
         config=config,
+        # Reuse the benchmark we already built: constructing a CWBenchmark
+        # instantiates every MJX task model, so a second one just to read
+        # ``num_tasks`` doubles the device allocations for each env build.
+        num_tasks=resolved_bench.num_tasks,
     )
     if not isinstance(adapter, VectorJaxEnv):
         raise TypeError(f"Expected VectorJaxEnv, got {type(adapter)!r}.")
@@ -327,6 +331,11 @@ class BatchedContinualLearningJaxEnv:
             bench=self._bench,
             autoreset=False,
         )
+
+    @property
+    def benchmark(self) -> Any:
+        """The shared ``CWBenchmark`` (goal pools); reused by evaluation."""
+        return self._bench
 
     @property
     def observation_shape(self) -> tuple[int, ...]:
@@ -390,6 +399,9 @@ class BatchedContinualLearningJaxEnv:
 
     def _advance_task(self, key: jnp.ndarray) -> JaxState:
         self._seq_idx += 1
+        # Release the finished task's MJX model and its last stored state before
+        # allocating the next task's, so the two never coexist on the device.
+        self._state = None
         del self._vector_env
         self._vector_env = self._make_task_vector_env(self._seq_idx)
         key, reset_key = jax.random.split(key)
@@ -691,17 +703,26 @@ def as_mtcworld_jax_env_from_spec(
     seed: int = 0,
     config: Any | None = None,
     steps_per_task: int | None = None,
+    num_tasks: int | None = None,
 ) -> JaxEnv | BatchedJaxEnv:
-    """Build a native MTCWorld object and return its JAX adapter."""
+    """Build a native MTCWorld object and return its JAX adapter.
+
+    ``num_tasks`` lets callers that already hold a ``CWBenchmark`` skip building
+    another one (each build instantiates every MJX task model on device).
+    """
     mtc = require_mtcworld()
 
     if vector_env is not None:
         if benchmark is not None and task_index is not None:
-            bench = mtc.CWBenchmark(benchmark, config=config, seed=seed)
+            resolved_num_tasks = num_tasks
+            if resolved_num_tasks is None:
+                resolved_num_tasks = mtc.CWBenchmark(
+                    benchmark, config=config, seed=seed
+                ).num_tasks
             return VectorJaxEnv(
                 vector_env,
                 task_index=task_index,
-                num_tasks=bench.num_tasks,
+                num_tasks=int(resolved_num_tasks),
                 append_one_hot=True,
             )
         return VectorJaxEnv(vector_env)
@@ -787,6 +808,7 @@ class MtcworldCWRolloutCollector(MtcworldRolloutCollector):
         num_envs: int = 8,
         seed: int = 0,
         config: Any | None = None,
+        bench: Any | None = None,
     ) -> None:
         adapter = _build_cw_vector_jax_env(
             benchmark,
@@ -794,6 +816,7 @@ class MtcworldCWRolloutCollector(MtcworldRolloutCollector):
             num_envs=num_envs,
             seed=seed,
             config=config,
+            bench=bench,
         )
         self.benchmark_name = benchmark
         self.task_index = task_index
