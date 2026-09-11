@@ -41,9 +41,11 @@ def main() -> None:
 
     key = jax.random.PRNGKey(0)
     state = env.reset(key)
-    for _ in range(5):
-        state = env.step(state, jnp.zeros((NUM_ENVS, 4), dtype=jnp.float32))
-    report("train env stepped")
+    for block in range(6):
+        for _ in range(50):
+            state = env.step(state, jnp.zeros((NUM_ENVS, 4), dtype=jnp.float32))
+        jax.block_until_ready(state.obs)
+        report(f"stepped {(block + 1) * 50:4d} steps")
 
     bench = env.benchmark
     eval_envs = []

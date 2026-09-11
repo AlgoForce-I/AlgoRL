@@ -2,8 +2,9 @@ from __future__ import annotations
 
 from algorl.backends.jax.memory import configure_jax_gpu_memory
 
-# MJX/warp allocates outside the JAX pool; keep device memory free for it.
-configure_jax_gpu_memory(preallocate=False, memory_fraction=0.85, reserve_gb=6.0)
+# MJX/warp allocates outside the JAX pool, on every physics step, and is the
+# first thing to fail when XLA's pool grows. See example_hypercez.py.
+configure_jax_gpu_memory(preallocate=False, memory_fraction=0.85, reserve_gb=14.0)
 
 import algorl as arl
 from algorl.backends.jax.envs import make_batched_cw_train_env

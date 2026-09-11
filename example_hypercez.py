@@ -2,8 +2,11 @@ from __future__ import annotations
 
 from algorl.backends.jax.memory import configure_jax_gpu_memory
 
-# MJX/warp allocates outside the JAX pool; keep device memory free for it.
-configure_jax_gpu_memory(preallocate=False, memory_fraction=0.85, reserve_gb=6.0)
+# MJX/warp allocates outside the JAX pool, on every physics step, and is the
+# first thing to fail when XLA's pool grows. XLA retains everything it ever
+# claims, so cap it well above its measured peak (~9 GB in-use over 2M steps)
+# rather than near the card's size.
+configure_jax_gpu_memory(preallocate=False, memory_fraction=0.85, reserve_gb=14.0)
 
 import algorl as arl
 from algorl.backends.jax.envs import make_batched_cw_train_env
@@ -16,7 +19,7 @@ STEPS_PER_TASK = 1_000_000
 TOTAL_TIMESTEPS = NUM_TASKS * STEPS_PER_TASK
 TENSORBOARD_LOG_DIR = "/home/algoritmi/data/HyperCEZ_data/runs/cw10_hypercez_cl_unchuncked_fixes"
 CHECKPOINT_DIR = f"{TENSORBOARD_LOG_DIR}/checkpoints"
-RESUME_FROM: str | None = None
+RESUME_FROM: str | None = f"{CHECKPOINT_DIR}/boundary_task_1"
 
 
 def main() -> None:
