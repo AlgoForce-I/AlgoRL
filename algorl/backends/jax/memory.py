@@ -15,6 +15,8 @@ import subprocess
 import sys
 from typing import Any
 
+from algorl.backends.jax.warp_graphs import live_graph_count
+
 _GIB = 1024.0**3
 
 
@@ -149,6 +151,12 @@ def collect_device_memory_metrics() -> dict[str, float]:
         )
     except Exception:  # pragma: no cover - optional warp API
         pass
+    # MJX's captured CUDA graphs are capped by count, not by bytes: past ~2048
+    # live graphs holding an allocation every capture-time allocation fails
+    # while ``gpu_free_gb`` still looks healthy.
+    graphs = live_graph_count()
+    if graphs is not None:
+        metrics["system/gpu_warp_graphs"] = float(graphs)
     return metrics
 
 

@@ -19,7 +19,7 @@ STEPS_PER_TASK = 1_000_000
 TOTAL_TIMESTEPS = NUM_TASKS * STEPS_PER_TASK
 TENSORBOARD_LOG_DIR = "/home/algoritmi/data/HyperCEZ_data/runs/cw10_hypercez_cl_unchuncked_fixes"
 CHECKPOINT_DIR = f"{TENSORBOARD_LOG_DIR}/checkpoints"
-RESUME_FROM: str | None = f"{CHECKPOINT_DIR}/boundary_task_1"
+RESUME_FROM: str | None = f"{CHECKPOINT_DIR}/boundary_task_3"
 
 
 def main() -> None:

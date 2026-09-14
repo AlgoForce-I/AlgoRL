@@ -14,6 +14,7 @@ from algorl.backends.jax.envs.mtcworld_search import (
     MtcworldCWTaskSearchEnvironment,
     MtcworldSearchEnvironment,
 )
+from algorl.backends.jax.warp_graphs import enforce_graph_budget, release_graph_caches
 from algorl.envs.jax_env import BatchedJaxEnv, JaxEnv, JaxRolloutBatch, JaxState, PolicyFn, RolloutStepCallback
 
 
@@ -403,6 +404,9 @@ class BatchedContinualLearningJaxEnv:
         # allocating the next task's, so the two never coexist on the device.
         self._state = None
         del self._vector_env
+        # The finished task's captured CUDA graphs hold driver-side graph slots
+        # that MJX's FFI registry never reclaims on its own.
+        release_graph_caches()
         self._vector_env = self._make_task_vector_env(self._seq_idx)
         key, reset_key = jax.random.split(key)
         return self._vector_env.reset(reset_key)
@@ -436,6 +440,9 @@ class BatchedContinualLearningJaxEnv:
     ) -> JaxRolloutBatch:
         if num_steps < 1:
             raise ValueError("num_steps must be >= 1")
+        # Every retrace of the MJX step adds a graph cache that is never pruned,
+        # so trim them between chunks rather than at the driver's hard limit.
+        enforce_graph_budget()
         if self._state is None:
             key, reset_key = jax.random.split(key)
             self.reset(reset_key)
@@ -628,6 +635,7 @@ class VectorJaxEnv(BatchedJaxEnv):
     ) -> JaxRolloutBatch:
         if num_steps < 1:
             raise ValueError("num_steps must be >= 1")
+        enforce_graph_budget()
 
         reset_key, rollout_key = jax.random.split(key)
         state = self.reset(reset_key)

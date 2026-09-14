@@ -256,6 +256,7 @@ class PeriodicEvaluator:
         progress_bar: TqdmProgressBar | None,
     ) -> list[_EpisodeStats]:
         eval_env = self._eval_env_for_task(task)
+        self._trim_warp_graph_caches()
         try:
             return self._rollout_task(
                 task,
@@ -265,6 +266,19 @@ class PeriodicEvaluator:
             )
         finally:
             self._retire_eval_env(task, eval_env)
+
+    @staticmethod
+    def _trim_warp_graph_caches() -> None:
+        """Keep MJX's captured CUDA graphs under the driver's live-graph limit.
+
+        Each cached eval env holds its own MJX graph caches, so a sweep over the
+        whole CW sequence adds captures that training-side trimming never sees.
+        """
+        try:
+            from algorl.backends.jax.warp_graphs import enforce_graph_budget
+        except ImportError:  # JAX backend not installed
+            return
+        enforce_graph_budget()
 
     def _rollout_task(
         self,
