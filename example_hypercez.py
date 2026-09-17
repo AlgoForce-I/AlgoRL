@@ -17,9 +17,15 @@ NUM_ENVS = 32
 NUM_TASKS = 10
 STEPS_PER_TASK = 1_000_000
 TOTAL_TIMESTEPS = NUM_TASKS * STEPS_PER_TASK
-TENSORBOARD_LOG_DIR = "/home/algoritmi/data/HyperCEZ_data/runs/cw10_hypercez_cl_unchuncked_fixes"
+RUNS_DIR = "/home/algoritmi/data/HyperCEZ_data/runs"
+# Fresh run directory: the fix-target run's later boundary checkpoints and
+# TensorBoard curves stay untouched and don't overlap with this run's steps.
+TENSORBOARD_LOG_DIR = f"{RUNS_DIR}/cw10_hypercez_cl_nullspace"
 CHECKPOINT_DIR = f"{TENSORBOARD_LOG_DIR}/checkpoints"
-RESUME_FROM: str | None = f"{CHECKPOINT_DIR}/boundary_task_3"
+# Written when task 0 (hammer) finished; the run continues with task 1
+# (push-wall). Task 0 never used the regularizer, so this state is identical
+# under either CL strategy. `boundary_task_{k}` is saved after task k ends.
+RESUME_FROM: str | None = f"{RUNS_DIR}/cw10_hypercez_cl_unchuncked_fixes/checkpoints/boundary_task_0"
 
 
 def main() -> None:
@@ -31,6 +37,9 @@ def main() -> None:
     )
     config = arl.HyperCEZConfig.for_batched(
         num_envs=NUM_ENVS,
+        # Protect earlier tasks by projecting hypernet updates onto their free
+        # output directions instead of the β-weighted fix-target regularizer.
+        cl_strategy="nullspace",
         checkpoint_dir=CHECKPOINT_DIR,
         checkpoint_freq=STEPS_PER_TASK,
         autosave_best=True,

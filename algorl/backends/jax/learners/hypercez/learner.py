@@ -50,6 +50,13 @@ from algorl.backends.jax.nn.hypercez.hyper_model import (
     component_outputs_to_tree,
 )
 from algorl.backends.jax.nn.hypercez.materialize import materialize_ez_params
+from algorl.backends.jax.nn.hypercez.nullspace import (
+    NullspaceBases,
+    build_nullspace_bases,
+    free_direction_fraction,
+    mask_alpha_updates,
+    project_hnet_updates,
+)
 from algorl.backends.jax.nn.hypercez.shapes import partition_params
 from algorl.backends.jax.nn.hypercez.regularizer import (
     RegTargets,
@@ -307,6 +314,7 @@ def _hypercez_task_step(
     optimizer: optax.GradientTransformation,
     frozen_ez: Params,
     hnet_modules: dict[str, Any],
+    nullspace_bases: NullspaceBases | None = None,
 ) -> tuple[
     dict[str, Any],
     optax.OptState,
@@ -389,6 +397,19 @@ def _hypercez_task_step(
             main_lr_scale=main_lr_scale,
             hyper_lr_scale=hyper_lr_scale,
         )
+        if config.cl_strategy == "nullspace":
+            # Other tasks' embeddings/α and the protected directions of every
+            # hypernet layer stay exactly where they were.
+            updates = {
+                **updates,
+                "hnets": project_hnet_updates(
+                    updates["hnets"],
+                    nullspace_bases,
+                    task_id=task_id,
+                    hnet_components=hnet_components,
+                ),
+                "alphas": mask_alpha_updates(updates["alphas"], task_id=task_id),
+            }
         new_state = optax.apply_updates(train_state, updates)
         shared = dict(new_state["shared"])
         rep_shared = dict(shared["representation_model"])
@@ -604,6 +625,7 @@ def _hypercez_full_train_step(
     reg_optimizer: optax.GradientTransformation,
     frozen_ez: Params,
     hnet_modules: dict[str, Any],
+    nullspace_bases: NullspaceBases | None = None,
 ) -> tuple[
     dict[str, Any],
     optax.OptState,
@@ -640,6 +662,7 @@ def _hypercez_full_train_step(
         optimizer=optimizer,
         frozen_ez=frozen_ez,
         hnet_modules=hnet_modules,
+        nullspace_bases=nullspace_bases,
     )
 
     if not defer_theta:
@@ -831,6 +854,7 @@ def _hypercez_burst_scan(
     reg_optimizer: optax.GradientTransformation,
     frozen_ez: Params,
     hnet_modules: dict[str, Any],
+    nullspace_bases: NullspaceBases | None = None,
 ) -> tuple[
     dict[str, Any],
     optax.OptState,
@@ -930,6 +954,7 @@ def _hypercez_burst_scan(
                 reg_optimizer=reg_optimizer,
                 frozen_ez=frozen_ez,
                 hnet_modules=hnet_modules,
+                nullspace_bases=nullspace_bases,
             )
             return (
                 (
@@ -1011,6 +1036,11 @@ class HyperCEZLearner(EfficientZeroLearner):
     On later tasks with ``beta > 0``, phase A updates shared/projections and the
     current embedding only; phase B applies fix-target regularization to hypernet
     theta (with optional lookahead ``Δθ``) and deferred alpha grads.
+
+    With ``cl_strategy="nullspace"`` every task uses the single phase; the
+    hypernet update is projected onto the directions that leave previous tasks'
+    layer activations unchanged (see ``nn/hypercez/nullspace.py``), and only the
+    current task's embedding and α move.
     """
 
     def __init__(self, context: ComponentContext) -> None:
@@ -1031,6 +1061,7 @@ class HyperCEZLearner(EfficientZeroLearner):
         self._ema_reg_loss: float | None = None
         self._task_train_steps = 0
         self._shared_snapshots: dict[int, Any] = {}
+        self._nullspace_bases: NullspaceBases | None = None
 
         # Shared EZ wiring (params copies, planner sync, burst spec, discrete checks).
         super().__init__(context)
@@ -1045,6 +1076,7 @@ class HyperCEZLearner(EfficientZeroLearner):
                 "lr_main_to_lr_hyper_ratio must be > 0, "
                 f"got {self.config.lr_main_to_lr_hyper_ratio}."
             )
+        self._validate_cl_strategy()
         self.train_state = build_train_state(
             hnet_params=copy.deepcopy(self.world_model.hnet_params),
             alphas=copy.deepcopy(self.world_model.alphas),
@@ -1084,10 +1116,50 @@ class HyperCEZLearner(EfficientZeroLearner):
             "reg_optimizer": self._reg_optimizer,
             "frozen_ez": self.frozen_ez,
             "hnet_modules": self.hnet_modules,
+            "nullspace_bases": self._nullspace_bases,
         }
+
+    def _validate_cl_strategy(self) -> None:
+        strategy = self.config.cl_strategy
+        if strategy not in {"fix_target", "nullspace"}:
+            raise ValueError(
+                f"cl_strategy must be 'fix_target' or 'nullspace', got {strategy!r}."
+            )
+        if strategy != "nullspace":
+            return
+        # Each requirement keeps a previous task's generated weights a pure
+        # function of parameters the projection protects.
+        if self.config.hnet_type != "unchunked":
+            raise ValueError("cl_strategy='nullspace' requires hnet_type='unchunked'.")
+        if not self.config.frozen_base_weights:
+            raise ValueError(
+                "cl_strategy='nullspace' requires frozen_base_weights=True "
+                "(a trainable shared W0 would change every task's weights)."
+            )
+        if self.config.plastic_prev_tembs:
+            raise ValueError("cl_strategy='nullspace' requires plastic_prev_tembs=False.")
+
+    def _protected_task_ids(self) -> list[int]:
+        """Tasks whose generated weights must not move while training ``task_id``."""
+        finished = set(range(self.task_id)) | {int(task) for task in self._shared_snapshots}
+        return sorted(finished - {self.task_id})
+
+    def _build_nullspace_bases(self) -> NullspaceBases | None:
+        if self.config.cl_strategy != "nullspace" or not hasattr(self, "train_state"):
+            return None
+        return build_nullspace_bases(
+            self.train_state["hnets"],
+            self.hnet_modules,
+            self.config.hnet_components,
+            self._protected_task_ids(),
+            rel_tol=self.config.nullspace_rel_tol,
+        )
 
     def _recompile_train_kernels(self) -> None:
         """Rebuild jitted single-step and burst kernels after task / CL changes."""
+        # Previous tasks' activations never change under the projection, so the
+        # bases only need rebuilding when the task (or strategy) changes.
+        self._nullspace_bases = self._build_nullspace_bases()
         kernel_kwargs = self._train_kernel_kwargs()
         # Rematerialize once after the jitted update (planner sync), not inside
         # the AD body — same policy for single-step and burst.
@@ -1211,7 +1283,8 @@ class HyperCEZLearner(EfficientZeroLearner):
 
     def _defer_theta(self) -> bool:
         return (
-            self.task_id > 0
+            self.config.cl_strategy == "fix_target"
+            and self.task_id > 0
             and self.config.beta > 0.0
             and self._reg_targets is not None
         )
@@ -1281,6 +1354,15 @@ class HyperCEZLearner(EfficientZeroLearner):
         metrics = {"retention/fix_target_reg": float(np.asarray(reg))}
         for index, value in enumerate(np.asarray(per_task).tolist()):
             metrics[f"retention/task_{index}_reg"] = float(value)
+        if self._nullspace_bases is not None:
+            for component, fraction in free_direction_fraction(
+                self.train_state["hnets"],
+                self.hnet_modules,
+                self.config.hnet_components,
+                self._nullspace_bases,
+                self.task_id,
+            ).items():
+                metrics[f"retention/free_frac/{component}"] = fraction
         return metrics
 
     def on_task_boundary(self, new_task_id: int) -> None:

@@ -61,6 +61,8 @@ RESUME_ALLOWLIST: frozenset[str] = frozenset(
         "std_magnification",
         "alpha_max",
         "frozen_base_weights",
+        "cl_strategy",
+        "nullspace_rel_tol",
     }
 )
 

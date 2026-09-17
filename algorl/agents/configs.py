@@ -376,6 +376,14 @@ class HyperCEZConfig(EfficientZeroConfig):
 
     ``hnet_type`` selects unchunked (one head per weight tensor; default) or
     chunked HyperCL-style generators (``chunk_dim`` / ``cemb_size``).
+
+    ``cl_strategy`` selects how earlier tasks are protected. ``"fix_target"``
+    is the HyperCL output regularizer (β-weighted, with lookahead).
+    ``"nullspace"`` drops the regularizer and projects every hypernet update
+    onto the directions that leave previous tasks' layer activations unchanged:
+    old generated weights stay fixed and the current task trains the remaining
+    directions at the full hypernet learning rate. It requires an unchunked
+    hypernet, frozen W0, and frozen previous-task embeddings.
     """
 
     # EZ training knobs (re-applied in presets: ``for_dmc_state`` overrides some).
@@ -430,6 +438,10 @@ class HyperCEZConfig(EfficientZeroConfig):
     reg_scaling_min: float = 0.25
     reg_scaling_max: float = 4.0
     retention_log_interval: int = 500  # log fix-target drift; 0 disables
+    cl_strategy: str = "fix_target"  # "fix_target" | "nullspace"
+    # Singular values below rel_tol * max are treated as numerical noise when
+    # building the protected subspace of previous-task activations.
+    nullspace_rel_tol: float = 1e-6
 
     @classmethod
     def _cw_training_overrides(cls) -> dict[str, object]:

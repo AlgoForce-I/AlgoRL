@@ -42,18 +42,41 @@ class HyperNetwork(nn.Module):
             raise ValueError(f"head_init_std must be >= 0, got {self.head_init_std}.")
 
     @nn.compact
-    def __call__(self, task_id: int | jnp.ndarray) -> tuple[jnp.ndarray, ...]:
+    def __call__(
+        self,
+        task_id: int | jnp.ndarray,
+        *,
+        return_layer_inputs: bool = False,
+    ) -> tuple[jnp.ndarray, ...] | dict[str, jnp.ndarray]:
+        """Generated weight tensors, or the input seen by every layer.
+
+        With ``return_layer_inputs`` the heads are skipped and a dict is
+        returned: ``hidden_{i}`` → that Dense layer's input, ``trunk_norm`` →
+        the LayerNorm input after normalization (before scale/bias), and
+        ``heads`` → the input shared by every head.
+        """
         embeddings = self.param(
             "task_embeddings",
             lambda rng, shape: jax.random.normal(rng, shape) * self.emb_init_std,
             (self.num_tasks, self.emb_size),
         )
         emb = embeddings[jnp.asarray(task_id, dtype=jnp.int32)]
+        layer_inputs: dict[str, jnp.ndarray] = {}
         h = emb
         for index, width in enumerate(self.hidden_dims):
+            layer_inputs[f"hidden_{index}"] = h
             h = nn.Dense(width, name=f"hidden_{index}")(h)
             h = nn.relu(h)
+        if return_layer_inputs:
+            # Param-free LayerNorm: the same normalization trunk_norm applies
+            # before its scale and bias.
+            layer_inputs["trunk_norm"] = nn.LayerNorm(
+                use_scale=False, use_bias=False, name="trunk_norm_unscaled"
+            )(h)
         h = nn.LayerNorm(name="trunk_norm")(h)
+        if return_layer_inputs:
+            layer_inputs["heads"] = h
+            return layer_inputs
 
         head_std = self.head_init_std
         # Unchunked heads map a width-H trunk onto full weight tensors. After one
@@ -227,6 +250,27 @@ def apply_hypernetwork(
     if dtheta is not None:
         apply_params = jax.tree_util.tree_map(lambda weight, delta: weight + delta, params, dtheta)
     return module.apply({"params": apply_params}, jnp.asarray(task_id, dtype=jnp.int32))
+
+
+def hypernetwork_layer_inputs(
+    module: HyperNetModule,
+    params: Any,
+    task_ids: Sequence[int],
+) -> dict[str, jnp.ndarray]:
+    """Per-layer inputs of an unchunked hypernet, stacked over ``task_ids``.
+
+    Returns ``{layer: (len(task_ids), dim)}`` with the keys documented on
+    :meth:`HyperNetwork.__call__`. Chunked hypernets feed every chunk
+    embedding through the same layers, so they have no per-task input.
+    """
+    if not isinstance(module, HyperNetwork):
+        raise TypeError(
+            f"Layer inputs are only defined for unchunked HyperNetwork, got {type(module).__name__}."
+        )
+    ids = jnp.asarray(list(task_ids), dtype=jnp.int32)
+    return jax.vmap(
+        lambda task_id: module.apply({"params": params}, task_id, return_layer_inputs=True)
+    )(ids)
 
 
 def outputs_to_tree(outputs: Sequence[jnp.ndarray], treedef: Any) -> Any:

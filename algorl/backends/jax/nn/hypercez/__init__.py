@@ -7,12 +7,20 @@ from algorl.backends.jax.nn.hypercez.hyper_model import (
     apply_hypernetwork,
     build_hypernetwork_for_component,
     component_outputs_to_tree,
+    hypernetwork_layer_inputs,
     init_hypernetwork_params,
     outputs_to_tree,
 )
 from algorl.backends.jax.nn.hypercez.materialize import (
     materialize_delta_component,
     materialize_ez_params,
+)
+from algorl.backends.jax.nn.hypercez.nullspace import (
+    NullspaceBases,
+    build_nullspace_bases,
+    free_direction_fraction,
+    mask_alpha_updates,
+    project_hnet_updates,
 )
 from algorl.backends.jax.nn.hypercez.regularizer import (
     RegTargets,
@@ -37,14 +45,20 @@ __all__ = [
     "HyperNetwork",
     "apply_hypernetwork",
     "build_hypernetwork_for_component",
+    "build_nullspace_bases",
     "component_outputs_to_tree",
+    "free_direction_fraction",
     "generated_treedef",
+    "hypernetwork_layer_inputs",
     "init_hypernetwork_params",
     "is_shared_leaf",
+    "mask_alpha_updates",
     "materialize_delta_component",
     "materialize_ez_params",
     "merge_params",
+    "NullspaceBases",
     "outputs_to_tree",
+    "project_hnet_updates",
     "RegTargets",
     "calc_component_reg_loss",
     "calc_fix_target_reg",

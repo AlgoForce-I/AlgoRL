@@ -46,6 +46,8 @@ def test_hypercez_config_defaults() -> None:
     assert config.warm_start_alpha is True
     assert config.snapshot_shared_per_task is True
     assert config.use_per_task_reg_scaling is False
+    assert config.cl_strategy == "fix_target"
+    assert config.nullspace_rel_tol == 1e-6
 
 
 def test_hypercez_config_chunked_override() -> None:

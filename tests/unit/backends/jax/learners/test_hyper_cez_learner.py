@@ -390,3 +390,151 @@ def _leaves(tree):
     import jax
 
     return jax.tree_util.tree_leaves(tree)
+
+
+def _nullspace_context(env: TrainingEnv, **overrides: object) -> ComponentContext:
+    fields = dict(
+        batch_size=2,
+        unroll_steps=2,
+        trajectory_size=4,
+        learning_starts=0,
+        mcts_simulations=2,
+        reanalyze_ratio=0.0,
+        use_priority=False,
+        num_tasks=3,
+        emb_size=8,
+        hnet_arch=(32, 32),
+        burst_compile_steps=1,
+        gradient_steps_per_rollout=1,
+        lr_warm_up=0.0,
+        head_init_std=1e-3,
+        cl_strategy="nullspace",
+    )
+    fields.update(overrides)
+    context = ComponentContext(
+        backend=get_backend("jax"),
+        config=HyperCEZConfig.for_dmc_state(**fields),
+        env=env,
+    )
+    context.world_model = build_hyper_cez_world_model(context)
+    context.planner = build_efficient_zero_planner(context)
+    return context
+
+
+def _hnet_outputs(learner: HyperCEZLearner, task_id: int) -> np.ndarray:
+    from algorl.backends.jax.nn.hypercez.hyper_model import apply_hypernetwork
+
+    return np.concatenate(
+        [
+            np.ravel(np.asarray(leaf))
+            for component in learner.config.hnet_components
+            for leaf in apply_hypernetwork(
+                learner.hnet_modules[component],
+                learner.train_state["hnets"][component],
+                task_id,
+            )
+        ]
+    )
+
+
+def _filled_buffer(config: HyperCEZConfig) -> EfficientZeroReplayBuffer:
+    buffer = EfficientZeroReplayBuffer(
+        capacity=100,
+        config=config,
+        unroll_steps=config.unroll_steps,
+        trajectory_size=config.trajectory_size,
+    )
+    _fill_buffer(buffer)
+    return buffer
+
+
+def test_nullspace_keeps_previous_task_exactly_while_training_current(
+    cartpole_training_env: TrainingEnv,
+) -> None:
+    context = _nullspace_context(cartpole_training_env)
+    learner = build_hyper_cez_learner(context)
+    buffer = _filled_buffer(context.config)
+    for _ in range(3):
+        learner.train_step(buffer, skip_reanalyze=True)
+    learner.on_task_boundary(1)
+    assert learner._nullspace_bases is not None
+    assert learner._defer_theta() is False
+
+    task0_hnet = _hnet_outputs(learner, 0)
+    task1_hnet = _hnet_outputs(learner, 1)
+    task0_params = copy.deepcopy(
+        {c: learner.materialize_task(0)[c] for c in learner.config.hnet_components}
+    )
+    alpha0 = copy.deepcopy(learner.train_state["alphas"][0])
+    for _ in range(5):
+        metrics = learner.train_step(buffer, skip_reanalyze=True)
+
+    assert metrics["cl_beta"] == 0.0
+    np.testing.assert_allclose(_hnet_outputs(learner, 0), task0_hnet, atol=1e-5)
+    assert np.linalg.norm(_hnet_outputs(learner, 1) - task1_hnet) > 0.0
+    task0_after = {c: learner.materialize_task(0)[c] for c in learner.config.hnet_components}
+    for before, after in zip(_leaves(task0_params), _leaves(task0_after), strict=True):
+        np.testing.assert_allclose(np.asarray(after), np.asarray(before), atol=1e-5)
+    for component in learner.config.hnet_components:
+        assert float(learner.train_state["alphas"][0][component]) == float(alpha0[component])
+
+    retention = learner.retention_target_metrics()
+    assert retention["retention/fix_target_reg"] < 1e-8
+    assert 0.0 < retention["retention/free_frac/dynamics_model"] <= 1.0
+
+
+def test_nullspace_burst_keeps_previous_tasks(cartpole_training_env: TrainingEnv) -> None:
+    context = _nullspace_context(
+        cartpole_training_env, burst_compile_steps=2, gradient_steps_per_rollout=4
+    )
+    learner = build_hyper_cez_learner(context)
+    buffer = _filled_buffer(context.config)
+    learner.train_burst(buffer, 2)
+    learner.on_task_boundary(1)
+    learner.train_burst(buffer, 2)
+    learner.on_task_boundary(2)
+    before = {task: _hnet_outputs(learner, task) for task in (0, 1)}
+
+    metrics = learner.train_burst(buffer, 4)
+
+    assert np.isfinite(metrics["loss"])
+    for task in (0, 1):
+        np.testing.assert_allclose(_hnet_outputs(learner, task), before[task], atol=1e-5)
+
+
+def test_nullspace_bases_rebuilt_after_checkpoint_load(
+    cartpole_training_env: TrainingEnv,
+    tmp_path,
+) -> None:
+    context = _nullspace_context(cartpole_training_env)
+    learner = build_hyper_cez_learner(context)
+    buffer = _filled_buffer(context.config)
+    learner.train_step(buffer, skip_reanalyze=True)
+    learner.on_task_boundary(1)
+    learner.save(tmp_path / "learner")
+
+    restored = build_hyper_cez_learner(_nullspace_context(cartpole_training_env))
+    restored.load(tmp_path / "learner")
+    assert restored.task_id == 1
+    assert restored._protected_task_ids() == [0]
+    assert restored._nullspace_bases is not None
+    task0 = _hnet_outputs(restored, 0)
+    restored.train_step(buffer, skip_reanalyze=True)
+    np.testing.assert_allclose(_hnet_outputs(restored, 0), task0, atol=1e-5)
+
+
+@pytest.mark.parametrize(
+    "overrides",
+    [
+        {"hnet_type": "chunked", "chunk_dim": 64, "cemb_size": 8},
+        {"frozen_base_weights": False},
+        {"plastic_prev_tembs": True},
+        {"cl_strategy": "bogus"},
+    ],
+)
+def test_nullspace_rejects_incompatible_configs(
+    cartpole_training_env: TrainingEnv,
+    overrides: dict,
+) -> None:
+    with pytest.raises(ValueError):
+        build_hyper_cez_learner(_nullspace_context(cartpole_training_env, **overrides))
