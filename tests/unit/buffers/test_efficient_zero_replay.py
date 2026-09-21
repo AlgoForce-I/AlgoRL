@@ -12,6 +12,7 @@ from algorl.buffers.efficientzero import (
     EfficientZeroReplayBuffer,
     step_from_transition,
 )
+from algorl.buffers.efficientzero.buffer import _PriorityStore
 from algorl.core.types import Transition
 
 
@@ -286,3 +287,59 @@ def test_efficient_zero_buffer_sanitizes_priority_updates() -> None:
     assert np.all(np.isfinite(buffer._priorities[:2]))
     batch = buffer.sample(2)
     assert batch.data["observations"].shape[0] == 2
+
+
+def test_priority_store_matches_list_semantics() -> None:
+    """The numpy-backed store must answer exactly like the list it replaced."""
+    store = _PriorityStore()
+    reference: list[float] = []
+    for value in (3.0, 1.5, float("nan"), 7.25, float("inf"), 0.5):
+        store.append(value)
+        reference.append(value)
+    assert len(store) == len(reference)
+    np.testing.assert_array_equal(np.asarray(store), np.asarray(reference, dtype=np.float64))
+
+    store[1] = 9.0
+    reference[1] = 9.0
+    # max over the finite entries only, as the previous helper computed it.
+    finite = [value for value in reference if np.isfinite(value)]
+    assert store.finite_max() == pytest.approx(max(finite))
+
+    store.zero_prefix(2)
+    reference[:2] = [0.0, 0.0]
+    store.drop_front(3)
+    del reference[:3]
+    np.testing.assert_array_equal(np.asarray(store), np.asarray(reference, dtype=np.float64))
+    assert list(store)[:1] == reference[:1]
+
+    store.clear()
+    assert len(store) == 0
+    assert _PriorityStore().finite_max() == pytest.approx(1.0)
+    assert _PriorityStore([float("nan")]).finite_max(default=4.0) == pytest.approx(4.0)
+
+
+def test_build_batch_reads_live_steps_after_eviction() -> None:
+    """Cached trajectory columns must never outlive the steps they came from."""
+    config = EfficientZeroConfig(unroll_steps=2, trajectory_size=4, use_priority=True)
+    buffer = EfficientZeroReplayBuffer(
+        capacity=8,
+        config=config,
+        unroll_steps=2,
+        trajectory_size=4,
+    )
+    for index in range(40):
+        buffer.add(_transition(index))
+
+    for flat_index, (traj_idx, step_idx) in enumerate(buffer._lookup):
+        batch = buffer._build_batch(np.asarray([flat_index]), trained_steps=0)
+        steps = buffer._stored_steps[traj_idx - buffer._base_traj_idx]
+        np.testing.assert_array_equal(
+            batch.data["observations"][0, 0], steps[step_idx].observation
+        )
+        np.testing.assert_array_equal(
+            batch.data["policy_targets"][0, 0], steps[step_idx].policy_target
+        )
+
+    # A reload replaces the step lists in place; stale columns must be dropped.
+    buffer.clear()
+    assert buffer._array_cache == {}

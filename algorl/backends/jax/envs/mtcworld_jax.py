@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from collections.abc import Sequence
 from typing import Any
 
 import jax
@@ -239,6 +240,34 @@ class ContinualLearningJaxEnv(JaxEnv):
         return next_state
 
 
+def _resolve_cw_task_selection(
+    task_names: Sequence[str],
+    *,
+    task_name: str | None = None,
+    task_index: int | None = None,
+) -> tuple[tuple[int, ...], tuple[str, ...]]:
+    """Map an optional CW slot filter onto sequence indices and names."""
+    names = tuple(str(name) for name in task_names)
+    if task_name is not None and task_index is not None:
+        raise ValueError("Pass only one of task_name or task_index.")
+    if task_name is None and task_index is None:
+        return tuple(range(len(names))), names
+    if task_name is not None:
+        try:
+            index = names.index(task_name)
+        except ValueError as exc:
+            raise ValueError(
+                f"Unknown Continual World task {task_name!r}. Expected one of {names}."
+            ) from exc
+        return (index,), (names[index],)
+    assert task_index is not None
+    if task_index < 0 or task_index >= len(names):
+        raise ValueError(
+            f"task_index={task_index} is out of range for {len(names)} tasks."
+        )
+    return (task_index,), (names[task_index],)
+
+
 def _build_cw_vector_jax_env(
     benchmark: str,
     task_index: int,
@@ -294,6 +323,8 @@ class BatchedContinualLearningJaxEnv:
         config: Any | None = None,
         steps_per_task: int,
         bench: Any | None = None,
+        task_name: str | None = None,
+        task_index: int | None = None,
     ) -> None:
         if num_envs < 1:
             raise ValueError("num_envs must be >= 1")
@@ -303,16 +334,21 @@ class BatchedContinualLearningJaxEnv:
         from MTCWorldMJX.cw_benchmarks import CWBenchmark
 
         self._bench = bench or CWBenchmark(benchmark, config=config, seed=seed)
+        self.task_indices, self.task_names = _resolve_cw_task_selection(
+            self._bench.task_names,
+            task_name=task_name,
+            task_index=task_index,
+        )
         self.benchmark_name = benchmark
         self.num_envs = num_envs
         self.seed = seed
         self.config = config
         self.steps_per_task = steps_per_task
-        self.num_tasks = self._bench.num_tasks
-        self.task_names = tuple(self._bench.task_names)
+        self.num_tasks = len(self.task_indices)
         self.steps_limit = self.num_tasks * steps_per_task
         mtc = require_mtcworld()
-        self._obs_dim = mtc.cw_obs_dim(self.num_tasks)
+        # One-hot stays the full CW width even when training a single slot.
+        self._obs_dim = mtc.cw_obs_dim(self._bench.num_tasks)
 
         self._seq_idx = 0
         self._global_step = 0
@@ -323,11 +359,12 @@ class BatchedContinualLearningJaxEnv:
         # Explicit resets (instead of VectorEnv's on-device autoreset) so that
         # every episode resamples goals from the task pool (CW random_init_all)
         # and the true terminal observation is available to the replay buffer.
+        cw_index = self.task_indices[task_index]
         return _build_cw_vector_jax_env(
             self.benchmark_name,
-            task_index,
+            cw_index,
             num_envs=self.num_envs,
-            seed=self.seed + task_index,
+            seed=self.seed + cw_index,
             config=self.config,
             bench=self._bench,
             autoreset=False,
@@ -549,8 +586,14 @@ def make_batched_cw_train_env(
     seed: int = 0,
     config: Any | None = None,
     steps_per_task: int | None = None,
+    task_name: str | None = None,
+    task_index: int | None = None,
 ) -> BatchedContinualLearningJaxEnv:
-    """Batched CW training: ``num_envs`` parallel actors per task, tasks in sequence."""
+    """Batched CW training: ``num_envs`` parallel actors per task, tasks in sequence.
+
+    ``task_name`` / ``task_index`` restrict the curriculum to one CW slot while
+    keeping the full-benchmark task one-hot (CW10 observations stay 49-d).
+    """
     from MTCWorldMJX.cw_benchmarks import CWBenchmark
 
     bench = CWBenchmark(benchmark, config=config, seed=seed)
@@ -566,6 +609,8 @@ def make_batched_cw_train_env(
         config=config,
         steps_per_task=int(resolved_steps),
         bench=bench,
+        task_name=task_name,
+        task_index=task_index,
     )
 
 

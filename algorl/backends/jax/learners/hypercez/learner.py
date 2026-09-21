@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import copy
+import math
 from collections.abc import Callable
 from functools import partial
 from pathlib import Path
@@ -61,7 +62,9 @@ from algorl.backends.jax.nn.hypercez.shapes import partition_params
 from algorl.backends.jax.nn.hypercez.regularizer import (
     RegTargets,
     calc_component_reg_loss,
+    calc_per_component_reg,
     reg_scaling_from_ema,
+    reg_target_sq_norms,
     snapshot_reg_targets,
     update_per_task_reg_ema,
 )
@@ -72,6 +75,14 @@ from algorl.core.component_context import ComponentContext
 from algorl.core.replay_buffer import ReplayBuffer
 
 _EMA_MOMENTUM = 0.99
+# λ controller (reg_balance="gradient"): multiplicative step per drift check,
+# fast to tighten when drift exceeds the budget, slow to loosen below it.
+_BALANCE_MAX_INCREASE = 4.0
+_BALANCE_MAX_DECREASE = 0.9
+# Drift that moved less than this fraction since the last check counts as flat.
+_BALANCE_FLAT_BAND = 0.1
+# Per-step gradient norms the host folds into its EMAs; not logged.
+_BALANCE_NORM_PREFIXES = ("cl_task_grad_norm/", "cl_reg_grad_norm/")
 
 
 def _task_alphas_from_state(
@@ -559,22 +570,244 @@ def _hypercez_reg_step(
     )
 
 
-def _hypercez_zeroed_step_metrics(batch: dict[str, jnp.ndarray]) -> dict[str, jnp.ndarray]:
-    metrics = _zeroed_step_metrics(batch)
-    zero = jnp.asarray(0.0, dtype=jnp.float32)
-    metrics["reg_loss"] = zero
-    metrics["cl_beta"] = zero
-    metrics["dtheta_norm"] = zero
-    return metrics
+def _tree_vdot(left: Any, right: Any) -> jnp.ndarray:
+    return sum(
+        (
+            jnp.vdot(a, b)
+            for a, b in zip(jax.tree_util.tree_leaves(left), jax.tree_util.tree_leaves(right), strict=True)
+        ),
+        jnp.asarray(0.0, dtype=jnp.float32),
+    )
 
 
-def _with_cl_metric_placeholders(metrics: dict[str, jnp.ndarray]) -> dict[str, jnp.ndarray]:
+def _default_reg_balance(config: HyperCEZConfig) -> dict[str, jnp.ndarray]:
+    """Balance state: per-component λ plus host EMAs of gradient norms (0 = unset)."""
+    count = len(config.hnet_components)
+    return {
+        "lambda": jnp.full((count,), config.reg_lambda_init, dtype=jnp.float32),
+        "task_norm": jnp.zeros((count,), dtype=jnp.float32),
+        "reg_norm": jnp.zeros((count,), dtype=jnp.float32),
+    }
+
+
+def _cl_metric_names(config: HyperCEZConfig) -> list[str]:
+    names = ["reg_loss", "cl_beta", "dtheta_norm"]
+    for component in config.hnet_components:
+        names.extend(
+            [
+                f"cl_lambda/{component}",
+                f"cl_task_share/{component}",
+                f"cl_conflict_cos/{component}",
+                f"cl_task_grad_norm/{component}",
+                f"cl_reg_grad_norm/{component}",
+            ]
+        )
+    return names
+
+
+def _hypercez_zeroed_step_metrics(
+    batch: dict[str, jnp.ndarray],
+    config: HyperCEZConfig,
+) -> dict[str, jnp.ndarray]:
+    return _with_cl_metric_placeholders(_zeroed_step_metrics(batch), config)
+
+
+def _with_cl_metric_placeholders(
+    metrics: dict[str, jnp.ndarray],
+    config: HyperCEZConfig,
+) -> dict[str, jnp.ndarray]:
+    # Every cond / scan branch must emit the same metric keys.
     metrics = dict(metrics)
     zero = jnp.asarray(0.0, dtype=jnp.float32)
-    metrics.setdefault("reg_loss", zero)
-    metrics.setdefault("cl_beta", zero)
-    metrics.setdefault("dtheta_norm", zero)
+    for name in _cl_metric_names(config):
+        metrics.setdefault(name, zero)
     return metrics
+
+
+def _next_reg_lambda(
+    reg_lambda: np.ndarray,
+    drift: np.ndarray,
+    prev_drift: np.ndarray | None,
+    tightened: np.ndarray,
+    *,
+    budget: float,
+    lambda_min: float,
+    lambda_max: float,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """One λ controller step per component; returns ``(lambda, over_budget, held)``.
+
+    - Over budget and drift still moving (or first check): tighten by the
+      overshoot ratio, at most ``_BALANCE_MAX_INCREASE`` per check.
+    - Over budget, but drift flat since the last tightening: hold. Adam steps
+      of ~lr per coordinate jitter the generated weights around their targets;
+      that floor does not shrink with λ (λ from 100 to 9000 left drift unchanged
+      on the CW10 checkpoint), so tightening further would only remove task signal.
+      Drift that keeps growing is never held.
+    - Under budget: loosen, at most ``_BALANCE_MAX_DECREASE`` per check.
+    """
+    ratio = np.where(np.isfinite(drift), np.maximum(drift, 0.0) / budget, np.inf)
+    over = ratio > 1.0
+    if prev_drift is None:
+        flat = np.zeros_like(over)
+    else:
+        flat = np.abs(drift - prev_drift) <= _BALANCE_FLAT_BAND * np.maximum(prev_drift, 1e-30)
+    held = over & tightened & flat
+    factor = np.where(
+        over,
+        np.minimum(ratio, _BALANCE_MAX_INCREASE),
+        np.maximum(ratio, _BALANCE_MAX_DECREASE),
+    )
+    factor = np.where(held, 1.0, factor)
+    new_lambda = np.clip(reg_lambda * factor, lambda_min, lambda_max)
+    return new_lambda, over, held
+
+
+def _mix_component_grads(
+    task_grad: Any,
+    reg_grad: Any,
+    *,
+    reg_lambda: jnp.ndarray,
+    task_norm_ref: jnp.ndarray,
+    reg_norm_ref: jnp.ndarray,
+    conflict_projection: bool,
+) -> tuple[Any, dict[str, jnp.ndarray]]:
+    """Combine one component's task and fix-target gradients.
+
+    ``task_norm_ref`` / ``reg_norm_ref`` are the host EMAs (``<= 0`` → use this
+    step's norms). Returns the mixed gradient and its diagnostics.
+    """
+    reg_sq = _tree_vdot(reg_grad, reg_grad)
+    reg_norm = jnp.sqrt(reg_sq)
+    dot = _tree_vdot(task_grad, reg_grad)
+    conflict_cos = dot / (optax.tree.norm(task_grad) * reg_norm + 1e-12)
+    if conflict_projection:
+        # Descending along -task_grad raises the drift penalty when dot < 0.
+        coef = jnp.where(dot < 0.0, dot / (reg_sq + 1e-12), 0.0)
+        task_grad = jax.tree.map(lambda t, r: t - coef * r, task_grad, reg_grad)
+    task_norm = optax.tree.norm(task_grad)
+    ref_task = jnp.where(task_norm_ref > 0.0, task_norm_ref, task_norm)
+    ref_reg = jnp.where(reg_norm_ref > 0.0, reg_norm_ref, reg_norm)
+    scale = reg_lambda * ref_task / (ref_reg + 1e-12)
+    mixed = jax.tree.map(lambda t, r: t + scale * r, task_grad, reg_grad)
+    diagnostics = {
+        "scale": scale,
+        "task_share": task_norm / (optax.tree.norm(mixed) + 1e-12),
+        "conflict_cos": conflict_cos,
+        "task_norm": task_norm,
+        "reg_norm": reg_norm,
+    }
+    return mixed, diagnostics
+
+
+def _hypercez_balanced_reg_step(
+    hnet_params: dict[str, Any],
+    alpha_params: dict[int, dict[str, jnp.ndarray]],
+    alpha_grads: dict[int, dict[str, jnp.ndarray]],
+    task_theta_grads: dict[str, Any],
+    reg_targets: RegTargets,
+    dtheta: dict[str, Any] | None,
+    task_id: int,
+    reg_balance: dict[str, jnp.ndarray],
+    hyper_lr_scale: jnp.ndarray,
+    hnet_opt_state: optax.OptState,
+    alpha_opt_state: optax.OptState,
+    *,
+    hnet_modules: dict[str, Any],
+    hnet_components: tuple[str, ...],
+    plastic_prev_tembs: bool,
+    conflict_projection: bool,
+    max_norm: float,
+    reg_optimizer: optax.GradientTransformation,
+) -> tuple[
+    dict[str, Any],
+    dict[int, dict[str, jnp.ndarray]],
+    optax.OptState,
+    optax.OptState,
+    jnp.ndarray,
+    jnp.ndarray,
+    dict[str, jnp.ndarray],
+]:
+    """Fix-target phase balanced per component in gradient space.
+
+    For each hypernet component c:
+
+    1. If the task gradient points toward more drift (negative inner product
+       with the regularizer gradient), that component is projected out; the
+       rest of the task step is kept at full strength.
+    2. The regularizer gradient is rescaled to ``λ_c`` times the task-gradient
+       norm (host EMAs of both norms), so neither side's raw magnitude decides
+       the mix. ``λ_c`` is steered on the host from measured drift.
+    3. The mix is clipped per component, so one component's regularizer cannot
+       shrink another component's task step through a shared global clip.
+    """
+
+    def reg_objective(
+        hnets: dict[str, Any],
+    ) -> tuple[jnp.ndarray, tuple[jnp.ndarray, jnp.ndarray]]:
+        per_component, per_task = calc_per_component_reg(
+            hnets,
+            hnet_modules=hnet_modules,
+            hnet_components=hnet_components,
+            task_id=task_id,
+            reg_targets=reg_targets,
+            dtheta=dtheta,
+        )
+        # Sum, so each component's gradient is exactly its own reg gradient.
+        return jnp.sum(per_component), (per_component, per_task)
+
+    (_, (per_component_reg, per_task_regs)), reg_grads = jax.value_and_grad(
+        reg_objective, has_aux=True
+    )(hnet_params)
+
+    component_max_norm = max_norm / math.sqrt(len(hnet_components))
+    combined: dict[str, Any] = {}
+    metrics: dict[str, jnp.ndarray] = {}
+    scales = []
+    for index, component in enumerate(hnet_components):
+        reg_grad = _mask_hnet_grads_theta_only(
+            reg_grads[component],
+            task_id=task_id,
+            plastic_prev_tembs=plastic_prev_tembs,
+        )
+        mixed, diagnostics = _mix_component_grads(
+            task_theta_grads[component],
+            reg_grad,
+            reg_lambda=reg_balance["lambda"][index],
+            task_norm_ref=reg_balance["task_norm"][index],
+            reg_norm_ref=reg_balance["reg_norm"][index],
+            conflict_projection=conflict_projection,
+        )
+        combined[component] = _clip_tree_by_global_norm(mixed, component_max_norm)
+        scales.append(diagnostics["scale"])
+        metrics[f"cl_lambda/{component}"] = reg_balance["lambda"][index]
+        metrics[f"cl_task_share/{component}"] = diagnostics["task_share"]
+        metrics[f"cl_conflict_cos/{component}"] = diagnostics["conflict_cos"]
+        metrics[f"cl_task_grad_norm/{component}"] = diagnostics["task_norm"]
+        metrics[f"cl_reg_grad_norm/{component}"] = diagnostics["reg_norm"]
+    metrics["cl_beta"] = jnp.mean(jnp.stack(scales))
+
+    hnet_updates, new_hnet_opt_state = reg_optimizer.update(
+        combined,
+        hnet_opt_state,
+        hnet_params,
+    )
+    alpha_updates, new_alpha_opt_state = reg_optimizer.update(
+        alpha_grads,
+        alpha_opt_state,
+        alpha_params,
+    )
+    scale_lr = lambda update: update * hyper_lr_scale
+    new_hnets = optax.apply_updates(hnet_params, jax.tree.map(scale_lr, hnet_updates))
+    new_alphas = optax.apply_updates(alpha_params, jax.tree.map(scale_lr, alpha_updates))
+    return (
+        new_hnets,
+        new_alphas,
+        new_hnet_opt_state,
+        new_alpha_opt_state,
+        jnp.mean(per_component_reg),
+        per_task_regs,
+        metrics,
+    )
 
 
 def _update_reg_beta_ema(
@@ -626,6 +859,7 @@ def _hypercez_full_train_step(
     frozen_ez: Params,
     hnet_modules: dict[str, Any],
     nullspace_bases: NullspaceBases | None = None,
+    reg_balance: dict[str, jnp.ndarray] | None = None,
 ) -> tuple[
     dict[str, Any],
     optax.OptState,
@@ -638,6 +872,12 @@ def _hypercez_full_train_step(
     jnp.ndarray,
     jnp.ndarray,
 ]:
+    """One HyperCEZ update.
+
+    ``reg_balance`` (traced; see :func:`_default_reg_balance`) carries the
+    per-component λ and gradient-norm EMAs for ``reg_balance="gradient"``;
+    ``None`` uses the configured initial λ with per-step norms.
+    """
     (
         train_state,
         opt_state,
@@ -673,7 +913,7 @@ def _hypercez_full_train_step(
             reg_alpha_opt_state,
             obs_count,
             params,
-            _with_cl_metric_placeholders(metrics),
+            _with_cl_metric_placeholders(metrics, config),
             ema_task_loss,
             ema_reg_loss,
             ema_reg_per_task,
@@ -700,7 +940,7 @@ def _hypercez_full_train_step(
             reg_alpha_opt_state,
             obs_count,
             params,
-            _with_cl_metric_placeholders(metrics),
+            _with_cl_metric_placeholders(metrics, config),
             ema_task_loss,
             ema_reg_loss,
             ema_reg_per_task,
@@ -742,52 +982,91 @@ def _hypercez_full_train_step(
             )
             dtheta_for_reg = dtheta
 
-        # Provisional beta from previous EMA (avoids a second reg forward).
-        beta_eff = jnp.where(
-            ema_reg_loss <= 0.0,
-            jnp.asarray(config.beta, dtype=jnp.float32),
-            jnp.minimum(
-                jnp.asarray(config.beta, dtype=jnp.float32)
-                * (ema_task_loss / (ema_reg_loss + 1e-8)),
-                jnp.asarray(config.beta * 1000.0, dtype=jnp.float32),
-            ),
-        )
-        (
-            new_hnets,
-            new_alphas,
-            new_reg_hnet_opt_state,
-            new_reg_alpha_opt_state,
-            reg_loss,
-            reg_loss_raw,
-            per_task_regs,
-        ) = _hypercez_reg_step(
-            train_state["hnets"],
-            train_state["alphas"],
-            alpha_grads,
-            task_theta_grads,
-            reg_targets,
-            dtheta_for_reg,
-            task_id,
-            beta_eff,
-            hyper_lr_scale,
-            reg_hnet_opt_state,
-            reg_alpha_opt_state,
-            ema_reg_per_task,
-            hnet_modules=hnet_modules,
-            hnet_components=config.hnet_components,
-            plastic_prev_tembs=config.plastic_prev_tembs,
-            use_per_task_reg_scaling=config.use_per_task_reg_scaling,
-            reg_scaling_min=config.reg_scaling_min,
-            reg_scaling_max=config.reg_scaling_max,
-            reg_optimizer=reg_optimizer,
-        )
-        new_ema_task, new_ema_reg, beta_logged = _update_reg_beta_ema(
-            ema_task_loss,
-            ema_reg_loss,
-            metrics["loss"],
-            reg_loss_raw,
-            config.beta,
-        )
+        balance_metrics: dict[str, jnp.ndarray] = {}
+        if config.reg_balance == "gradient":
+            (
+                new_hnets,
+                new_alphas,
+                new_reg_hnet_opt_state,
+                new_reg_alpha_opt_state,
+                reg_loss_raw,
+                per_task_regs,
+                balance_metrics,
+            ) = _hypercez_balanced_reg_step(
+                train_state["hnets"],
+                train_state["alphas"],
+                alpha_grads,
+                task_theta_grads,
+                reg_targets,
+                dtheta_for_reg,
+                task_id,
+                _default_reg_balance(config) if reg_balance is None else reg_balance,
+                hyper_lr_scale,
+                reg_hnet_opt_state,
+                reg_alpha_opt_state,
+                hnet_modules=hnet_modules,
+                hnet_components=config.hnet_components,
+                plastic_prev_tembs=config.plastic_prev_tembs,
+                conflict_projection=config.reg_conflict_projection,
+                max_norm=config.hnet_grad_max_norm,
+                reg_optimizer=reg_optimizer,
+            )
+            reg_loss = reg_loss_raw
+            new_ema_task, new_ema_reg, _ = _update_reg_beta_ema(
+                ema_task_loss,
+                ema_reg_loss,
+                metrics["loss"],
+                reg_loss_raw,
+                config.beta,
+            )
+            beta_logged = balance_metrics.pop("cl_beta")
+        else:
+            # Provisional beta from previous EMA (avoids a second reg forward).
+            beta_eff = jnp.where(
+                ema_reg_loss <= 0.0,
+                jnp.asarray(config.beta, dtype=jnp.float32),
+                jnp.minimum(
+                    jnp.asarray(config.beta, dtype=jnp.float32)
+                    * (ema_task_loss / (ema_reg_loss + 1e-8)),
+                    jnp.asarray(config.beta * 1000.0, dtype=jnp.float32),
+                ),
+            )
+            (
+                new_hnets,
+                new_alphas,
+                new_reg_hnet_opt_state,
+                new_reg_alpha_opt_state,
+                reg_loss,
+                reg_loss_raw,
+                per_task_regs,
+            ) = _hypercez_reg_step(
+                train_state["hnets"],
+                train_state["alphas"],
+                alpha_grads,
+                task_theta_grads,
+                reg_targets,
+                dtheta_for_reg,
+                task_id,
+                beta_eff,
+                hyper_lr_scale,
+                reg_hnet_opt_state,
+                reg_alpha_opt_state,
+                ema_reg_per_task,
+                hnet_modules=hnet_modules,
+                hnet_components=config.hnet_components,
+                plastic_prev_tembs=config.plastic_prev_tembs,
+                use_per_task_reg_scaling=config.use_per_task_reg_scaling,
+                reg_scaling_min=config.reg_scaling_min,
+                reg_scaling_max=config.reg_scaling_max,
+                reg_optimizer=reg_optimizer,
+            )
+            new_ema_task, new_ema_reg, beta_logged = _update_reg_beta_ema(
+                ema_task_loss,
+                ema_reg_loss,
+                metrics["loss"],
+                reg_loss_raw,
+                config.beta,
+            )
         new_ema_reg_per_task = update_per_task_reg_ema(
             ema_reg_per_task,
             per_task_regs,
@@ -806,7 +1085,7 @@ def _hypercez_full_train_step(
                 num_tasks=config.num_tasks,
                 alpha_max=config.alpha_max,
             )
-        new_metrics = dict(metrics)
+        new_metrics = _with_cl_metric_placeholders({**metrics, **balance_metrics}, config)
         new_metrics["reg_loss"] = reg_loss
         new_metrics["cl_beta"] = beta_logged
         new_metrics["dtheta_norm"] = (
@@ -855,6 +1134,7 @@ def _hypercez_burst_scan(
     frozen_ez: Params,
     hnet_modules: dict[str, Any],
     nullspace_bases: NullspaceBases | None = None,
+    reg_balance: dict[str, jnp.ndarray] | None = None,
 ) -> tuple[
     dict[str, Any],
     optax.OptState,
@@ -866,6 +1146,8 @@ def _hypercez_burst_scan(
     jnp.ndarray,
     dict[str, jnp.ndarray],
 ]:
+    # ``reg_balance`` is held fixed within a burst; the host refreshes its
+    # norm EMAs and λ between bursts.
     def scan_step(
         carry: tuple[
             dict[str, Any],
@@ -955,6 +1237,7 @@ def _hypercez_burst_scan(
                 frozen_ez=frozen_ez,
                 hnet_modules=hnet_modules,
                 nullspace_bases=nullspace_bases,
+                reg_balance=reg_balance,
             )
             return (
                 (
@@ -985,7 +1268,7 @@ def _hypercez_burst_scan(
             ],
             dict[str, jnp.ndarray],
         ]:
-            return carry, _hypercez_zeroed_step_metrics(batch)
+            return carry, _hypercez_zeroed_step_metrics(batch, config)
 
         return jax.lax.cond(active > 0.0, run_step, skip_step, None)
 
@@ -1037,6 +1320,12 @@ class HyperCEZLearner(EfficientZeroLearner):
     current embedding only; phase B applies fix-target regularization to hypernet
     theta (with optional lookahead ``Δθ``) and deferred alpha grads.
 
+    With ``reg_balance="gradient"`` (default), phase B mixes task and
+    regularizer gradients per component (:func:`_mix_component_grads`) and a
+    host-side controller moves each component's λ every
+    ``reg_balance_interval`` steps so measured relative drift of earlier tasks
+    tracks ``reg_drift_budget``. ``"loss_ratio"`` keeps the original shared β.
+
     With ``cl_strategy="nullspace"`` every task uses the single phase; the
     hypernet update is projected onto the directions that leave previous tasks'
     layer activations unchanged (see ``nn/hypercez/nullspace.py``), and only the
@@ -1062,6 +1351,9 @@ class HyperCEZLearner(EfficientZeroLearner):
         self._task_train_steps = 0
         self._shared_snapshots: dict[int, Any] = {}
         self._nullspace_bases: NullspaceBases | None = None
+        self._reg_balance_state: dict[str, jnp.ndarray] | None = None
+        self._reg_target_norms: np.ndarray | None = None
+        self._jit_component_reg: Callable[..., tuple[jnp.ndarray, jnp.ndarray]] | None = None
 
         # Shared EZ wiring (params copies, planner sync, burst spec, discrete checks).
         super().__init__(context)
@@ -1077,6 +1369,8 @@ class HyperCEZLearner(EfficientZeroLearner):
                 f"got {self.config.lr_main_to_lr_hyper_ratio}."
             )
         self._validate_cl_strategy()
+        self._reg_balance_state = _default_reg_balance(self.config)
+        self._reset_reg_lambda_history()
         self.train_state = build_train_state(
             hnet_params=copy.deepcopy(self.world_model.hnet_params),
             alphas=copy.deepcopy(self.world_model.alphas),
@@ -1125,6 +1419,23 @@ class HyperCEZLearner(EfficientZeroLearner):
             raise ValueError(
                 f"cl_strategy must be 'fix_target' or 'nullspace', got {strategy!r}."
             )
+        if self.config.reg_balance not in {"gradient", "loss_ratio"}:
+            raise ValueError(
+                "reg_balance must be 'gradient' or 'loss_ratio', "
+                f"got {self.config.reg_balance!r}."
+            )
+        if self.config.reg_drift_budget <= 0.0:
+            raise ValueError(f"reg_drift_budget must be > 0, got {self.config.reg_drift_budget}.")
+        if not (
+            0.0 < self.config.reg_lambda_min
+            <= self.config.reg_lambda_init
+            <= self.config.reg_lambda_max
+        ):
+            raise ValueError(
+                "Expected 0 < reg_lambda_min <= reg_lambda_init <= reg_lambda_max, got "
+                f"{self.config.reg_lambda_min}, {self.config.reg_lambda_init}, "
+                f"{self.config.reg_lambda_max}."
+            )
         if strategy != "nullspace":
             return
         # Each requirement keeps a previous task's generated weights a pure
@@ -1144,6 +1455,105 @@ class HyperCEZLearner(EfficientZeroLearner):
         finished = set(range(self.task_id)) | {int(task) for task in self._shared_snapshots}
         return sorted(finished - {self.task_id})
 
+    def _balances_reg(self) -> bool:
+        return self.config.reg_balance == "gradient" and self._defer_theta()
+
+    def _prepare_reg_balance(self) -> None:
+        """Per-task drift measurement (jitted) and target scales for the λ controller."""
+        if not self._balances_reg():
+            self._jit_component_reg = None
+            self._reg_target_norms = None
+            return
+        self._jit_component_reg = jax.jit(
+            partial(
+                calc_per_component_reg,
+                hnet_modules=self.hnet_modules,
+                hnet_components=self.config.hnet_components,
+                task_id=self.task_id,
+            )
+        )
+        self._reg_target_norms = np.asarray(
+            reg_target_sq_norms(self._reg_targets, self.config.hnet_components),
+            dtype=np.float64,
+        )
+
+    def _relative_reg_drift(self) -> np.ndarray:
+        """``mean_j ||f(e_j) - f*_j||² / mean_j ||f*_j||²`` per component, since the task began."""
+        assert self._jit_component_reg is not None and self._reg_target_norms is not None
+        per_component, _ = self._jit_component_reg(
+            self.train_state["hnets"], reg_targets=self._reg_targets
+        )
+        return np.asarray(per_component, dtype=np.float64) / np.maximum(
+            self._reg_target_norms, 1e-30
+        )
+
+    def _observe_reg_balance_norms(self, step_metrics: list[dict[str, float]]) -> None:
+        """Fold per-step task / reg gradient norms into the host EMAs."""
+        if not self._balances_reg() or self._reg_balance_state is None:
+            return
+        components = self.config.hnet_components
+        task = np.asarray(self._reg_balance_state["task_norm"], dtype=np.float64)
+        reg = np.asarray(self._reg_balance_state["reg_norm"], dtype=np.float64)
+        for metrics in step_metrics:
+            for index, component in enumerate(components):
+                task_norm = float(metrics[f"cl_task_grad_norm/{component}"])
+                reg_norm = float(metrics[f"cl_reg_grad_norm/{component}"])
+                # Skipped (non-finite loss) steps report zeros.
+                if not (np.isfinite(task_norm) and np.isfinite(reg_norm)):
+                    continue
+                if task_norm == 0.0 and reg_norm == 0.0:
+                    continue
+                for ema, value in ((task, task_norm), (reg, reg_norm)):
+                    ema[index] = (
+                        value
+                        if ema[index] <= 0.0
+                        else _EMA_MOMENTUM * ema[index] + (1.0 - _EMA_MOMENTUM) * value
+                    )
+        self._reg_balance_state = {
+            **self._reg_balance_state,
+            "task_norm": jnp.asarray(task, dtype=jnp.float32),
+            "reg_norm": jnp.asarray(reg, dtype=jnp.float32),
+        }
+
+    def _maybe_update_reg_lambda(self, steps_before: int, steps_after: int) -> None:
+        """Every ``reg_balance_interval`` task steps, steer λ toward the drift budget."""
+        interval = int(self.config.reg_balance_interval)
+        if interval <= 0 or not self._balances_reg() or self._reg_balance_state is None:
+            return
+        if steps_after // interval == steps_before // interval:
+            return
+        drift = self._relative_reg_drift()
+        history = self._reg_lambda_history
+        lam, over, held = _next_reg_lambda(
+            np.asarray(self._reg_balance_state["lambda"], dtype=np.float64),
+            drift,
+            history["drift"],
+            history["tightened"],
+            budget=self.config.reg_drift_budget,
+            lambda_min=self.config.reg_lambda_min,
+            lambda_max=self.config.reg_lambda_max,
+        )
+        self._reg_lambda_history = {"drift": drift, "tightened": over, "held": held}
+        self._reg_balance_state = {
+            **self._reg_balance_state,
+            "lambda": jnp.asarray(lam, dtype=jnp.float32),
+        }
+
+    def _reset_reg_lambda_history(self) -> None:
+        count = len(self.config.hnet_components)
+        self._reg_lambda_history = {
+            "drift": None,
+            "tightened": np.zeros((count,), dtype=bool),
+            "held": np.zeros((count,), dtype=bool),
+        }
+
+    def _strip_reg_balance_norms(self, metrics: dict[str, float]) -> dict[str, float]:
+        return {
+            key: value
+            for key, value in metrics.items()
+            if not key.startswith(_BALANCE_NORM_PREFIXES)
+        }
+
     def _build_nullspace_bases(self) -> NullspaceBases | None:
         if self.config.cl_strategy != "nullspace" or not hasattr(self, "train_state"):
             return None
@@ -1160,6 +1570,7 @@ class HyperCEZLearner(EfficientZeroLearner):
         # Previous tasks' activations never change under the projection, so the
         # bases only need rebuilding when the task (or strategy) changes.
         self._nullspace_bases = self._build_nullspace_bases()
+        self._prepare_reg_balance()
         kernel_kwargs = self._train_kernel_kwargs()
         # Rematerialize once after the jitted update (planner sync), not inside
         # the AD body — same policy for single-step and burst.
@@ -1354,6 +1765,14 @@ class HyperCEZLearner(EfficientZeroLearner):
         metrics = {"retention/fix_target_reg": float(np.asarray(reg))}
         for index, value in enumerate(np.asarray(per_task).tolist()):
             metrics[f"retention/task_{index}_reg"] = float(value)
+        if self._balances_reg():
+            held = self._reg_lambda_history["held"]
+            for index, (component, drift) in enumerate(
+                zip(self.config.hnet_components, self._relative_reg_drift(), strict=True)
+            ):
+                metrics[f"retention/rel_drift/{component}"] = float(drift)
+                # 1 = over budget at the optimizer jitter floor; λ is being held.
+                metrics[f"retention/lambda_held/{component}"] = float(held[index])
         if self._nullspace_bases is not None:
             for component, fraction in free_direction_fraction(
                 self.train_state["hnets"],
@@ -1396,6 +1815,14 @@ class HyperCEZLearner(EfficientZeroLearner):
         self._task_train_steps = 0
         self._ema_task_loss = None
         self._ema_reg_loss = None
+        if self._reg_balance_state is not None:
+            # New targets change both gradient scales; λ carries over as a prior.
+            fresh = _default_reg_balance(self.config)
+            self._reg_balance_state = {
+                **fresh,
+                "lambda": self._reg_balance_state["lambda"],
+            }
+        self._reset_reg_lambda_history()
         prev_task = self.task_id
         self.task_id = new_task_id
         self.world_model.set_task_id(self.task_id)
@@ -1500,6 +1927,7 @@ class HyperCEZLearner(EfficientZeroLearner):
             self._ema_scalar(self._ema_task_loss),
             self._ema_scalar(self._ema_reg_loss),
             self._ema_reg_per_task,
+            reg_balance=self._reg_balance_state,
         )
         if defer_theta:
             self._sync_ema_from_scan(ema_task, ema_reg, ema_reg_per_task)
@@ -1523,6 +1951,9 @@ class HyperCEZLearner(EfficientZeroLearner):
             for key, value in metrics.items()
             if key != "priorities"
         }
+        self._observe_reg_balance_norms([out])
+        self._maybe_update_reg_lambda(self._task_train_steps - 1, self._task_train_steps)
+        out = self._strip_reg_balance_norms(out)
         interval = int(self.config.retention_log_interval)
         if interval > 0 and self._task_train_steps % interval == 0:
             out.update(self.retention_target_metrics())
@@ -1683,10 +2114,17 @@ class HyperCEZLearner(EfficientZeroLearner):
             main_lr_scales,
             hyper_lr_scales,
             active_mask,
+            reg_balance=self._reg_balance_state,
         )
         self._obs_running_count = int(np.asarray(self._obs_running_count))
         if defer_theta:
             self._sync_ema_from_scan(ema_task, ema_reg, ema_reg_per_task)
+        if self._balances_reg():
+            norm_keys = [key for key in burst_metrics if key.startswith(_BALANCE_NORM_PREFIXES)]
+            norms = {key: np.asarray(burst_metrics[key]) for key in norm_keys}
+            self._observe_reg_balance_norms(
+                [{key: norms[key][offset] for key in norm_keys} for offset in range(chunk_steps)]
+            )
         self._train_steps = start_step + chunk_steps
         self._task_train_steps = task_start + chunk_steps
         self.params = _strip_obs_running_count(
@@ -1716,6 +2154,8 @@ class HyperCEZLearner(EfficientZeroLearner):
             for key in burst_metrics
             if key != "priorities"
         }
+        self._maybe_update_reg_lambda(task_start, task_start + chunk_steps)
+        out = self._strip_reg_balance_norms(out)
         interval = int(self.config.retention_log_interval)
         if interval > 0 and self._task_train_steps % interval < max(1, chunk_steps):
             out.update(self.retention_target_metrics())
@@ -1752,6 +2192,7 @@ class HyperCEZLearner(EfficientZeroLearner):
             self._ema_scalar(self._ema_task_loss),
             self._ema_scalar(self._ema_reg_loss),
             self._ema_reg_per_task,
+            reg_balance=self._reg_balance_state,
         )
         if spec.burst_steps <= 1:
             return
@@ -1786,6 +2227,7 @@ class HyperCEZLearner(EfficientZeroLearner):
             lr_scales,
             lr_scales,
             active_mask,
+            reg_balance=self._reg_balance_state,
         )
 
     def _maybe_refresh_model_copies(self) -> None:
@@ -1853,6 +2295,7 @@ class HyperCEZLearner(EfficientZeroLearner):
         """Structured HyperCEZ learner state for multi-file checkpoints."""
         from algorl.backends.jax.learners.hypercez.checkpoint import (
             hypercez_checkpoint_state,
+            reg_balance_lambda_list,
         )
 
         return {
@@ -1863,6 +2306,7 @@ class HyperCEZLearner(EfficientZeroLearner):
                 "obs_running_count": int(self._obs_running_count),
                 "ema_task_loss": self._ema_task_loss,
                 "ema_reg_loss": self._ema_reg_loss,
+                "reg_balance_lambda": reg_balance_lambda_list(self),
             },
             "data": hypercez_checkpoint_state(self),
         }

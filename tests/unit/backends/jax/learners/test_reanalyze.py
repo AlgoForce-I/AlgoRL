@@ -182,3 +182,55 @@ def test_reanalyze_preserves_trajectory_shapes() -> None:
     assert search_values.shape == (2, 4)
     assert policy_candidates.shape == (2, 4, 2, 1)
     assert best_actions.shape == (2, 4, 1)
+
+
+def test_batch_initial_values_slices_match_and_transfer_once() -> None:
+    """Slicing must not change values, and each call makes one host transfer.
+
+    Pulling every slice to the host blocked the dispatch queue once per slice
+    (11 slices per gradient step at the default sizes).
+    """
+    import jax
+    import jax.numpy as jnp
+
+    from algorl.backends.jax.learners.efficientzero import reanalyze as reanalyze_module
+    from algorl.backends.jax.learners.efficientzero.reanalyze import batch_initial_values
+
+    rows, obs_dim = 70, 5
+    observations = np.arange(rows * obs_dim, dtype=np.float32).reshape(rows, obs_dim) / rows
+
+    def infer_fn(params, obs, keys):
+        del params, keys
+        return jnp.sum(obs, axis=-1)
+
+    expected = observations.sum(axis=-1)
+    key = jax.random.PRNGKey(0)
+    for mini_batch_size in (7, 16, 64, rows, 4096):
+        values = batch_initial_values(
+            None, None, observations, rng_key=key, mini_batch_size=mini_batch_size, infer_fn=infer_fn
+        )
+        assert values.shape == (rows,)
+        np.testing.assert_array_equal(values, expected)
+
+    transfers = 0
+    real_asarray = reanalyze_module.np.asarray
+
+    def counting_asarray(value, *args, **kwargs):
+        nonlocal transfers
+        if isinstance(value, jax.Array):
+            transfers += 1
+        return real_asarray(value, *args, **kwargs)
+
+    reanalyze_module.np.asarray = counting_asarray
+    try:
+        batch_initial_values(
+            None, None, observations, rng_key=key, mini_batch_size=8, infer_fn=infer_fn
+        )
+    finally:
+        reanalyze_module.np.asarray = real_asarray
+    assert transfers == 1
+
+    empty = batch_initial_values(
+        None, None, np.zeros((0, obs_dim), dtype=np.float32), rng_key=key, infer_fn=infer_fn
+    )
+    assert empty.shape == (0,)

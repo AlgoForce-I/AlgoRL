@@ -88,22 +88,36 @@ def discover_eval_tasks(train_env: TrainingEnv) -> tuple[EvalTask, ...]:
         ):
             continue
         names = getattr(obj, "task_names", None)
-        task_names = (
-            tuple(str(name) for name in names)
-            if names is not None
-            else tuple(f"task_{index}" for index in range(num_tasks))
-        )
+        raw_indices = getattr(obj, "task_indices", None)
+        if isinstance(raw_indices, (tuple, list)) and len(raw_indices) >= 1:
+            task_indices = tuple(int(index) for index in raw_indices)
+            task_names = (
+                tuple(str(name) for name in names)
+                if names is not None
+                else tuple(f"task_{index}" for index in task_indices)
+            )
+        else:
+            task_indices = tuple(range(num_tasks))
+            task_names = (
+                tuple(str(name) for name in names)
+                if names is not None
+                else tuple(f"task_{index}" for index in task_indices)
+            )
         config = getattr(obj, "config", None)
         return tuple(
             EvalTask(
-                name=task_names[index] if index < len(task_names) else f"task_{index}",
-                task_index=index,
+                name=(
+                    task_names[slot]
+                    if slot < len(task_names)
+                    else f"task_{cw_index}"
+                ),
+                task_index=cw_index,
                 kind="cw",
                 benchmark=benchmark,
                 cw_config=config,
                 max_steps=CW_EVAL_HORIZON,
             )
-            for index in range(num_tasks)
+            for slot, cw_index in enumerate(task_indices)
         )
 
     env_id = _mtcworld_single_task_id(train_env)

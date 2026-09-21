@@ -523,6 +523,181 @@ def test_nullspace_bases_rebuilt_after_checkpoint_load(
     np.testing.assert_allclose(_hnet_outputs(restored, 0), task0, atol=1e-5)
 
 
+def _balanced_context(env: TrainingEnv, **overrides: object) -> ComponentContext:
+    return _nullspace_context(env, **{"cl_strategy": "fix_target", **overrides})
+
+
+def test_mix_component_grads_removes_conflict_and_scales_reg() -> None:
+    from algorl.backends.jax.learners.hypercez.learner import _mix_component_grads
+
+    task = {"w": jnp.asarray([1.0, 1.0])}
+    unset = jnp.asarray(0.0)
+    # Conflict (dot < 0): task loses its component along reg, then reg is scaled
+    # to λ times the remaining task norm.
+    mixed, diagnostics = _mix_component_grads(
+        task,
+        {"w": jnp.asarray([-1.0, 0.0])},
+        reg_lambda=jnp.asarray(2.0),
+        task_norm_ref=unset,
+        reg_norm_ref=unset,
+        conflict_projection=True,
+    )
+    np.testing.assert_allclose(np.asarray(mixed["w"]), [-2.0, 1.0], atol=1e-6)
+    np.testing.assert_allclose(float(diagnostics["scale"]), 2.0, atol=1e-6)
+    assert float(diagnostics["conflict_cos"]) < 0.0
+
+    # No conflict: task gradient is untouched.
+    aligned, diagnostics = _mix_component_grads(
+        task,
+        {"w": jnp.asarray([1.0, 0.0])},
+        reg_lambda=jnp.asarray(1.0),
+        task_norm_ref=unset,
+        reg_norm_ref=unset,
+        conflict_projection=True,
+    )
+    np.testing.assert_allclose(np.asarray(aligned["w"]), [1.0 + np.sqrt(2.0), 1.0], atol=1e-5)
+
+    # Host EMAs replace per-step norms once set.
+    _, diagnostics = _mix_component_grads(
+        task,
+        {"w": jnp.asarray([1.0, 0.0])},
+        reg_lambda=jnp.asarray(1.0),
+        task_norm_ref=jnp.asarray(3.0),
+        reg_norm_ref=jnp.asarray(6.0),
+        conflict_projection=True,
+    )
+    np.testing.assert_allclose(float(diagnostics["scale"]), 0.5, atol=1e-6)
+
+
+def test_balanced_fix_target_reports_diagnostics_and_updates_norm_emas(
+    cartpole_training_env: TrainingEnv,
+) -> None:
+    context = _balanced_context(cartpole_training_env)
+    learner = build_hyper_cez_learner(context)
+    learner.on_task_boundary(1)
+    assert learner._defer_theta()
+
+    metrics = learner.train_step(_filled_buffer(context.config), skip_reanalyze=True)
+
+    for component in context.config.hnet_components:
+        assert np.isfinite(metrics[f"cl_lambda/{component}"])
+        assert 0.0 <= metrics[f"cl_task_share/{component}"] <= 1.0 + 1e-5
+        assert -1.0 - 1e-5 <= metrics[f"cl_conflict_cos/{component}"] <= 1.0 + 1e-5
+    assert not any(key.startswith(("cl_task_grad_norm/", "cl_reg_grad_norm/")) for key in metrics)
+    assert np.all(np.asarray(learner._reg_balance_state["task_norm"]) > 0.0)
+    assert np.all(np.asarray(learner._reg_balance_state["reg_norm"]) > 0.0)
+
+
+def test_reg_lambda_controller_tracks_drift_budget(cartpole_training_env: TrainingEnv) -> None:
+    context = _balanced_context(
+        cartpole_training_env,
+        reg_balance_interval=10,
+        reg_drift_budget=1e-3,
+        reg_lambda_init=10.0,
+        reg_lambda_min=1.0,
+        reg_lambda_max=100.0,
+    )
+    learner = build_hyper_cez_learner(context)
+    learner.on_task_boundary(1)
+    count = len(context.config.hnet_components)
+
+    def lambdas() -> np.ndarray:
+        return np.asarray(learner._reg_balance_state["lambda"])
+
+    def drift(value: float):
+        return mock.patch.object(learner, "_relative_reg_drift", return_value=np.full(count, value))
+
+    with drift(1e-1):
+        learner._maybe_update_reg_lambda(5, 8)  # interval not crossed: no measurement
+    np.testing.assert_allclose(lambdas(), 10.0)
+    with drift(2e-3):  # 2x over budget → tighten 2x
+        learner._maybe_update_reg_lambda(8, 10)
+    np.testing.assert_allclose(lambdas(), 20.0)
+    with drift(1.0):  # far over and rising → capped step (x4)
+        learner._maybe_update_reg_lambda(10, 20)
+    np.testing.assert_allclose(lambdas(), 80.0)
+    with drift(1.0):  # still over but flat after tightening → jitter floor, hold
+        learner._maybe_update_reg_lambda(20, 30)
+    np.testing.assert_allclose(lambdas(), 80.0)
+    assert learner._reg_lambda_history["held"].all()
+    with drift(4.0):  # growing again → tighten, capped at max
+        learner._maybe_update_reg_lambda(30, 40)
+    np.testing.assert_allclose(lambdas(), 100.0)
+    with drift(0.0):  # under budget → loosen slowly
+        learner._maybe_update_reg_lambda(40, 50)
+    np.testing.assert_allclose(lambdas(), 90.0, rtol=1e-5)
+
+    # A new task keeps λ as a prior but resets the norm EMAs and controller history.
+    learner.on_task_boundary(2)
+    np.testing.assert_allclose(lambdas(), 90.0, rtol=1e-5)
+    assert np.all(np.asarray(learner._reg_balance_state["task_norm"]) == 0.0)
+    assert learner._reg_lambda_history["drift"] is None
+
+
+def test_next_reg_lambda_holds_at_jitter_floor_but_never_while_drift_grows() -> None:
+    from algorl.backends.jax.learners.hypercez.learner import _next_reg_lambda
+
+    kw = dict(budget=1e-3, lambda_min=1.0, lambda_max=100.0)
+    lam, tightened, prev = np.array([10.0]), np.array([False]), None
+    trace = []
+    for value in [2e-3, 8e-3, 8.2e-3, 8.1e-3, 3e-2, 5e-4, 5e-4]:
+        lam, over, held = _next_reg_lambda(lam, np.array([value]), prev, tightened, **kw)
+        trace.append((float(lam[0]), bool(held[0])))
+        prev, tightened = np.array([value]), over
+    np.testing.assert_allclose([t[0] for t in trace], [20.0, 80.0, 80.0, 80.0, 100.0, 90.0, 81.0])
+    assert [t[1] for t in trace] == [False, False, True, True, False, False, False]
+
+    nan_lam, _, _ = _next_reg_lambda(
+        np.array([10.0]), np.array([np.nan]), None, np.array([False]), **kw
+    )
+    assert nan_lam[0] == 40.0
+
+
+def test_reg_lambda_persists_through_checkpoint(
+    cartpole_training_env: TrainingEnv,
+    tmp_path,
+) -> None:
+    learner = build_hyper_cez_learner(_balanced_context(cartpole_training_env))
+    learner.on_task_boundary(1)
+    learner._reg_balance_state = {
+        **learner._reg_balance_state,
+        "lambda": jnp.asarray([3.0, 5.0, 7.0, 11.0], dtype=jnp.float32),
+    }
+    learner.save(tmp_path / "learner")
+
+    restored = build_hyper_cez_learner(_balanced_context(cartpole_training_env))
+    restored.load(tmp_path / "learner")
+    np.testing.assert_allclose(np.asarray(restored._reg_balance_state["lambda"]), [3.0, 5.0, 7.0, 11.0])
+    assert restored._jit_component_reg is not None
+    assert restored._relative_reg_drift().shape == (4,)
+
+
+def test_loss_ratio_balance_keeps_original_beta(cartpole_training_env: TrainingEnv) -> None:
+    context = _balanced_context(cartpole_training_env, reg_balance="loss_ratio")
+    learner = build_hyper_cez_learner(context)
+    learner.on_task_boundary(1)
+    metrics = learner.train_step(_filled_buffer(context.config), skip_reanalyze=True)
+    assert metrics["cl_beta"] > 0.0
+    assert metrics["cl_lambda/dynamics_model"] == 0.0
+    assert learner._jit_component_reg is None
+
+
+@pytest.mark.parametrize(
+    "overrides",
+    [
+        {"reg_balance": "bogus"},
+        {"reg_drift_budget": 0.0},
+        {"reg_lambda_init": 0.01},
+    ],
+)
+def test_fix_target_rejects_invalid_balance_configs(
+    cartpole_training_env: TrainingEnv,
+    overrides: dict,
+) -> None:
+    with pytest.raises(ValueError):
+        build_hyper_cez_learner(_balanced_context(cartpole_training_env, **overrides))
+
+
 @pytest.mark.parametrize(
     "overrides",
     [

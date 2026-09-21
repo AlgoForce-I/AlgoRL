@@ -139,7 +139,7 @@ def batch_initial_values(
     if obs.ndim == 1:
         obs = obs.reshape(1, -1)
     batch_size = obs.shape[0]
-    outputs: list[np.ndarray] = []
+    outputs: list[jnp.ndarray] = []
     slices = int(np.ceil(batch_size / mini_batch_size))
     key = rng_key
     for slice_index in range(slices):
@@ -148,9 +148,14 @@ def batch_initial_values(
         chunk = jnp.asarray(obs[start:end], dtype=jnp.float32)
         key, infer_key = jax.random.split(key)
         infer_keys = jax.random.split(infer_key, chunk.shape[0])
-        values = np.asarray(infer_fn(params, chunk, infer_keys), dtype=np.float32)
-        outputs.append(values.reshape(-1))
-    return np.concatenate(outputs, axis=0)
+        # Keep the result on device: pulling each slice to the host blocks the
+        # dispatch queue once per slice (11 syncs per gradient step at the
+        # default sizes). Slice shapes are unchanged, so the kernels and their
+        # numerics are identical; only the transfers are batched.
+        outputs.append(jnp.reshape(infer_fn(params, chunk, infer_keys), (-1,)))
+    if not outputs:
+        return np.zeros((0,), dtype=np.float32)
+    return np.asarray(jnp.concatenate(outputs, axis=0), dtype=np.float32)
 
 
 def _batched_search_outputs(

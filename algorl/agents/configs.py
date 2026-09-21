@@ -378,7 +378,13 @@ class HyperCEZConfig(EfficientZeroConfig):
     chunked HyperCL-style generators (``chunk_dim`` / ``cemb_size``).
 
     ``cl_strategy`` selects how earlier tasks are protected. ``"fix_target"``
-    is the HyperCL output regularizer (β-weighted, with lookahead).
+    is the HyperCL output regularizer (with lookahead); ``reg_balance`` sets
+    how it is weighed against the task gradient. ``"gradient"`` balances per
+    hypernet component in gradient space: the part of the task gradient that
+    would increase drift is projected out, the regularizer gradient is scaled
+    to ``λ_c ×`` the task-gradient norm, and ``λ_c`` is steered so the relative
+    drift of earlier tasks' generated weights stays at ``reg_drift_budget``.
+    ``"loss_ratio"`` is the original β = beta · |L_task| / L_reg heuristic.
     ``"nullspace"`` drops the regularizer and projects every hypernet update
     onto the directions that leave previous tasks' layer activations unchanged:
     old generated weights stay fixed and the current task trains the remaining
@@ -439,6 +445,20 @@ class HyperCEZConfig(EfficientZeroConfig):
     reg_scaling_max: float = 4.0
     retention_log_interval: int = 500  # log fix-target drift; 0 disables
     cl_strategy: str = "fix_target"  # "fix_target" | "nullspace"
+    reg_balance: str = "gradient"  # "gradient" | "loss_ratio" (original β heuristic)
+    # Allowed relative drift of earlier tasks' generated weights during one task,
+    # mean_j ||f(e_j) - f*_j||² / mean_j ||f*_j||² per component. The fix-target
+    # CW10 run drifted 3e-9..7e-8 per task (median ~1e-8) and kept retention.
+    reg_drift_budget: float = 2e-8
+    # ||λ-scaled reg grad|| / ||task grad|| before any drift has been measured.
+    # Start strict and let the controller loosen. On the CW10 checkpoint, λ=1
+    # overshot the budget ~1000x within 16 steps of a new task, while λ anywhere
+    # in 100..9000 gave the same drift (the optimizer jitter floor).
+    reg_lambda_init: float = 100.0
+    reg_lambda_min: float = 0.1
+    reg_lambda_max: float = 1e3
+    reg_balance_interval: int = 100  # train steps between drift measurements
+    reg_conflict_projection: bool = True  # drop the task-gradient part that raises drift
     # Singular values below rel_tol * max are treated as numerical noise when
     # building the protected subspace of previous-task activations.
     nullspace_rel_tol: float = 1e-6

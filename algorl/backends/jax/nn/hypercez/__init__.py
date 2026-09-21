@@ -26,7 +26,9 @@ from algorl.backends.jax.nn.hypercez.regularizer import (
     RegTargets,
     calc_component_reg_loss,
     calc_fix_target_reg,
+    calc_per_component_reg,
     reg_scaling_from_ema,
+    reg_target_sq_norms,
     snapshot_reg_targets,
     update_per_task_reg_ema,
 )
@@ -62,6 +64,8 @@ __all__ = [
     "RegTargets",
     "calc_component_reg_loss",
     "calc_fix_target_reg",
+    "calc_per_component_reg",
+    "reg_target_sq_norms",
     "partition_params",
     "path_strings",
     "reg_scaling_from_ema",

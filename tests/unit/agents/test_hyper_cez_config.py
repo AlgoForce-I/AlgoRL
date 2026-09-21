@@ -48,6 +48,11 @@ def test_hypercez_config_defaults() -> None:
     assert config.use_per_task_reg_scaling is False
     assert config.cl_strategy == "fix_target"
     assert config.nullspace_rel_tol == 1e-6
+    assert config.reg_balance == "gradient"
+    assert config.reg_drift_budget == 2e-8
+    assert config.reg_lambda_min <= config.reg_lambda_init <= config.reg_lambda_max
+    assert config.reg_balance_interval == 100
+    assert config.reg_conflict_projection is True
 
 
 def test_hypercez_config_chunked_override() -> None:

@@ -165,6 +165,24 @@ def test_discover_eval_tasks_from_cw_train_env() -> None:
     assert all(task.kind == "cw" for task in tasks)
 
 
+def test_discover_eval_tasks_uses_cw_task_indices() -> None:
+    class _CWRaw:
+        benchmark_name = "CW10"
+        num_tasks = 1
+        task_names = ("push-back-v3",)
+        task_indices = (3,)
+
+    env = TrainingEnv(
+        observation_space=gym.spaces.Box(low=-1.0, high=1.0, shape=(3,), dtype=np.float32),
+        action_space=gym.spaces.Box(low=-1.0, high=1.0, shape=(1,), dtype=np.float32),
+        raw=_CWRaw(),
+    )
+    tasks = discover_eval_tasks(env)
+    assert [task.name for task in tasks] == ["push-back-v3"]
+    assert [task.task_index for task in tasks] == [3]
+    assert tasks[0].kind == "cw"
+
+
 def test_discover_eval_tasks_from_gymnasium_env() -> None:
     env = TrainingEnv.from_gymnasium(gym.make("CartPole-v1"))
     tasks = discover_eval_tasks(env)

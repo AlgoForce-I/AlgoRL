@@ -63,6 +63,13 @@ RESUME_ALLOWLIST: frozenset[str] = frozenset(
         "frozen_base_weights",
         "cl_strategy",
         "nullspace_rel_tol",
+        "reg_balance",
+        "reg_drift_budget",
+        "reg_lambda_init",
+        "reg_lambda_min",
+        "reg_lambda_max",
+        "reg_balance_interval",
+        "reg_conflict_projection",
     }
 )
 

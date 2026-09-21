@@ -58,6 +58,15 @@ def hypercez_checkpoint_state(learner: Any) -> dict[str, Any]:
     }
 
 
+def reg_balance_lambda_list(learner: Any) -> list[float] | None:
+    state = getattr(learner, "_reg_balance_state", None)
+    if state is None:
+        return None
+    import numpy as np
+
+    return [float(value) for value in np.asarray(state["lambda"])]
+
+
 def apply_hypercez_learner_state(
     learner: Any,
     *,
@@ -96,6 +105,16 @@ def apply_hypercez_learner_state(
     learner._obs_running_count = int(meta["obs_running_count"])
     learner._ema_task_loss = meta.get("ema_task_loss")
     learner._ema_reg_loss = meta.get("ema_reg_loss")
+    # Older checkpoints predate reg balancing: start from the configured λ.
+    # Gradient-norm EMAs are not saved; they refill within a few steps.
+    from algorl.backends.jax.learners.hypercez.learner import _default_reg_balance
+
+    balance = _default_reg_balance(learner.config)
+    saved_lambda = meta.get("reg_balance_lambda")
+    if saved_lambda is not None and len(saved_lambda) == len(learner.config.hnet_components):
+        balance["lambda"] = jnp.asarray(saved_lambda, dtype=jnp.float32)
+    learner._reg_balance_state = balance
+    learner._reset_reg_lambda_history()
 
     learner.world_model.set_task_id(learner.task_id)
     learner._jit_materialize = jax.jit(
@@ -129,6 +148,7 @@ def save_hypercez_learner(learner: Any, directory: str | Path) -> None:
             "obs_running_count": int(learner._obs_running_count),
             "ema_task_loss": learner._ema_task_loss,
             "ema_reg_loss": learner._ema_reg_loss,
+            "reg_balance_lambda": reg_balance_lambda_list(learner),
         },
     )
     save_pytree(directory / "data", hypercez_checkpoint_state(learner))
