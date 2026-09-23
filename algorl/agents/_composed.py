@@ -9,6 +9,7 @@ from algorl.agents._compose import compose_agent
 from algorl.agents.configs import BaseAgentConfig, EfficientZeroConfig
 from algorl.common.checkpoints import (
     load_run_checkpoint,
+    require_checkpointable,
     save_run_checkpoint,
     split_resume_overrides,
     write_resume_overrides,
@@ -124,6 +125,7 @@ class ComposedAgent(Agent):
 
     def save(self, path: str) -> None:
         """Persist a full multi-file run checkpoint to ``path`` (directory)."""
+        require_checkpointable(self.learner, role="Learner")
         task_id = getattr(self.learner, "task_id", None)
         step = int(getattr(self.learner, "_train_steps", 0))
         save_run_checkpoint(

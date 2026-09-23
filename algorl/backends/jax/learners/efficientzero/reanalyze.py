@@ -78,11 +78,6 @@ def resolve_reanalyze_search_width(
     return validate_search_batch_size(int(value))
 
 
-def effective_reanalyze_search_batch_size(config: EfficientZeroConfig) -> int:
-    """MCTS width for training-time policy reanalyze (independent of rollout width)."""
-    return resolve_reanalyze_search_width(config)
-
-
 def mcts_temperature(config: EfficientZeroConfig, trained_steps: int) -> float:
     """MCTS temperature schedule for reanalyze."""
     if not config.change_temperature:

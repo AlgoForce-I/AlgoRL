@@ -909,7 +909,7 @@ def _apply_reanalyze_outputs(
         dtype=jnp.float32,
     )
     arrays["search_values"] = jnp.asarray(
-        _merge_reanalyze_1d(arrays["search_values"], search_values, reanalyze_count),
+        _merge_reanalyze(arrays["search_values"], search_values, reanalyze_count),
         dtype=jnp.float32,
     )
     arrays["policy_candidates"] = jnp.asarray(
@@ -1060,16 +1060,6 @@ def _stack_training_batches(batches: list[dict[str, jnp.ndarray]]) -> dict[str, 
 
 
 def _merge_reanalyze(
-    original: jnp.ndarray | np.ndarray,
-    refreshed: np.ndarray,
-    count: int,
-) -> np.ndarray:
-    merged = np.asarray(original, dtype=np.float32).copy()
-    merged[:count] = refreshed[:count]
-    return merged
-
-
-def _merge_reanalyze_1d(
     original: jnp.ndarray | np.ndarray,
     refreshed: np.ndarray,
     count: int,

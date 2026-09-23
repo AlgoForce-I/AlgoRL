@@ -18,6 +18,7 @@ from algorl.common.checkpoints.manifest import (
     write_json,
     write_manifest,
 )
+from algorl.core.checkpointable import Checkpointable
 
 
 def _config_to_jsonable(config: Any) -> dict[str, Any]:
@@ -28,6 +29,25 @@ def _config_to_jsonable(config: Any) -> dict[str, Any]:
     else:
         raise TypeError(f"Cannot serialize config type {type(config)!r}.")
     return json.loads(json.dumps(raw, default=str))
+
+
+def require_checkpointable(component: Any, *, role: str) -> Checkpointable:
+    """Return ``component`` if it satisfies :class:`Checkpointable`, else raise.
+
+    Checked before a staging directory is written so a component that cannot be
+    persisted fails the checkpoint outright rather than leaving a partial one.
+    """
+    if not isinstance(component, Checkpointable):
+        missing = [
+            f"{name}(directory)"
+            for name in ("save", "load")
+            if not callable(getattr(component, name, None))
+        ]
+        raise TypeError(
+            f"{role} {type(component)!r} does not satisfy Checkpointable: "
+            f"missing {', '.join(missing)}."
+        )
+    return component
 
 
 def _find_continual_env(env: Any) -> Any | None:
@@ -61,6 +81,9 @@ def save_run_checkpoint(
     extra_meta: dict[str, Any] | None = None,
 ) -> Path:
     """Atomically write a full training-run checkpoint directory."""
+    # Validated before any directory exists: a learner that cannot persist
+    # itself fails the checkpoint outright instead of leaving a staging dir.
+    require_checkpointable(learner, role="Learner")
     final_dir = Path(directory)
     staging = prepare_staging_dir(final_dir)
     artifacts: dict[str, str] = {
@@ -75,13 +98,10 @@ def save_run_checkpoint(
         write_json(staging / "logger.json", {"history": logger_history})
         artifacts["logger"] = "logger.json"
 
-    if hasattr(learner, "save"):
-        learner.save(staging / "learner")
-        artifacts["learner"] = "learner"
-    else:
-        raise TypeError(f"Learner {type(learner)!r} has no save().")
+    learner.save(staging / "learner")
+    artifacts["learner"] = "learner"
 
-    if hasattr(replay_buffer, "save"):
+    if isinstance(replay_buffer, Checkpointable):
         replay_buffer.save(staging / "buffer")
         artifacts["buffer"] = "buffer"
 
@@ -126,11 +146,10 @@ def load_run_checkpoint(
     artifacts = manifest["artifacts"]
 
     if "learner" in artifacts:
-        if not hasattr(learner, "load"):
-            raise TypeError(f"Learner {type(learner)!r} has no load().")
+        require_checkpointable(learner, role="Learner")
         learner.load(directory / artifacts["learner"])
 
-    if "buffer" in artifacts and hasattr(replay_buffer, "load"):
+    if "buffer" in artifacts and isinstance(replay_buffer, Checkpointable):
         replay_buffer.load(directory / artifacts["buffer"])
 
     loop_state = read_json(directory / artifacts.get("loop", "loop.json"))

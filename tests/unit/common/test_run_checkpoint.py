@@ -181,3 +181,57 @@ def test_learn_rejects_structural_overrides() -> None:
     agent = HyperCEZ(env, config=config)
     with pytest.raises(ValueError, match="hnet_arch"):
         agent.learn(total_timesteps=1, config_overrides={"hnet_arch": (8, 8)})
+
+
+def test_checkpointable_protocol_matches_the_real_components() -> None:
+    """The components a run checkpoint persists must satisfy the protocol."""
+    from algorl.backends.jax.learners.efficientzero.learner import EfficientZeroLearner
+    from algorl.backends.jax.learners.hypercez.learner import HyperCEZLearner
+    from algorl.buffers.efficientzero import EfficientZeroReplayBuffer
+    from algorl.core import Checkpointable
+
+    assert issubclass(EfficientZeroLearner, Checkpointable)
+    assert issubclass(HyperCEZLearner, Checkpointable)
+    # The buffer is optional in a checkpoint, but ours opts in.
+    assert issubclass(EfficientZeroReplayBuffer, Checkpointable)
+
+
+def test_require_checkpointable_names_what_is_missing() -> None:
+    from algorl.common.checkpoints import require_checkpointable
+    from algorl.core import Checkpointable
+
+    class HalfDone:
+        def save(self, directory) -> None: ...
+
+    class Done(HalfDone):
+        def load(self, directory) -> None: ...
+
+    assert not isinstance(HalfDone(), Checkpointable)
+    with pytest.raises(TypeError, match=r"missing load\(directory\)"):
+        require_checkpointable(HalfDone(), role="Learner")
+    with pytest.raises(TypeError, match=r"missing save\(directory\), load\(directory\)"):
+        require_checkpointable(object(), role="Learner")
+
+    done = Done()
+    assert require_checkpointable(done, role="Learner") is done
+
+
+def test_save_run_checkpoint_rejects_a_non_checkpointable_learner(tmp_path: Path) -> None:
+    """A learner that cannot persist itself must fail before anything is written."""
+    from algorl.common.checkpoints import save_run_checkpoint
+
+    target = tmp_path / "run"
+    with pytest.raises(TypeError, match="does not satisfy Checkpointable"):
+        save_run_checkpoint(
+            directory=target,
+            agent_name="test",
+            step=0,
+            config=EfficientZeroConfig(),
+            learner=object(),
+            replay_buffer=object(),
+            env=None,
+            loop_state={"step": 0},
+        )
+    assert not target.exists()
+    # and no staging directory is left behind
+    assert not target.with_name(target.name + ".tmp").exists()

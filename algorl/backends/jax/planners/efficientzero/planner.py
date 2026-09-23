@@ -24,6 +24,8 @@ from algorl.backends.jax.planners.mcts.continuous import (
 from algorl.backends.jax.planners.mcts.core import (
     NormalizedObservationBatch,
     ObservationBatch,
+    _action_from_batch,
+    _slice_search_tree,
     normalize_observation_batch,
     validate_search_batch_size,
 )
@@ -387,16 +389,3 @@ def _observations_to_array(observations: NormalizedObservationBatch) -> jnp.ndar
     arrays = [jnp.asarray(observation, dtype=jnp.float32) for observation in observations.items]
     return jnp.stack(arrays, axis=0)
 
-
-def _action_from_batch(actions: jnp.ndarray, index: int) -> Action:
-    selected = actions[index]
-    if actions.ndim == 1:
-        return int(selected)
-    return jnp.asarray(selected)
-
-
-def _slice_search_tree(tree: Any, index: int) -> Any:
-    return jax.tree.map(
-        lambda leaf: leaf[index] if hasattr(leaf, "shape") and len(leaf.shape) > 0 else leaf,
-        tree,
-    )

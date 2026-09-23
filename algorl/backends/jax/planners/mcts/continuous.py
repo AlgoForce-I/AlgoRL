@@ -18,6 +18,7 @@ from mctx._src import search as mctx_search
 from mctx._src.action_selection import switching_action_selection_wrapper
 from mctx._src.base import InteriorActionSelectionFn
 
+from algorl.backends.jax.nn.efficientzero.losses import squashed_normal_log_prob
 from algorl.backends.jax.nn.efficientzero.model import EfficientZero as EfficientZeroNetwork
 from algorl.backends.jax.nn.efficientzero.model import Params
 from algorl.backends.jax.planners.mcts.core import RecurrentFn
@@ -180,19 +181,6 @@ def initial_step_fn_from_world_model(world_model: SupportsRecurrentStep) -> Init
     return step
 
 
-def _squashed_normal_log_prob(mean: Array, std: Array, actions: Array) -> Array:
-    clipped = jnp.clip(actions, -0.999, 0.999)
-    pre_tanh = jnp.arctanh(clipped)
-    safe_std = jnp.maximum(std, 1e-6)
-    var = safe_std**2
-    log_gaussian = -0.5 * jnp.sum(
-        ((pre_tanh - mean) ** 2) / var + 2.0 * jnp.log(safe_std) + jnp.log(2.0 * jnp.pi),
-        axis=-1,
-    )
-    log_det = jnp.sum(jnp.log(1.0 - jnp.tanh(pre_tanh) ** 2 + 1e-6), axis=-1)
-    return log_gaussian - log_det
-
-
 def sample_actions(
     policy: Array,
     rng: Array,
@@ -245,7 +233,7 @@ def sample_actions(
             maxval=1.0,
         )
         sampled = jnp.concatenate([policy_actions, random_actions, uniform_actions], axis=1)
-        random_log_prob_all = _squashed_normal_log_prob(
+        random_log_prob_all = squashed_normal_log_prob(
             mean[:, None, :],
             random_std[:, None, :],
             jnp.clip(sampled, -0.999, 0.999),
@@ -255,7 +243,7 @@ def sample_actions(
         random_log_prob_all = jnp.zeros((batch_size, num_sampled), dtype=jnp.float32)
 
     all_actions = jnp.clip(sampled, -0.999, 0.999)
-    policy_log_prob = _squashed_normal_log_prob(
+    policy_log_prob = squashed_normal_log_prob(
         mean[:, None, :],
         safe_std[:, None, :],
         all_actions,
@@ -1182,14 +1170,6 @@ def _tree_children_slice(
 
 def _tree_node_values(tree: ContinuousMCTSTree, node_index: NodeIndex) -> Array:
     return tree.node_values[node_index]
-
-
-def _tree_children_rewards(tree: ContinuousMCTSTree, node_index: NodeIndex, action: int) -> Array:
-    return _tree_children_slice(tree.children_rewards, node_index, action + 1)[action]
-
-
-def _tree_children_values(tree: ContinuousMCTSTree, node_index: NodeIndex, action: int) -> Array:
-    return _tree_children_slice(tree.children_values, node_index, action + 1)[action]
 
 
 def _tree_children_index(tree: ContinuousMCTSTree, node_index: NodeIndex) -> Array:
