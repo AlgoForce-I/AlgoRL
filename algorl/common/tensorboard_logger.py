@@ -7,7 +7,7 @@ from collections import defaultdict
 from typing import Any
 
 from algorl.common.episode_metrics import EpisodeEndEvent, episode_metrics_from_event, sanitize_task_name
-from algorl.common.logger import Logger
+from algorl.common.logger import DEFAULT_HISTORY_LIMIT, Logger
 
 
 class _ScalarWriter:
@@ -41,8 +41,13 @@ class _ScalarWriter:
 class TensorboardLogger(Logger):
     """Logger that mirrors scalar metrics to TensorBoard event files."""
 
-    def __init__(self, log_dir: str) -> None:
-        super().__init__()
+    def __init__(
+        self,
+        log_dir: str,
+        *,
+        history_limit: int | None = DEFAULT_HISTORY_LIMIT,
+    ) -> None:
+        super().__init__(history_limit=history_limit)
         self.log_dir = log_dir
         self._writer = _ScalarWriter(log_dir)
         self._closed = False

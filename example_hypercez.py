@@ -2,7 +2,12 @@ from __future__ import annotations
 
 from algorl.backends.jax.memory import configure_jax_gpu_memory
 
-configure_jax_gpu_memory(preallocate=False, memory_fraction=0.85)
+configure_jax_gpu_memory(preallocate=False, memory_fraction=0.85, reserve_gb=14.0)
+
+import jax
+
+jax.config.update("jax_compilation_cache_dir", "/home/algoritmi/data/HyperCEZ_data/jax_cache")
+jax.config.update("jax_persistent_cache_min_compile_time_secs", 1.0)
 
 import algorl as arl
 from algorl.backends.jax.envs import make_batched_cw_train_env
@@ -13,9 +18,9 @@ NUM_ENVS = 32
 NUM_TASKS = 10
 STEPS_PER_TASK = 1_000_000
 TOTAL_TIMESTEPS = NUM_TASKS * STEPS_PER_TASK
-TENSORBOARD_LOG_DIR = "runs/cw10_hypercez_cl_unchuncked"
+RUNS_DIR = "/home/algoritmi/data/HyperCEZ_data/runs"
+TENSORBOARD_LOG_DIR = f"{RUNS_DIR}/cw10_hypercez_fix target"
 CHECKPOINT_DIR = f"{TENSORBOARD_LOG_DIR}/checkpoints"
-# Set to e.g. f"{CHECKPOINT_DIR}/boundary_task_0" to continue after task 0.
 RESUME_FROM: str | None = None
 
 
@@ -28,6 +33,13 @@ def main() -> None:
     )
     config = arl.HyperCEZConfig.for_batched(
         num_envs=NUM_ENVS,
+        # Fix-target regularizer, balanced per hypernet component in gradient
+        # space. λ tightens while earlier tasks' generated weights are drifting
+        # past reg_drift_budget, and never past the point where the new task
+        # keeps reg_task_share_floor of its own gradient.
+        # cl_strategy="nullspace" swaps in exact null-space projection instead.
+        cl_strategy="fix_target",
+        reg_balance="gradient",
         checkpoint_dir=CHECKPOINT_DIR,
         checkpoint_freq=STEPS_PER_TASK,
         autosave_best=True,
@@ -36,13 +48,15 @@ def main() -> None:
     agent = arl.HyperCEZ(env, config=config)
     agent.learn(
         total_timesteps=TOTAL_TIMESTEPS,
+        eval_period=200_000,
+        eval_episodes=20,
         tensorboard_log_dir=TENSORBOARD_LOG_DIR,
         checkpoint_dir=CHECKPOINT_DIR,
         resume_from=RESUME_FROM,
         progress_bar=True,
         callbacks=HyperCEZRetentionCallback(
             agent.learner,
-            eval_every_steps=STEPS_PER_TASK // 10,
+            retention_every_steps=STEPS_PER_TASK // 10,
         ),
     )
 

@@ -6,6 +6,7 @@ import numpy as np
 import jax.numpy as jnp
 
 from algorl.backends.jax.nn.efficientzero.obs_norm import (
+    OBS_RUNNING_COUNT_DTYPE,
     compute_tentative_obs_stats,
     compute_tentative_obs_stats_jax,
     update_mean_var_count_from_moments,
@@ -56,7 +57,7 @@ def test_obs_norm_keeps_exact_python_count() -> None:
     assert np.all(np.isfinite(updated["representation_model"]["running_var"]))
 
 
-def test_jax_obs_norm_preserves_int32_count_in_carry() -> None:
+def test_jax_obs_norm_count_is_float32_carry() -> None:
     params = {
         "representation_model": {
             "running_mean": jnp.zeros((4,), dtype=jnp.float32),
@@ -64,10 +65,26 @@ def test_jax_obs_norm_preserves_int32_count_in_carry() -> None:
         }
     }
     obs = jnp.ones((8, 4), dtype=jnp.float32)
-    updated, count = update_representation_obs_stats_jax(params, obs, count=jnp.int32(1_500_000_000))
-    assert int(count) == 1_500_000_008
-    assert count.dtype == jnp.int32
+    updated, count = update_representation_obs_stats_jax(params, obs, count=1000)
+    assert int(count) == 1008
+    assert count.dtype == OBS_RUNNING_COUNT_DTYPE
     assert "running_count" not in updated["representation_model"]
+
+
+def test_jax_obs_norm_count_does_not_wrap_past_int32_max() -> None:
+    params = {
+        "representation_model": {
+            "running_mean": jnp.zeros((4,), dtype=jnp.float32),
+            "running_var": jnp.ones((4,), dtype=jnp.float32),
+        }
+    }
+    obs = jnp.ones((8, 4), dtype=jnp.float32)
+    past_int32 = 3_000_000_000.0
+    _, count = update_representation_obs_stats_jax(params, obs, count=past_int32)
+    # int32 would wrap to a negative value; float32 stays positive and finite.
+    assert float(count) > 0.0
+    assert np.isfinite(count)
+    np.testing.assert_allclose(float(count), past_int32 + 8, rtol=0.0, atol=256.0)
 
 
 def test_tentative_obs_stats_match_committed_update() -> None:
@@ -125,12 +142,12 @@ def test_jax_tentative_obs_stats_match_committed_update() -> None:
     tentative_mean, tentative_var, tentative_count = compute_tentative_obs_stats_jax(
         params,
         obs,
-        count=jnp.int32(1000),
+        count=1000,
     )
     updated, committed_count = update_representation_obs_stats_jax(
         params,
         obs,
-        count=jnp.int32(1000),
+        count=1000,
     )
     assert int(committed_count) == int(tentative_count)
     np.testing.assert_allclose(

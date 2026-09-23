@@ -75,6 +75,7 @@ class TrainingLoop:
         self._recent_returns: list[float] = []
         self._best_score = float("-inf")
         self._skip_initial_env_reset = False
+        self._evaluator = None
 
     def restore_run_checkpoint(self, directory: str | Path) -> dict[str, Any]:
         """Load learner/buffer/env/logger state from a multi-file checkpoint."""
@@ -108,6 +109,9 @@ class TrainingLoop:
         start_step: int = 0,
         extra_step_info: dict[str, Any] | None = None,
         progress_bar: TqdmProgressBar | None = None,
+        eval_period: int | None = None,
+        eval_env_factory: Any | None = None,
+        eval_episodes: int | None = None,
     ) -> None:
         """Interact with the environment and call ``learner.train_step`` on schedule."""
         if checkpoint_dir is not None:
@@ -116,8 +120,25 @@ class TrainingLoop:
             # Treat legacy path as a checkpoint directory root.
             self._checkpoint_dir = checkpoint_path
         self._progress_bar = progress_bar
+        self._evaluator = None
+        period = None if eval_period is None else int(eval_period)
+        if period is not None and period > 0:
+            from algorl.core.evaluation import PeriodicEvaluator, EVAL_EPISODES
+
+            self._evaluator = PeriodicEvaluator(
+                period=period,
+                train_env=self.env,
+                planner=self.planner,
+                learner=self.learner,
+                logger=self.logger,
+                seed=int(self.config.seed),
+                start_step=start_step,
+                env_factory=eval_env_factory,
+                num_episodes=eval_episodes if eval_episodes is not None else EVAL_EPISODES,
+            )
         if progress_bar is not None:
-            progress_bar.start(total_timesteps)
+            progress_bar.start(total_timesteps, initial=max(0, int(start_step)))
+        completed_ok = False
         try:
             if self.env.is_batched:
                 self._run_batched(
@@ -126,14 +147,20 @@ class TrainingLoop:
                     extra_step_info=extra_step_info,
                     progress_bar=progress_bar,
                 )
-                return
-            self._run_sequential(
-                total_timesteps,
-                start_step=start_step,
-                extra_step_info=extra_step_info,
-                progress_bar=progress_bar,
-            )
+            else:
+                self._run_sequential(
+                    total_timesteps,
+                    start_step=start_step,
+                    extra_step_info=extra_step_info,
+                    progress_bar=progress_bar,
+                )
+            completed_ok = True
         finally:
+            if completed_ok:
+                self._maybe_eval(total_timesteps, total_timesteps, at_end=True)
+            if self._evaluator is not None:
+                self._evaluator.close()
+            self._evaluator = None
             self._progress_bar = None
             if progress_bar is not None:
                 progress_bar.close()
@@ -183,6 +210,7 @@ class TrainingLoop:
                 if callable(clear_buffer):
                     clear_buffer()
                 self._min_train_step = step + 1 + self.config.learning_starts
+                self._reset_autosave_best_for_new_task()
                 self._maybe_boundary_checkpoint(step, metrics)
 
             if done:
@@ -202,6 +230,7 @@ class TrainingLoop:
             self._maybe_checkpoint(step, metrics)
             if progress_bar is not None:
                 progress_bar.update(step_info)
+            self._maybe_eval(step + 1, total_timesteps)
 
     def _run_batched(
         self,
@@ -297,6 +326,7 @@ class TrainingLoop:
                     metrics,
                     progress_bar=progress_bar,
                 )
+            self._maybe_eval(steps_collected, total_timesteps)
 
     def _apply_task_boundary(
         self,
@@ -327,6 +357,7 @@ class TrainingLoop:
             clear_buffer()
         boundary_step = chunk_start_step + boundary + 1
         self._min_train_step = boundary_step + self.config.learning_starts
+        self._reset_autosave_best_for_new_task()
         self._maybe_boundary_checkpoint(boundary_step, {})
         return transitions[boundary + 1:], boundary + 1
 
@@ -737,6 +768,23 @@ class TrainingLoop:
         self._maybe_record_memory(step)
         return step_info
 
+    def _maybe_eval(
+        self,
+        completed_steps: int,
+        total_timesteps: int,
+        *,
+        at_end: bool = False,
+    ) -> None:
+        evaluator = getattr(self, "_evaluator", None)
+        if evaluator is None:
+            return
+        evaluator.maybe_run(
+            int(completed_steps),
+            total_timesteps=int(total_timesteps),
+            at_end=at_end,
+            progress_bar=self._progress_bar,
+        )
+
     def _loop_checkpoint_state(self, step: int) -> dict[str, Any]:
         task_id = getattr(self.learner, "task_id", self._env_current_task_index())
         return {
@@ -805,6 +853,22 @@ class TrainingLoop:
             extra_meta={"buffer_cleared": True, "finished_task": finished},
         )
 
+    def _reset_autosave_best_for_new_task(self) -> None:
+        """Clear the global best bar so each CL task can claim its own best."""
+        if not getattr(self.config, "autosave_best_per_task", False):
+            return
+        self._best_score = float("-inf")
+        self._recent_returns = []
+
+    def _autosave_best_target(self) -> tuple[str, str]:
+        """Return ``(tag, subdirectory)`` for the next autosave-best write."""
+        if getattr(self.config, "autosave_best_per_task", False):
+            task_id = getattr(self.learner, "task_id", self._env_current_task_index())
+            if task_id is not None:
+                name = f"best_task_{int(task_id)}"
+                return name, name
+        return "best", "best"
+
     def _maybe_autosave_best(
         self,
         step: int,
@@ -832,23 +896,30 @@ class TrainingLoop:
         if score <= self._best_score:
             return
         self._best_score = score
+        tag, subdirectory = self._autosave_best_target()
         self._write_run_checkpoint(
             step,
-            tag="best",
-            subdirectory="best",
+            tag=tag,
+            subdirectory=subdirectory,
             extra_meta={
                 "best_score": score,
                 "best_metric": metric_name,
                 "best_window": window,
             },
         )
+        score_name = (
+            f"{subdirectory}_score.json"
+            if subdirectory != "best"
+            else "best_score.json"
+        )
         write_json(
-            Path(self._checkpoint_dir) / "best_score.json",
+            Path(self._checkpoint_dir) / score_name,
             {
                 "best_score": score,
                 "best_step": int(step),
                 "metric": metric_name,
                 "window": window,
+                "subdirectory": subdirectory,
             },
         )
 

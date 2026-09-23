@@ -770,3 +770,220 @@ def test_training_loop_syncs_task_id_from_env_current_task_index() -> None:
     loop.run(2)
     assert learner.boundary_calls == [2]
     assert learner.task_id == 2
+
+
+class _EvalCountingEnv:
+    """Wrap a sequential env and count train ``step`` calls."""
+
+    def __init__(self, base: TrainingEnv) -> None:
+        self._base = base
+        self.step_calls = 0
+
+    def reset(self, *, seed: int | None = None):
+        return self._base.reset(seed=seed)
+
+    def step(self, action):
+        self.step_calls += 1
+        return self._base.step(action)
+
+    @property
+    def observation_space(self):
+        return self._base.observation_space
+
+    @property
+    def action_space(self):
+        return self._base.action_space
+
+    @property
+    def raw(self):
+        return self._base.raw
+
+    @property
+    def unwrapped(self):
+        return self._base.unwrapped
+
+    @property
+    def is_batched(self):
+        return self._base.is_batched
+
+    @property
+    def num_envs(self):
+        return self._base.num_envs
+
+
+class _FakePeriodicEvalEnv:
+    def __init__(self, *, num_envs: int = 3, episode_len: int = 1) -> None:
+        self.num_envs = num_envs
+        self.episode_len = episode_len
+        self.action_widths: list[int] = []
+        self._t = 0
+
+    def reset(self, *, seed: int | None = None):
+        del seed
+        self._t = 0
+        return np.zeros((self.num_envs, 3), dtype=np.float32)
+
+    def step(self, actions):
+        self.action_widths.append(int(np.asarray(actions).shape[0]))
+        self._t += 1
+        rewards = np.ones((self.num_envs,), dtype=np.float32)
+        dones = np.full((self.num_envs,), self._t >= self.episode_len)
+        return np.zeros((self.num_envs, 3), dtype=np.float32), rewards, dones, [{} for _ in range(self.num_envs)]
+
+    def close(self) -> None:
+        return
+
+
+def test_training_loop_eval_period_none_does_not_touch_factory(cartpole_env: TrainingEnv) -> None:
+    def _factory(task):
+        raise AssertionError(f"eval factory should not run, got {task!r}")
+
+    config = BaseAgentConfig(learning_starts=10, train_freq=1, batch_size=1, seed=0)
+    loop = TrainingLoop(
+        env=cartpole_env,
+        planner=_RandomPlanner(cartpole_env.action_space),
+        learner=_NoOpLearner(),
+        replay_buffer=UniformReplayBuffer(capacity=100),
+        config=config,
+    )
+    loop.run(4, eval_period=None, eval_env_factory=_factory)
+    assert all("eval/mean_return" not in entry for entry in loop.logger.history)
+
+
+def test_training_loop_eval_period_does_not_step_train_env(cartpole_env: TrainingEnv) -> None:
+    env = _EvalCountingEnv(cartpole_env)
+    created: list[object] = []
+
+    def factory(task):
+        eval_env = _FakePeriodicEvalEnv()
+        created.append(eval_env)
+        return eval_env
+
+    config = BaseAgentConfig(learning_starts=10, train_freq=1, batch_size=1, seed=0)
+    planner = _RandomPlanner(cartpole_env.action_space)
+    loop = TrainingLoop(
+        env=env,
+        planner=planner,
+        learner=_NoOpLearner(),
+        replay_buffer=UniformReplayBuffer(capacity=100),
+        config=config,
+    )
+    loop.run(6, eval_period=3, eval_env_factory=factory)
+    assert env.step_calls == 6
+    assert created
+    eval_entries = [entry for entry in loop.logger.history if "eval/mean_return" in entry]
+    assert len(eval_entries) == 2
+    assert all(width == 3 for env_obj in created for width in env_obj.action_widths)
+
+
+def test_training_loop_eval_period_batched_runs_after_chunks() -> None:
+    num_envs = 2
+    env = _MockBatchedEnv(num_envs=num_envs)
+    collect_calls = {"n": 0}
+    original = env.collect_rollout
+
+    def counting_collect(policy, num_steps, *, key=None, on_step=None):
+        collect_calls["n"] += 1
+        return original(policy, num_steps, key=key, on_step=on_step)
+
+    env.collect_rollout = counting_collect  # type: ignore[method-assign]
+    created: list[_FakePeriodicEvalEnv] = []
+
+    def factory(task):
+        eval_env = _FakePeriodicEvalEnv()
+        created.append(eval_env)
+        return eval_env
+
+    class _TrackingBar:
+        def __init__(self) -> None:
+            self.pulses: list[dict[str, object]] = []
+
+        def start(self, total: int, **kwargs) -> None:
+            del total, kwargs
+
+        def update(self, step_info=None, *, n: int = 1) -> None:
+            del step_info, n
+
+        def pulse(self, step_info=None) -> None:
+            if step_info is not None:
+                self.pulses.append(dict(step_info))
+
+        def close(self) -> None:
+            return
+
+    config = BaseAgentConfig(
+        learning_starts=0,
+        train_freq=1,
+        batch_size=1,
+        seed=0,
+        jax_rollout_chunk=2,
+        gradient_steps_per_rollout=1,
+    )
+    progress_bar = _TrackingBar()
+    loop = TrainingLoop(
+        env=env,
+        planner=_BatchedPlanner(batch_size=num_envs),
+        learner=_NoOpLearner(),
+        replay_buffer=UniformReplayBuffer(capacity=100),
+        config=config,
+    )
+    train_collects_before = collect_calls["n"]
+    loop.run(8, eval_period=4, eval_env_factory=factory, progress_bar=progress_bar)
+    assert collect_calls["n"] > train_collects_before
+    eval_entries = [entry for entry in loop.logger.history if "eval/mean_return" in entry]
+    assert eval_entries
+    assert any(pulse.get("phase") == "eval" for pulse in progress_bar.pulses)
+    assert any("eval_step" in pulse for pulse in progress_bar.pulses)
+    assert all(width == 3 for eval_env in created for width in eval_env.action_widths)
+
+
+def test_training_loop_eval_period_runs_once_per_cl_task() -> None:
+    class _CWRaw:
+        benchmark_name = "CW10"
+        num_tasks = 2
+        task_names = ("hammer-v3", "push-v3")
+
+    env = _MockBatchedEnv(num_envs=2)
+    env.raw = _CWRaw()
+    tasks_seen: list[str] = []
+
+    def factory(task):
+        tasks_seen.append(task.name)
+        return _FakePeriodicEvalEnv()
+
+    config = BaseAgentConfig(
+        learning_starts=0,
+        train_freq=1,
+        batch_size=1,
+        seed=0,
+        jax_rollout_chunk=2,
+        gradient_steps_per_rollout=1,
+    )
+    loop = TrainingLoop(
+        env=env,
+        planner=_BatchedPlanner(batch_size=2),
+        learner=_NoOpLearner(),
+        replay_buffer=UniformReplayBuffer(capacity=100),
+        config=config,
+    )
+    loop.run(4, eval_period=4, eval_env_factory=factory)
+    assert tasks_seen == ["hammer-v3", "push-v3"]
+    eval_entries = [entry for entry in loop.logger.history if "eval/mean_return" in entry]
+    assert eval_entries
+    assert "eval/task/hammer-v3/mean_return" in eval_entries[0]
+    assert "eval/task/push-v3/mean_return" in eval_entries[0]
+
+
+def test_training_loop_eval_period_cartpole_infers_gym_env(cartpole_env: TrainingEnv) -> None:
+    config = BaseAgentConfig(learning_starts=10, train_freq=1, batch_size=1, seed=0)
+    loop = TrainingLoop(
+        env=cartpole_env,
+        planner=_RandomPlanner(cartpole_env.action_space),
+        learner=_NoOpLearner(),
+        replay_buffer=UniformReplayBuffer(capacity=100),
+        config=config,
+    )
+    loop.run(4, eval_period=4)
+    eval_entries = [entry for entry in loop.logger.history if "eval/mean_return" in entry]
+    assert len(eval_entries) == 1
+    assert eval_entries[0]["eval/mean_return"] >= 1.0

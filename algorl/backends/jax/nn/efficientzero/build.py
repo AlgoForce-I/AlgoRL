@@ -124,6 +124,7 @@ def _build_dmc_state_model(
         init_zero=config.init_zero,
         policy_distribution=config.policy_distribution,
         use_bn=config.use_bn,
+        policy_mean_bound=config.policy_mean_bound,
     )
     if config.value_prefix:
         reward_prediction_model = VectorRewardLSTMNetwork(
@@ -213,6 +214,7 @@ def _build_conv_model(
         v_num=config.v_num,
         init_zero=config.init_zero,
         continuous=continuous,
+        policy_mean_bound=config.policy_mean_bound,
     )
     if config.value_prefix:
         reward_prediction_model = ConvSupportLSTMNetwork(

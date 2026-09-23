@@ -147,6 +147,55 @@ def calc_component_reg_loss(
     return mean_reg
 
 
+def calc_per_component_reg(
+    hnet_params: dict[str, Any],
+    *,
+    hnet_modules: dict[str, Any],
+    hnet_components: tuple[str, ...],
+    task_id: int,
+    reg_targets: RegTargets,
+    dtheta: dict[str, Any] | None = None,
+) -> tuple[jnp.ndarray, jnp.ndarray]:
+    """Fix-target reg per component ``(C,)`` and component-mean per-task reg ``(task_id,)``.
+
+    ``jnp.mean`` of the first output equals :func:`calc_component_reg_loss`.
+    """
+    per_component: list[jnp.ndarray] = []
+    per_task_acc = jnp.zeros((max(task_id, 0),), dtype=jnp.float32)
+    for component_name in hnet_components:
+        component_dtheta = None if dtheta is None else dtheta.get(component_name)
+        component_reg, component_per_task = calc_fix_target_reg(
+            hnet_params[component_name],
+            hnet_module=hnet_modules[component_name],
+            task_id=task_id,
+            targets=reg_targets[component_name],
+            dtheta=component_dtheta,
+            return_per_task=True,
+        )
+        per_component.append(component_reg)
+        per_task_acc = per_task_acc + component_per_task
+    return jnp.stack(per_component), per_task_acc / float(len(hnet_components))
+
+
+def reg_target_sq_norms(
+    reg_targets: RegTargets,
+    hnet_components: tuple[str, ...],
+) -> jnp.ndarray:
+    """``mean_j ||f*_j||²`` per component: the scale that makes drift relative."""
+    norms = []
+    for component_name in hnet_components:
+        targets = reg_targets[component_name]
+        if not targets:
+            norms.append(jnp.asarray(0.0, dtype=jnp.float32))
+            continue
+        norms.append(
+            jnp.mean(
+                jnp.stack([jnp.sum(_flatten_outputs(target) ** 2) for target in targets])
+            )
+        )
+    return jnp.stack(norms)
+
+
 def reg_scaling_from_ema(
     ema_per_task: jnp.ndarray,
     task_id: int,

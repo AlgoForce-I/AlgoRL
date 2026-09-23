@@ -24,6 +24,8 @@ from algorl.backends.jax.planners.mcts.continuous import (
 from algorl.backends.jax.planners.mcts.core import (
     NormalizedObservationBatch,
     ObservationBatch,
+    _action_from_batch,
+    _slice_search_tree,
     normalize_observation_batch,
     validate_search_batch_size,
 )
@@ -146,6 +148,15 @@ def continuous_search_config_from_agent(
         else ContinuousSearchConfig().num_sampled_actions
     )
     base = search_config or ContinuousSearchConfig()
+    candidate_total = (
+        config.policy_action_num + config.random_action_num + config.uniform_action_num
+    )
+    if candidate_total != num_actions:
+        raise ValueError(
+            "policy_action_num + random_action_num + uniform_action_num must equal the "
+            f"root candidate count {num_actions}, got {config.policy_action_num} + "
+            f"{config.random_action_num} + {config.uniform_action_num} = {candidate_total}."
+        )
     return replace(
         base,
         num_simulations=config.mcts_simulations,
@@ -153,6 +164,7 @@ def continuous_search_config_from_agent(
         num_top_actions=num_actions,
         policy_action_num=config.policy_action_num,
         random_action_num=config.random_action_num,
+        uniform_action_num=config.uniform_action_num,
         std_magnification=config.std_magnification,
         discount=config.discount,
         gumbel_scale=0.0,
@@ -377,16 +389,3 @@ def _observations_to_array(observations: NormalizedObservationBatch) -> jnp.ndar
     arrays = [jnp.asarray(observation, dtype=jnp.float32) for observation in observations.items]
     return jnp.stack(arrays, axis=0)
 
-
-def _action_from_batch(actions: jnp.ndarray, index: int) -> Action:
-    selected = actions[index]
-    if actions.ndim == 1:
-        return int(selected)
-    return jnp.asarray(selected)
-
-
-def _slice_search_tree(tree: Any, index: int) -> Any:
-    return jax.tree.map(
-        lambda leaf: leaf[index] if hasattr(leaf, "shape") and len(leaf.shape) > 0 else leaf,
-        tree,
-    )

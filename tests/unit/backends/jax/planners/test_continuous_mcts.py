@@ -6,6 +6,7 @@ from dataclasses import replace
 
 import gymnasium as gym
 import jax
+import numpy as np
 import jax.numpy as jnp
 import mctx
 import pytest
@@ -48,6 +49,7 @@ def _stub_search_config(**overrides: object) -> ContinuousSearchConfig:
         "leaf_action_num": 2,
         "policy_action_num": 2,
         "random_action_num": 2,
+        "uniform_action_num": 0,
         "num_top_actions": 4,
         "use_gumbel_noise": False,
     }
@@ -140,12 +142,42 @@ def test_sample_actions_matches_efficientzero_v2_shapes() -> None:
         num_sampled_actions=8,
         policy_action_num=4,
         random_action_num=4,
+        uniform_action_num=0,
     )
     policy = jnp.zeros((2, 4), dtype=jnp.float32)
     rng = jax.random.PRNGKey(0)
     actions, log_probs = sample_actions(policy, rng, config=config)
     assert actions.shape == (2, 8, 2)
     assert log_probs.shape == (2, 8)
+
+
+def test_sample_actions_uniform_share_survives_a_saturated_policy() -> None:
+    """The uniform candidates must not inherit the policy's collapsed spread."""
+    config = ContinuousSearchConfig(
+        num_sampled_actions=16,
+        policy_action_num=4,
+        random_action_num=8,
+        uniform_action_num=4,
+        std_magnification=4.0,
+    )
+    # A policy pinned at the action-box corner: every Gaussian sample squashes
+    # onto the clip, which is what the 1M-step push-back run logged.
+    policy = jnp.concatenate(
+        [jnp.full((1, 2), 5.0, dtype=jnp.float32), jnp.full((1, 2), 0.1, dtype=jnp.float32)],
+        axis=-1,
+    )
+    actions, _ = sample_actions(policy, jax.random.PRNGKey(0), config=config)
+    assert actions.shape == (1, 16, 2)
+    gaussian = np.asarray(actions[0, :12])
+    uniform = np.asarray(actions[0, 12:])
+    assert np.ptp(gaussian, axis=0).max() < 1e-2, "saturated policy should give identical candidates"
+    assert np.ptp(uniform, axis=0).min() > 0.1, "uniform candidates should still span the box"
+
+    # Leaf expansion stays on-policy (no uniform share).
+    leaf, _ = sample_actions(
+        policy, jax.random.PRNGKey(0), config=config, add_noise=False, sample_nums=2
+    )
+    assert leaf.shape == (1, 2, 2)
 
 
 def test_build_continuous_root(world_model) -> None:

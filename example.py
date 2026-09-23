@@ -11,7 +11,9 @@ from MTCWorldMJX import CWConfig
 NUM_ENVS = 32
 STEPS_PER_TASK = 1_000_000
 TOTAL_TIMESTEPS = STEPS_PER_TASK
-TENSORBOARD_LOG_DIR = "runs/cw10_ez_hammer_poc"
+RUNS_DIR = "/home/algoritmi/data/HyperCEZ_data/runs"
+TASK_NAME = "push-back-v3"
+TENSORBOARD_LOG_DIR = f"{RUNS_DIR}/cw10_ez_push_back_poc"
 
 
 def for_cw10_batched(
@@ -49,6 +51,7 @@ def main() -> None:
         num_envs=NUM_ENVS,
         seed=42,
         config=CWConfig(seed=42, steps_per_task=STEPS_PER_TASK),
+        task_name=TASK_NAME,
     )
     agent = arl.EfficientZero(
         env,

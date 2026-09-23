@@ -11,6 +11,7 @@ import numpy as np
 from algorl.buffers.efficientzero.buffer import (
     EfficientZeroStep,
     EfficientZeroTrajectory,
+    _PriorityStore,
 )
 from algorl.common.checkpoints import (
     load_pytree,
@@ -189,7 +190,7 @@ def load_efficient_zero_buffer(buffer: Any, directory: str | Path) -> None:
     lookup = np.asarray(payload["lookup"], dtype=np.int64).reshape(-1, 2)
     buffer._lookup = [(int(row[0]), int(row[1])) for row in lookup]
     priorities = np.asarray(payload["priorities"], dtype=np.float64).reshape(-1)
-    buffer._priorities = [float(value) for value in priorities.tolist()]
+    buffer._priorities = _PriorityStore(priorities)
     if len(buffer._priorities) != len(buffer._lookup):
         raise ValueError(
             "Corrupt buffer checkpoint: "

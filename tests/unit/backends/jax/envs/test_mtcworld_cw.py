@@ -22,6 +22,7 @@ from algorl.backends.jax.envs import (
     make_batched_cw_train_env,
     search_env_from_context,
 )
+from algorl.backends.jax.envs.mtcworld_jax import _resolve_cw_task_selection
 from algorl.core.component_context import ComponentContext
 from algorl.envs import resolve_env
 
@@ -137,6 +138,26 @@ def test_batched_continual_task_schedule() -> None:
             seen_tasks.append(seq_idx)
 
     assert seen_tasks == [0, 1, 2]
+
+
+def test_resolve_cw_task_selection_single_slot() -> None:
+    names = (
+        "hammer-v3",
+        "push-wall-v3",
+        "faucet-close-v3",
+        "push-back-v3",
+    )
+    indices, selected = _resolve_cw_task_selection(names, task_name="push-back-v3")
+    assert indices == (3,)
+    assert selected == ("push-back-v3",)
+
+    indices, selected = _resolve_cw_task_selection(names, task_index=3)
+    assert indices == (3,)
+    assert selected == ("push-back-v3",)
+
+    indices, selected = _resolve_cw_task_selection(names)
+    assert indices == (0, 1, 2, 3)
+    assert selected == names
 
 
 def test_resolve_batched_continual_learning_env() -> None:

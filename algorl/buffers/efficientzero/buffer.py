@@ -38,11 +38,98 @@ def _sanitize_priority(value: float, *, min_prior: float) -> float:
     return float(np.clip(value, min_prior, _PRIORITY_VALUE_CLIP + min_prior))
 
 
-def _finite_max_priority(priorities: list[float], *, default: float = 1.0) -> float:
-    finite = [priority for priority in priorities if np.isfinite(priority)]
-    if not finite:
-        return default
-    return float(max(finite))
+class _PriorityStore:
+    """Growable float64 priority vector with the list API the buffer used.
+
+    ``_sample_indices`` reads every priority on each call, so a Python list
+    meant rebuilding a ``capacity``-sized array once per sampled batch. The
+    values are the same float64s a list held, so probabilities, draws and
+    importance weights are unchanged.
+    """
+
+    __slots__ = ("_values", "_size")
+
+    _MIN_CAPACITY = 1024
+
+    def __init__(self, values: np.ndarray | list[float] | None = None) -> None:
+        if values is None:
+            self._values = np.zeros((self._MIN_CAPACITY,), dtype=np.float64)
+            self._size = 0
+        else:
+            array = np.asarray(values, dtype=np.float64).reshape(-1)
+            self._values = array.copy()
+            self._size = int(array.shape[0])
+
+    @property
+    def values(self) -> np.ndarray:
+        """View of the live priorities (writes through to the store)."""
+        return self._values[: self._size]
+
+    def __len__(self) -> int:
+        return self._size
+
+    def __iter__(self):
+        return iter(self.values.tolist())
+
+    def __getitem__(self, index):
+        return self.values[index]
+
+    def __setitem__(self, index, value) -> None:
+        self.values[index] = value
+
+    def __array__(self, dtype=None, copy=None):
+        array = self.values
+        if dtype is not None and np.dtype(dtype) != array.dtype:
+            return array.astype(dtype)
+        return array if copy is False else array.copy()
+
+    def tolist(self) -> list[float]:
+        return self.values.tolist()
+
+    def append(self, value: float) -> None:
+        self.extend_constant(1, value)
+
+    def extend_constant(self, count: int, value: float) -> None:
+        """Append ``count`` copies of ``value`` (new transitions share a priority)."""
+        if count <= 0:
+            return
+        self._reserve(self._size + count)
+        self._values[self._size : self._size + count] = value
+        self._size += count
+
+    def clear(self) -> None:
+        self._size = 0
+
+    def drop_front(self, count: int) -> None:
+        count = min(max(int(count), 0), self._size)
+        if count == 0:
+            return
+        remaining = self._size - count
+        self._values[:remaining] = self._values[count : self._size]
+        self._size = remaining
+
+    def zero_prefix(self, count: int) -> None:
+        count = min(max(int(count), 0), self._size)
+        if count > 0:
+            self._values[:count] = 0.0
+
+    def finite_max(self, *, default: float = 1.0) -> float:
+        values = self.values
+        finite = values[np.isfinite(values)]
+        if finite.size == 0:
+            return default
+        return float(finite.max())
+
+    def _reserve(self, needed: int) -> None:
+        capacity = self._values.shape[0]
+        if needed <= capacity:
+            return
+        capacity = max(capacity, self._MIN_CAPACITY)
+        while capacity < needed:
+            capacity *= 2
+        grown = np.zeros((capacity,), dtype=np.float64)
+        grown[: self._size] = self._values[: self._size]
+        self._values = grown
 
 
 @dataclass(frozen=True)
@@ -123,6 +210,66 @@ class EfficientZeroTrajectory:
             discount=config.discount,
             td_steps=config.td_steps,
         )
+
+
+@dataclass(frozen=True)
+class _TrajectoryArrays:
+    """Column arrays for one stored trajectory, sliced directly into batches.
+
+    Sampling reads ``ext_window`` steps per batch row and revisits the same
+    trajectories many times per gradient burst; per-step attribute reads and
+    row-by-row assignment dominated it. The columns hold exactly what the
+    per-step loop wrote, so batches are unchanged.
+    """
+
+    source: list[EfficientZeroStep]
+    observations: np.ndarray
+    actions: np.ndarray
+    rewards: np.ndarray
+    policy_targets: np.ndarray
+    pred_values: np.ndarray
+    search_values: np.ndarray
+    dones: np.ndarray
+    best_actions: np.ndarray
+    # Padded to the trajectory-wide candidate count; a chunk that needs fewer
+    # slices off the front, exactly as per-chunk padding produced.
+    candidates: np.ndarray
+    candidate_counts: np.ndarray
+
+    @property
+    def length(self) -> int:
+        return len(self.source)
+
+
+def _trajectory_arrays_from_steps(steps: list[EfficientZeroStep]) -> _TrajectoryArrays:
+    candidate_rows = [
+        step.root_candidates if step.root_candidates.size else step.best_action.reshape(1, -1)
+        for step in steps
+    ]
+    counts = np.asarray([row.shape[0] for row in candidate_rows], dtype=np.int64)
+    max_candidates = int(counts.max())
+    action_dim = candidate_rows[0].shape[1]
+    candidates = np.zeros((len(steps), max_candidates, action_dim), dtype=np.float32)
+    for index, row in enumerate(candidate_rows):
+        count = row.shape[0]
+        candidates[index, :count] = row
+        if count < max_candidates:
+            # Repeat the last candidate, matching the per-chunk padding rule.
+            candidates[index, count:] = row[-1]
+
+    return _TrajectoryArrays(
+        source=steps,
+        observations=np.asarray([step.observation for step in steps], dtype=np.float32),
+        actions=np.asarray([step.action for step in steps], dtype=np.float32),
+        rewards=np.asarray([step.reward for step in steps], dtype=np.float32),
+        policy_targets=np.asarray([step.policy_target for step in steps], dtype=np.float32),
+        pred_values=np.asarray([step.pred_value for step in steps], dtype=np.float32),
+        search_values=np.asarray([step.search_value for step in steps], dtype=np.float32),
+        dones=np.asarray([step.done for step in steps], dtype=np.bool_),
+        best_actions=np.asarray([step.best_action for step in steps], dtype=np.float32),
+        candidates=candidates,
+        candidate_counts=counts,
+    )
 
 
 def search_fields_from_transition_info(
@@ -209,7 +356,8 @@ class EfficientZeroReplayBuffer(ReplayBuffer):
         self._trajectories: Deque[EfficientZeroTrajectory] = deque()
         self._stored_steps: Deque[list[EfficientZeroStep]] = deque()
         self._lookup: list[tuple[int, int]] = []
-        self._priorities: list[float] = []
+        self._priorities = _PriorityStore()
+        self._array_cache: dict[int, _TrajectoryArrays] = {}
         self._base_traj_idx = 0
         # Per-env-lane trajectory assembly: parallel rollouts interleave
         # transitions from independent envs, so each lane accumulates its own
@@ -275,6 +423,7 @@ class EfficientZeroReplayBuffer(ReplayBuffer):
         self._stored_steps.clear()
         self._lookup.clear()
         self._priorities.clear()
+        self._array_cache.clear()
         self._base_traj_idx = 0
         self._active.clear()
         self._pending_commit.clear()
@@ -370,7 +519,7 @@ class EfficientZeroReplayBuffer(ReplayBuffer):
                 pred_for_prior = np.clip(pred_for_prior, 0.0, _PRIORITY_VALUE_CLIP)
                 boot_for_prior = np.clip(boot_for_prior, 0.0, _PRIORITY_VALUE_CLIP)
             traj_priorities = np.abs(pred_for_prior - boot_for_prior) + self.config.min_prior
-            max_prior = _finite_max_priority(self._priorities)
+            max_prior = self._priorities.finite_max()
             new_priority = _sanitize_priority(
                 max(max_prior, float(traj_priorities.max())),
                 min_prior=self.config.min_prior,
@@ -379,9 +528,8 @@ class EfficientZeroReplayBuffer(ReplayBuffer):
             new_priority = 1.0
 
         # Every core transition is a valid sample position.
-        for step_pos in range(core_len):
-            self._lookup.append((traj_idx, step_pos))
-            self._priorities.append(new_priority)
+        self._lookup.extend((traj_idx, step_pos) for step_pos in range(core_len))
+        self._priorities.extend_constant(core_len, new_priority)
 
         self._total_commits += 1
         self._trim_to_capacity()
@@ -394,11 +542,9 @@ class EfficientZeroReplayBuffer(ReplayBuffer):
 
         # EfficientZero-V2: permanently zero priorities outside the top-transitions window.
         if total > int(self.config.top_transitions):
-            cutoff = total - int(self.config.top_transitions)
-            for index in range(cutoff):
-                self._priorities[index] = 0.0
+            self._priorities.zero_prefix(total - int(self.config.top_transitions))
 
-        priorities = np.asarray(self._priorities[:total], dtype=np.float64)
+        priorities = self._priorities.values[:total]
         priorities = np.nan_to_num(priorities, nan=0.0, posinf=0.0, neginf=0.0)
         priorities = np.maximum(priorities, 0.0)
         probs = priorities**self.config.priority_prob_alpha
@@ -418,33 +564,58 @@ class EfficientZeroReplayBuffer(ReplayBuffer):
         self._last_weights = weights.astype(np.float32)
         return indices
 
+    def _trajectory_arrays(self, traj_idx: int) -> _TrajectoryArrays:
+        """Column arrays for a stored trajectory, built once and reused.
+
+        Step lists are never mutated after ``_store_trajectory`` commits them,
+        so a cached entry stays valid; the identity check rebuilds it if the
+        list is ever replaced (a checkpoint load swaps in fresh lists).
+        """
+        steps = self._stored_steps[traj_idx - self._base_traj_idx]
+        cached = self._array_cache.get(traj_idx)
+        if cached is not None and cached.source is steps:
+            return cached
+        arrays = _trajectory_arrays_from_steps(steps)
+        self._array_cache[traj_idx] = arrays
+        return arrays
+
     def _build_batch(self, indices: np.ndarray, *, trained_steps: int) -> Batch:
         window = self.unroll_steps + 1
         # EfficientZero-V2 computes value targets on the stored trajectory; expose the
         # extra tail so every unroll position keeps its full TD / GAE horizon.
         ext_window = max(window, extended_target_window(self.config))
-        observations: list[np.ndarray] = []
-        actions: list[np.ndarray] = []
-        rewards: list[np.ndarray] = []
-        policy_targets: list[np.ndarray] = []
-        pred_values: list[np.ndarray] = []
-        search_values: list[np.ndarray] = []
-        value_targets: list[np.ndarray] = []
-        policy_candidates: list[np.ndarray] = []
-        best_actions: list[np.ndarray] = []
-        dones: list[np.ndarray] = []
-        masks: list[np.ndarray] = []
-        mix_masks: list[np.ndarray] = []
-        valid_lengths: list[int] = []
-        bootstrap_limits: list[int] = []
-        sample_indices: list[int] = []
-        weights: list[float] = []
+        flat_indices = np.asarray(indices, dtype=np.int64).reshape(-1)
+        batch_size = int(flat_indices.shape[0])
+        if batch_size == 0:
+            raise ValueError("Cannot build a replay batch from an empty index array.")
 
-        for offset, flat_index in enumerate(indices):
-            traj_idx, step_idx = self._lookup[int(flat_index)]
-            traj_steps = self._stored_steps[traj_idx - self._base_traj_idx]
+        # Row shapes come from the first sample; the old per-sample rows were
+        # stacked at the end, which required the same uniformity.
+        first = self._trajectory_arrays(self._lookup[int(flat_indices[0])][0])
+        observations = np.zeros((batch_size, ext_window, *first.observations.shape[1:]), dtype=np.float32)
+        actions = np.zeros((batch_size, self.unroll_steps, *first.actions.shape[1:]), dtype=np.float32)
+        rewards = np.zeros((batch_size, ext_window), dtype=np.float32)
+        policy_targets = np.zeros((batch_size, window, *first.policy_targets.shape[1:]), dtype=np.float32)
+        pred_values = np.zeros((batch_size, window), dtype=np.float32)
+        search_values = np.zeros((batch_size, window), dtype=np.float32)
+        value_targets = np.zeros((batch_size, window), dtype=np.float32)
+        best_actions = np.zeros((batch_size, window, *first.best_actions.shape[1:]), dtype=np.float32)
+        dones = np.zeros((batch_size, window), dtype=np.bool_)
+        masks = np.zeros((batch_size, self.unroll_steps), dtype=np.float32)
+        mix_masks = np.zeros((batch_size, window), dtype=np.float32)
+        valid_lengths = np.zeros((batch_size,), dtype=np.int32)
+        bootstrap_limits = np.zeros((batch_size,), dtype=np.int32)
+        weights = np.ones((batch_size,), dtype=np.float32)
+        policy_candidates: list[np.ndarray] = []
+        last_weights = getattr(self, "_last_weights", None)
+
+        for offset in range(batch_size):
+            flat_index = int(flat_indices[offset])
+            traj_idx, step_idx = self._lookup[flat_index]
+            arrays = self._trajectory_arrays(traj_idx)
             traj_meta = self._trajectories[traj_idx - self._base_traj_idx]
-            core_len = traj_meta.core_len if traj_meta.core_len is not None else len(traj_steps)
+            traj_len = arrays.length
+            core_len = traj_meta.core_len if traj_meta.core_len is not None else traj_len
             if step_idx >= core_len:
                 raise RuntimeError(
                     "Invalid replay lookup while sampling an unroll window. "
@@ -452,66 +623,57 @@ class EfficientZeroReplayBuffer(ReplayBuffer):
                 )
             valid_len = core_len - step_idx
 
-            chunk = traj_steps[step_idx : step_idx + ext_window]
+            chunk_len = min(ext_window, traj_len - step_idx)
 
-            obs_rows = [step.observation.astype(np.float32) for step in chunk]
+            obs_row = observations[offset]
+            obs_row[:chunk_len] = arrays.observations[step_idx : step_idx + chunk_len]
+            filled = chunk_len
             has_terminal_obs = False
             if (
-                len(obs_rows) < ext_window
-                and step_idx + len(chunk) == len(traj_steps)
+                filled < ext_window
+                and step_idx + chunk_len == traj_len
                 and traj_meta.final_observation is not None
             ):
-                obs_rows.append(traj_meta.final_observation.astype(np.float32))
+                obs_row[filled] = traj_meta.final_observation
+                filled += 1
                 has_terminal_obs = True
-            while len(obs_rows) < ext_window:
+            if filled < ext_window:
                 # Repeat the last frame when padding observations.
-                obs_rows.append(obs_rows[-1])
-            observations.append(np.stack(obs_rows[:ext_window], axis=0))
+                obs_row[filled:] = obs_row[filled - 1]
 
-            reward_row = np.zeros((ext_window,), dtype=np.float32)
-            reward_row[: len(chunk)] = [step.reward for step in chunk]
-            rewards.append(reward_row)
+            rewards[offset, :chunk_len] = arrays.rewards[step_idx : step_idx + chunk_len]
 
             # Observation one step past the last core transition: available from
             # tail padding or the stored terminal observation (EfficientZero-V2 always
             # has ``obs_lst[traj_len]``, so ``bootstrap_index <= traj_len``).
-            if len(chunk) > valid_len or (len(chunk) == valid_len and has_terminal_obs):
+            if chunk_len > valid_len or (chunk_len == valid_len and has_terminal_obs):
                 bootstrap_limit = valid_len
             else:
                 bootstrap_limit = valid_len - 1
-            valid_lengths.append(valid_len)
-            bootstrap_limits.append(bootstrap_limit)
+            valid_lengths[offset] = valid_len
+            bootstrap_limits[offset] = bootstrap_limit
 
-            window_chunk = chunk[:window]
-            n_window = len(window_chunk)
+            n_action = min(self.unroll_steps, chunk_len)
+            actions[offset, :n_action] = arrays.actions[step_idx : step_idx + n_action]
 
-            action_row = np.zeros((self.unroll_steps, window_chunk[0].action.shape[0]), dtype=np.float32)
-            for k, step in enumerate(chunk[: self.unroll_steps]):
-                action_row[k] = step.action
-            actions.append(action_row)
+            n_window = min(window, chunk_len)
+            stop = step_idx + n_window
+            policy_targets[offset, :n_window] = arrays.policy_targets[step_idx:stop]
+            pred_row = pred_values[offset]
+            pred_row[:n_window] = arrays.pred_values[step_idx:stop]
+            search_row = search_values[offset]
+            search_row[:n_window] = arrays.search_values[step_idx:stop]
+            dones[offset, :n_window] = arrays.dones[step_idx:stop]
+            best_row = best_actions[offset]
+            best_row[:n_window] = arrays.best_actions[step_idx:stop]
+            if n_window < window:
+                best_row[n_window:] = best_row[n_window - 1]
 
-            policy_row = np.zeros((window, window_chunk[0].policy_target.shape[0]), dtype=np.float32)
-            pred_row = np.zeros((window,), dtype=np.float32)
-            search_row = np.zeros((window,), dtype=np.float32)
-            done_row = np.zeros((window,), dtype=np.bool_)
-            best_row = np.zeros((window, window_chunk[0].best_action.shape[0]), dtype=np.float32)
-            for k, step in enumerate(window_chunk):
-                policy_row[k] = step.policy_target
-                pred_row[k] = step.pred_value
-                search_row[k] = step.search_value
-                done_row[k] = step.done
-                best_row[k] = step.best_action
-            for k in range(n_window, window):
-                best_row[k] = best_row[n_window - 1]
-            policy_targets.append(policy_row)
-            pred_values.append(pred_row)
-            search_values.append(search_row)
-            dones.append(done_row)
-            best_actions.append(best_row)
-
-            candidates = self._stack_candidates(window_chunk)
-            if candidates.shape[0] < window:
-                pad = np.repeat(candidates[-1:], window - candidates.shape[0], axis=0)
+            # Per-chunk candidate width, as the per-step padding produced it.
+            max_candidates = int(arrays.candidate_counts[step_idx:stop].max())
+            candidates = arrays.candidates[step_idx:stop, :max_candidates]
+            if n_window < window:
+                pad = np.repeat(candidates[-1:], window - n_window, axis=0)
                 candidates = np.concatenate([candidates, pad], axis=0)
             policy_candidates.append(candidates)
 
@@ -538,36 +700,31 @@ class EfficientZeroReplayBuffer(ReplayBuffer):
             else:
                 targets = bootstrapped
                 mix_mask = np.ones((window,), dtype=np.float32)
-            value_targets.append(np.asarray(targets, dtype=np.float32))
-            mix_masks.append(mix_mask)
+            value_targets[offset] = targets
+            mix_masks[offset] = mix_mask
 
             # Train unroll step k only while the next position is inside the trajectory.
-            mask = np.zeros((self.unroll_steps,), dtype=np.float32)
-            mask[: max(0, min(self.unroll_steps, valid_len - 1))] = 1.0
-            masks.append(mask)
-            sample_indices.append(int(flat_index))
-            if hasattr(self, "_last_weights"):
-                weights.append(float(self._last_weights[offset]))
-            else:
-                weights.append(1.0)
+            masks[offset, : max(0, min(self.unroll_steps, valid_len - 1))] = 1.0
+            if last_weights is not None:
+                weights[offset] = float(last_weights[offset])
 
         batch_data = {
-            "observations": np.stack(observations, axis=0),
-            "actions": np.stack(actions, axis=0),
-            "rewards": np.stack(rewards, axis=0),
-            "policy_targets": np.stack(policy_targets, axis=0),
-            "pred_values": np.stack(pred_values, axis=0),
-            "search_values": np.stack(search_values, axis=0),
-            "value_targets": np.stack(value_targets, axis=0),
+            "observations": observations,
+            "actions": actions,
+            "rewards": rewards,
+            "policy_targets": policy_targets,
+            "pred_values": pred_values,
+            "search_values": search_values,
+            "value_targets": value_targets,
             "policy_candidates": self._stack_batch_candidates(policy_candidates),
-            "best_actions": np.stack(best_actions, axis=0),
-            "dones": np.stack(dones, axis=0),
-            "masks": np.stack(masks, axis=0),
-            "mix_masks": np.stack(mix_masks, axis=0),
-            "valid_lengths": np.asarray(valid_lengths, dtype=np.int32),
-            "bootstrap_limits": np.asarray(bootstrap_limits, dtype=np.int32),
-            "indices": np.asarray(sample_indices, dtype=np.int32),
-            "weights": np.asarray(weights, dtype=np.float32),
+            "best_actions": best_actions,
+            "dones": dones,
+            "masks": masks,
+            "mix_masks": mix_masks,
+            "valid_lengths": valid_lengths,
+            "bootstrap_limits": bootstrap_limits,
+            "indices": flat_indices.astype(np.int32),
+            "weights": weights,
         }
         return Batch(data=batch_data)
 
@@ -595,33 +752,14 @@ class EfficientZeroReplayBuffer(ReplayBuffer):
                 break
             self._stored_steps.popleft()
             self._trajectories.popleft()
+            self._array_cache.pop(self._base_traj_idx, None)
             self._base_traj_idx += 1
             self._lookup = [
                 (traj_idx, step_idx)
                 for traj_idx, step_idx in self._lookup
                 if traj_idx >= self._base_traj_idx
             ]
-            drop_count = len(self._priorities) - len(self._lookup)
-            if drop_count > 0:
-                self._priorities = self._priorities[drop_count:]
-
-    @staticmethod
-    def _stack_candidates(chunk: list[EfficientZeroStep]) -> np.ndarray:
-        arrays: list[np.ndarray] = []
-        for step in chunk:
-            candidates = step.root_candidates
-            if candidates.size == 0:
-                candidates = step.best_action.reshape(1, -1)
-            arrays.append(candidates.astype(np.float32))
-        max_candidates = max(array.shape[0] for array in arrays)
-        action_dim = arrays[0].shape[1]
-        padded = np.zeros((len(arrays), max_candidates, action_dim), dtype=np.float32)
-        for index, candidates in enumerate(arrays):
-            padded[index, : candidates.shape[0]] = candidates
-            if candidates.shape[0] < max_candidates:
-                padded[index, candidates.shape[0] :] = candidates[-1]
-        return padded
-
+            self._priorities.drop_front(len(self._priorities) - len(self._lookup))
 
 def _action_array(action: Action) -> np.ndarray:
     array = np.asarray(action, dtype=np.float32)

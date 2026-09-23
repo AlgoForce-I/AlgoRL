@@ -46,6 +46,7 @@ from algorl.common.checkpoints.pytree_store import (
 from algorl.common.checkpoints.run import (
     load_run_checkpoint,
     prune_step_checkpoints,
+    require_checkpointable,
     save_run_checkpoint,
     write_resume_overrides,
 )
@@ -70,6 +71,7 @@ __all__ = [
     "read_manifest",
     "save_checkpoint",
     "save_pytree",
+    "require_checkpointable",
     "save_run_checkpoint",
     "split_resume_overrides",
     "validate_manifest",

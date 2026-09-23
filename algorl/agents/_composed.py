@@ -9,6 +9,7 @@ from algorl.agents._compose import compose_agent
 from algorl.agents.configs import BaseAgentConfig, EfficientZeroConfig
 from algorl.common.checkpoints import (
     load_run_checkpoint,
+    require_checkpointable,
     save_run_checkpoint,
     split_resume_overrides,
     write_resume_overrides,
@@ -49,6 +50,9 @@ class ComposedAgent(Agent):
         tensorboard_log_dir = kwargs.pop("tensorboard_log_dir", None)
         progress_bar = kwargs.pop("progress_bar", None)
         progress_bar_kwargs = kwargs.pop("progress_bar_kwargs", None)
+        eval_period = kwargs.pop("eval_period", None)
+        eval_env_factory = kwargs.pop("eval_env_factory", None)
+        eval_episodes = kwargs.pop("eval_episodes", None)
 
         if config_overrides:
             allowed, rejected = split_resume_overrides(dict(config_overrides))
@@ -114,10 +118,14 @@ class ComposedAgent(Agent):
             start_step=start_step,
             extra_step_info=kwargs or None,
             progress_bar=progress_bar,
+            eval_period=eval_period,
+            eval_env_factory=eval_env_factory,
+            eval_episodes=eval_episodes,
         )
 
     def save(self, path: str) -> None:
         """Persist a full multi-file run checkpoint to ``path`` (directory)."""
+        require_checkpointable(self.learner, role="Learner")
         task_id = getattr(self.learner, "task_id", None)
         step = int(getattr(self.learner, "_train_steps", 0))
         save_run_checkpoint(

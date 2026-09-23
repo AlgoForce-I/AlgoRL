@@ -29,6 +29,8 @@ from algorl.buffers.efficientzero.targets import (
     prepare_gae_batch_values,
 )
 from algorl.backends.jax.nn.efficientzero.obs_norm import (
+    INITIAL_OBS_RUNNING_COUNT,
+    as_obs_running_count,
     with_representation_obs_stats,
     compute_tentative_obs_stats_jax,
 )
@@ -175,6 +177,7 @@ def _loss_from_batch(
         candidates=policy_candidates[:, 0],
         target_policy=policy_targets[:, 0],
         entropy_rng=init_policy_rng,
+        use_improved_target=config.policy_loss_mode == "improved",
     )
     reward_loss_total = jnp.zeros((batch_size,), dtype=jnp.float32)
     consistency_loss_total = jnp.zeros((batch_size,), dtype=jnp.float32)
@@ -224,6 +227,7 @@ def _loss_from_batch(
             candidates=candidates,
             target_policy=target_policy,
             entropy_rng=step_rng,
+            use_improved_target=config.policy_loss_mode == "improved",
         )
         step_policy = step_policy * step_mask
         step_entropy = step_entropy * step_mask
@@ -322,7 +326,7 @@ def _extract_obs_running_count(params: Params) -> int:
     rep = params.get("representation_model", {})
     count = rep.get("running_count")
     if count is None:
-        return 1000
+        return INITIAL_OBS_RUNNING_COUNT
     return int(np.asarray(count, dtype=np.int64))
 
 
@@ -447,7 +451,7 @@ class EfficientZeroLearner(Learner):
         self.params, self._opt_state, self._obs_running_count, metrics = self._update(
             self.params,
             self._opt_state,
-            jnp.asarray(self._obs_running_count, dtype=jnp.int32),
+            as_obs_running_count(self._obs_running_count),
             arrays,
             step_key,
             jnp.asarray(self._learning_rate_scale(), dtype=jnp.float32),
@@ -628,7 +632,7 @@ class EfficientZeroLearner(Learner):
         self.params, self._opt_state, self._obs_running_count, burst_metrics = self._burst_update(
             self.params,
             self._opt_state,
-            jnp.asarray(self._obs_running_count, dtype=jnp.int32),
+            as_obs_running_count(self._obs_running_count),
             stacked_batch,
             step_keys,
             lr_scales,
@@ -675,7 +679,7 @@ class EfficientZeroLearner(Learner):
         _, _, _, _ = self._burst_update(
             self.params,
             self._opt_state,
-            jnp.asarray(self._obs_running_count, dtype=jnp.int32),
+            as_obs_running_count(self._obs_running_count),
             stacked_batch,
             step_keys,
             lr_scales,
@@ -905,7 +909,7 @@ def _apply_reanalyze_outputs(
         dtype=jnp.float32,
     )
     arrays["search_values"] = jnp.asarray(
-        _merge_reanalyze_1d(arrays["search_values"], search_values, reanalyze_count),
+        _merge_reanalyze(arrays["search_values"], search_values, reanalyze_count),
         dtype=jnp.float32,
     )
     arrays["policy_candidates"] = jnp.asarray(
@@ -1056,16 +1060,6 @@ def _stack_training_batches(batches: list[dict[str, jnp.ndarray]]) -> dict[str, 
 
 
 def _merge_reanalyze(
-    original: jnp.ndarray | np.ndarray,
-    refreshed: np.ndarray,
-    count: int,
-) -> np.ndarray:
-    merged = np.asarray(original, dtype=np.float32).copy()
-    merged[:count] = refreshed[:count]
-    return merged
-
-
-def _merge_reanalyze_1d(
     original: jnp.ndarray | np.ndarray,
     refreshed: np.ndarray,
     count: int,
