@@ -111,6 +111,7 @@ class TrainingLoop:
         progress_bar: TqdmProgressBar | None = None,
         eval_period: int | None = None,
         eval_env_factory: Any | None = None,
+        eval_episodes: int | None = None,
     ) -> None:
         """Interact with the environment and call ``learner.train_step`` on schedule."""
         if checkpoint_dir is not None:
@@ -122,7 +123,7 @@ class TrainingLoop:
         self._evaluator = None
         period = None if eval_period is None else int(eval_period)
         if period is not None and period > 0:
-            from algorl.core.evaluation import PeriodicEvaluator
+            from algorl.core.evaluation import PeriodicEvaluator, EVAL_EPISODES
 
             self._evaluator = PeriodicEvaluator(
                 period=period,
@@ -133,6 +134,7 @@ class TrainingLoop:
                 seed=int(self.config.seed),
                 start_step=start_step,
                 env_factory=eval_env_factory,
+                num_episodes=eval_episodes if eval_episodes is not None else EVAL_EPISODES,
             )
         if progress_bar is not None:
             progress_bar.start(total_timesteps, initial=max(0, int(start_step)))

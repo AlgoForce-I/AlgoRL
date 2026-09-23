@@ -51,6 +51,7 @@ class ComposedAgent(Agent):
         progress_bar_kwargs = kwargs.pop("progress_bar_kwargs", None)
         eval_period = kwargs.pop("eval_period", None)
         eval_env_factory = kwargs.pop("eval_env_factory", None)
+        eval_episodes = kwargs.pop("eval_episodes", None)
 
         if config_overrides:
             allowed, rejected = split_resume_overrides(dict(config_overrides))
@@ -118,6 +119,7 @@ class ComposedAgent(Agent):
             progress_bar=progress_bar,
             eval_period=eval_period,
             eval_env_factory=eval_env_factory,
+            eval_episodes=eval_episodes,
         )
 
     def save(self, path: str) -> None:
