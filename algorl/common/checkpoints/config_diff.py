@@ -58,6 +58,10 @@ RESUME_ALLOWLIST: frozenset[str] = frozenset(
         "use_priority",
         "change_temperature",
         "clip_inference_values",
+        "policy_loss_mode",
+        "uniform_action_num",
+        "policy_action_num",
+        "random_action_num",
         "std_magnification",
         "alpha_max",
         "frozen_base_weights",
@@ -68,6 +72,7 @@ RESUME_ALLOWLIST: frozenset[str] = frozenset(
         "reg_lambda_init",
         "reg_lambda_min",
         "reg_lambda_max",
+        "reg_task_share_floor",
         "reg_balance_interval",
         "reg_conflict_projection",
     }

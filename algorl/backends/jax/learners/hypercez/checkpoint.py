@@ -107,12 +107,24 @@ def apply_hypercez_learner_state(
     learner._ema_reg_loss = meta.get("ema_reg_loss")
     # Older checkpoints predate reg balancing: start from the configured λ.
     # Gradient-norm EMAs are not saved; they refill within a few steps.
-    from algorl.backends.jax.learners.hypercez.learner import _default_reg_balance
+    from algorl.backends.jax.learners.hypercez.learner import (
+        _default_reg_balance,
+        _lambda_share_cap,
+    )
 
     balance = _default_reg_balance(learner.config)
     saved_lambda = meta.get("reg_balance_lambda")
     if saved_lambda is not None and len(saved_lambda) == len(learner.config.hnet_components):
-        balance["lambda"] = jnp.asarray(saved_lambda, dtype=jnp.float32)
+        # A λ saved before the share floor existed can be far above it; the
+        # floor is a property of the live config, not of the checkpoint.
+        cap = max(
+            _lambda_share_cap(learner.config.reg_task_share_floor, learner.config.reg_lambda_max),
+            learner.config.reg_lambda_min,
+        )
+        balance["lambda"] = jnp.minimum(
+            jnp.asarray(saved_lambda, dtype=jnp.float32),
+            jnp.asarray(cap, dtype=jnp.float32),
+        )
     learner._reg_balance_state = balance
     learner._reset_reg_lambda_history()
 

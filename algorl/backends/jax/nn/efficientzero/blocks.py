@@ -203,6 +203,7 @@ class VectorValuePolicyNetwork(nn.Module):
     init_zero: bool = True
     policy_distribution: str = "squashed_gaussian"
     use_bn: bool = False
+    policy_mean_bound: float = 2.0
 
     @nn.compact
     def __call__(self, state: jnp.ndarray) -> tuple[jnp.ndarray, jnp.ndarray]:
@@ -231,7 +232,10 @@ class VectorValuePolicyNetwork(nn.Module):
 
         if self.policy_distribution == "squashed_gaussian":
             action_dim = self.policy_output_size // 2
-            mu = 5.0 * jnp.tanh(policy[..., :action_dim] / 5.0)
+            # Bounded mean: at |mu| = bound the tanh Jacobian is still large
+            # enough that sampled actions differ from one another.
+            bound = self.policy_mean_bound
+            mu = bound * jnp.tanh(policy[..., :action_dim] / bound)
             std = jax.nn.softplus(policy[..., action_dim:] + 1.0) + 0.1
             std = jnp.clip(std, 0.1, 10.0)
             policy = jnp.concatenate([mu, std], axis=-1)
@@ -399,6 +403,7 @@ class ConvValuePolicyNetwork(nn.Module):
     v_num: int
     init_zero: bool = True
     continuous: bool = False
+    policy_mean_bound: float = 2.0
 
     @nn.compact
     def __call__(self, state: jnp.ndarray) -> tuple[jnp.ndarray, jnp.ndarray]:
@@ -455,7 +460,8 @@ class ConvValuePolicyNetwork(nn.Module):
 
         if self.continuous:
             action_dim = self.policy_output_size // 2
-            mu = 5.0 * jnp.tanh(policy[:action_dim] / 5.0)
+            bound = self.policy_mean_bound
+            mu = bound * jnp.tanh(policy[:action_dim] / bound)
             std = jax.nn.softplus(policy[action_dim:] + 1.0) + 0.1
             policy = jnp.concatenate([mu, std], axis=-1)
 

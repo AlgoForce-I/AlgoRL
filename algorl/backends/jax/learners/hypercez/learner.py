@@ -75,14 +75,31 @@ from algorl.core.component_context import ComponentContext
 from algorl.core.replay_buffer import ReplayBuffer
 
 _EMA_MOMENTUM = 0.99
-# λ controller (reg_balance="gradient"): multiplicative step per drift check,
-# fast to tighten when drift exceeds the budget, slow to loosen below it.
-_BALANCE_MAX_INCREASE = 4.0
-_BALANCE_MAX_DECREASE = 0.9
+# λ controller (reg_balance="gradient"): multiplicative step per drift check.
+# Symmetric in log-λ so a noisy drift signal cannot ratchet λ upward: the
+# balanced CW10 run used 4.0 up against 0.9 down and never came back from 900.
+_BALANCE_MAX_INCREASE = 2.0
+_BALANCE_MAX_DECREASE = 0.5
 # Drift that moved less than this fraction since the last check counts as flat.
 _BALANCE_FLAT_BAND = 0.1
+# Drift is compared between smoothed checks; raw per-check drift fluctuates by
+# more than the flat band at the jitter floor, which reads as false growth.
+_BALANCE_DRIFT_MOMENTUM = 0.7
+# Over budget but not growing: λ is not what is holding drift there, so probe
+# downward instead of holding, and recover plasticity while drift stays flat.
+_BALANCE_IDLE_DECAY = 0.98
+# The growth reference is a high-water mark that leaks back down, so ordinary
+# fluctuation around a flat level never reads as growth but a genuine slow
+# climb does. Following drift down instead would make every mean-reversion a
+# tightening event, which is the ratchet in another form.
+_BALANCE_REF_DECAY = 0.999
+# Drift this far past the budget tightens λ regardless of the growth test.
+_BALANCE_HARD_OVER = 10.0
 # Per-step gradient norms the host folds into its EMAs; not logged.
 _BALANCE_NORM_PREFIXES = ("cl_task_grad_norm/", "cl_reg_grad_norm/")
+# Everything the host reads back per step: norms plus the realised task share
+# the λ controller needs for its plasticity floor (that one stays in the logs).
+_BALANCE_OBSERVED_PREFIXES = (*_BALANCE_NORM_PREFIXES, "cl_task_share/")
 
 
 def _task_alphas_from_state(
@@ -583,8 +600,13 @@ def _tree_vdot(left: Any, right: Any) -> jnp.ndarray:
 def _default_reg_balance(config: HyperCEZConfig) -> dict[str, jnp.ndarray]:
     """Balance state: per-component λ plus host EMAs of gradient norms (0 = unset)."""
     count = len(config.hnet_components)
+    # The share floor applies from the first step, not from the first check.
+    initial_lambda = min(
+        config.reg_lambda_init,
+        max(_lambda_share_cap(config.reg_task_share_floor, config.reg_lambda_max), config.reg_lambda_min),
+    )
     return {
-        "lambda": jnp.full((count,), config.reg_lambda_init, dtype=jnp.float32),
+        "lambda": jnp.full((count,), initial_lambda, dtype=jnp.float32),
         "task_norm": jnp.zeros((count,), dtype=jnp.float32),
         "reg_norm": jnp.zeros((count,), dtype=jnp.float32),
     }
@@ -624,42 +646,102 @@ def _with_cl_metric_placeholders(
     return metrics
 
 
+def _lambda_share_cap(share_floor: float, lambda_max: float) -> float:
+    """Largest λ that can still leave ``share_floor`` of the mixed gradient to the task.
+
+    With the reg gradient scaled to ``λ ||g_task||`` and the conflicting part of
+    the task gradient projected out, ``g_task · g_reg >= 0``, so
+    ``||g_mix|| >= ||g_task|| sqrt(1 + λ²)`` and the task share is at most
+    ``1 / sqrt(1 + λ²)``. Inverting that bound gives a λ ceiling that holds
+    whatever the two gradients happen to be doing this step.
+    """
+    if share_floor <= 0.0:
+        return lambda_max
+    if share_floor >= 1.0:
+        return 0.0
+    return float(np.sqrt(max(1.0 / (share_floor * share_floor) - 1.0, 0.0)))
+
+
 def _next_reg_lambda(
     reg_lambda: np.ndarray,
     drift: np.ndarray,
-    prev_drift: np.ndarray | None,
-    tightened: np.ndarray,
+    drift_ema: np.ndarray | None,
+    drift_ref: np.ndarray | None,
+    task_share: np.ndarray | None,
     *,
     budget: float,
     lambda_min: float,
     lambda_max: float,
-) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
-    """One λ controller step per component; returns ``(lambda, over_budget, held)``.
+    share_floor: float,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+    """One λ controller step; ``(lambda, over_budget, held, drift_ema, drift_ref)``.
 
-    - Over budget and drift still moving (or first check): tighten by the
-      overshoot ratio, at most ``_BALANCE_MAX_INCREASE`` per check.
-    - Over budget, but drift flat since the last tightening: hold. Adam steps
-      of ~lr per coordinate jitter the generated weights around their targets;
-      that floor does not shrink with λ (λ from 100 to 9000 left drift unchanged
-      on the CW10 checkpoint), so tightening further would only remove task signal.
-      Drift that keeps growing is never held.
-    - Under budget: loosen, at most ``_BALANCE_MAX_DECREASE`` per check.
+    Two-sided. The drift budget bounds how much earlier tasks may move; the
+    task-share floor bounds what that protection is allowed to cost the new task.
+
+    - Over budget and drift grown past the level it had at the last tightening:
+      tighten by the overshoot ratio, at most ``_BALANCE_MAX_INCREASE``. The
+      reference is the last tightening, not the last check, so a drift that
+      merely fluctuates does not read as growth: on the balanced CW10 run λ≈0.5
+      and λ≈900 both sat at 2e-8..4e-8, and comparing consecutive checks turned
+      that noise into a one-way ratchet to ``reg_lambda_max``.
+    - Over budget but not growing: decay gently. Adam steps of ~lr per
+      coordinate jitter the generated weights around their targets, and that
+      floor does not shrink with λ, so holding λ there only removes task signal;
+      decaying probes for the smallest λ that still keeps drift flat.
+    - Drift past ``_BALANCE_HARD_OVER`` × budget always tightens, whatever the
+      reference says — a guard against runaway forgetting.
+    - Under budget: loosen toward it, at most ``_BALANCE_MAX_DECREASE``.
+    - Finally λ is capped so the task keeps ``share_floor`` of the mixed
+      gradient: the analytic ceiling always, plus a first-order correction from
+      the measured share (share ∝ 1/λ) when one is available.
     """
-    ratio = np.where(np.isfinite(drift), np.maximum(drift, 0.0) / budget, np.inf)
-    over = ratio > 1.0
-    if prev_drift is None:
-        flat = np.zeros_like(over)
+    if drift_ema is None:
+        smoothed = np.where(np.isfinite(drift), drift, 0.0)
     else:
-        flat = np.abs(drift - prev_drift) <= _BALANCE_FLAT_BAND * np.maximum(prev_drift, 1e-30)
-    held = over & tightened & flat
+        smoothed = np.where(
+            np.isfinite(drift),
+            _BALANCE_DRIFT_MOMENTUM * drift_ema + (1.0 - _BALANCE_DRIFT_MOMENTUM) * drift,
+            drift_ema,
+        )
+
+    ratio = np.where(np.isfinite(smoothed), np.maximum(smoothed, 0.0) / budget, np.inf)
+    over = ratio > 1.0
+    if drift_ref is None:
+        grown = np.ones_like(over)
+    else:
+        grown = smoothed > drift_ref * (1.0 + _BALANCE_FLAT_BAND)
+    tighten = over & (grown | (ratio > _BALANCE_HARD_OVER))
+    loosen = ~over
+    held = ~(tighten | loosen)
     factor = np.where(
-        over,
+        tighten,
         np.minimum(ratio, _BALANCE_MAX_INCREASE),
-        np.maximum(ratio, _BALANCE_MAX_DECREASE),
+        np.where(loosen, np.maximum(ratio, _BALANCE_MAX_DECREASE), _BALANCE_IDLE_DECAY),
     )
-    factor = np.where(held, 1.0, factor)
     new_lambda = np.clip(reg_lambda * factor, lambda_min, lambda_max)
-    return new_lambda, over, held
+    # Growth is measured against a leaky high-water mark of the drift itself.
+    new_ref = (
+        smoothed
+        if drift_ref is None
+        else np.maximum(smoothed, drift_ref * _BALANCE_REF_DECAY)
+    )
+
+    if share_floor > 0.0:
+        new_lambda = np.minimum(new_lambda, max(_lambda_share_cap(share_floor, lambda_max), lambda_min))
+        if task_share is not None:
+            # The share was measured at the previous λ and falls about as 1/λ,
+            # so ``λ · share / floor`` is the λ that would sit on the floor. It
+            # is a ceiling, not a one-off step: a tightening in the same check
+            # must not undo it, or a starved component never recovers.
+            implied = np.maximum(
+                reg_lambda * task_share / share_floor, reg_lambda * _BALANCE_MAX_DECREASE
+            )
+            starved = np.isfinite(task_share) & (task_share > 0.0) & (task_share < share_floor)
+            new_lambda = np.where(
+                starved, np.maximum(np.minimum(new_lambda, implied), lambda_min), new_lambda
+            )
+    return new_lambda, over, held, smoothed, new_ref
 
 
 def _mix_component_grads(
@@ -1323,8 +1405,11 @@ class HyperCEZLearner(EfficientZeroLearner):
     With ``reg_balance="gradient"`` (default), phase B mixes task and
     regularizer gradients per component (:func:`_mix_component_grads`) and a
     host-side controller moves each component's λ every
-    ``reg_balance_interval`` steps so measured relative drift of earlier tasks
-    tracks ``reg_drift_budget``. ``"loss_ratio"`` keeps the original shared β.
+    ``reg_balance_interval`` steps. The controller is two-sided: it tightens
+    while measured drift of earlier tasks is growing past ``reg_drift_budget``,
+    and never tightens past the λ that would leave the new task less than
+    ``reg_task_share_floor`` of its mixed gradient. ``"loss_ratio"`` keeps the
+    original shared β.
 
     With ``cl_strategy="nullspace"`` every task uses the single phase; the
     hypernet update is projected onto the directions that leave previous tasks'
@@ -1353,6 +1438,7 @@ class HyperCEZLearner(EfficientZeroLearner):
         self._nullspace_bases: NullspaceBases | None = None
         self._reg_balance_state: dict[str, jnp.ndarray] | None = None
         self._reg_target_norms: np.ndarray | None = None
+        self._reg_share_ema = np.zeros((0,), dtype=np.float64)
         self._jit_component_reg: Callable[..., tuple[jnp.ndarray, jnp.ndarray]] | None = None
 
         # Shared EZ wiring (params copies, planner sync, burst spec, discrete checks).
@@ -1436,6 +1522,11 @@ class HyperCEZLearner(EfficientZeroLearner):
                 f"{self.config.reg_lambda_min}, {self.config.reg_lambda_init}, "
                 f"{self.config.reg_lambda_max}."
             )
+        if not 0.0 <= self.config.reg_task_share_floor < 1.0:
+            raise ValueError(
+                "reg_task_share_floor must be in [0, 1), got "
+                f"{self.config.reg_task_share_floor}."
+            )
         if strategy != "nullspace":
             return
         # Each requirement keeps a previous task's generated weights a pure
@@ -1494,6 +1585,7 @@ class HyperCEZLearner(EfficientZeroLearner):
         components = self.config.hnet_components
         task = np.asarray(self._reg_balance_state["task_norm"], dtype=np.float64)
         reg = np.asarray(self._reg_balance_state["reg_norm"], dtype=np.float64)
+        share = self._reg_share_ema
         for metrics in step_metrics:
             for index, component in enumerate(components):
                 task_norm = float(metrics[f"cl_task_grad_norm/{component}"])
@@ -1509,6 +1601,15 @@ class HyperCEZLearner(EfficientZeroLearner):
                         if ema[index] <= 0.0
                         else _EMA_MOMENTUM * ema[index] + (1.0 - _EMA_MOMENTUM) * value
                     )
+                # What the mix actually left the task, for the share floor.
+                observed = float(metrics.get(f"cl_task_share/{component}", float("nan")))
+                if np.isfinite(observed) and observed > 0.0:
+                    share[index] = (
+                        observed
+                        if not np.isfinite(share[index])
+                        else _EMA_MOMENTUM * share[index] + (1.0 - _EMA_MOMENTUM) * observed
+                    )
+        self._reg_share_ema = share
         self._reg_balance_state = {
             **self._reg_balance_state,
             "task_norm": jnp.asarray(task, dtype=jnp.float32),
@@ -1524,16 +1625,23 @@ class HyperCEZLearner(EfficientZeroLearner):
             return
         drift = self._relative_reg_drift()
         history = self._reg_lambda_history
-        lam, over, held = _next_reg_lambda(
+        lam, over, held, drift_ema, drift_ref = _next_reg_lambda(
             np.asarray(self._reg_balance_state["lambda"], dtype=np.float64),
             drift,
             history["drift"],
-            history["tightened"],
+            history["ref"],
+            self._reg_share_ema,
             budget=self.config.reg_drift_budget,
             lambda_min=self.config.reg_lambda_min,
             lambda_max=self.config.reg_lambda_max,
+            share_floor=self.config.reg_task_share_floor,
         )
-        self._reg_lambda_history = {"drift": drift, "tightened": over, "held": held}
+        self._reg_lambda_history = {
+            "drift": drift_ema,
+            "ref": drift_ref,
+            "tightened": over,
+            "held": held,
+        }
         self._reg_balance_state = {
             **self._reg_balance_state,
             "lambda": jnp.asarray(lam, dtype=jnp.float32),
@@ -1543,9 +1651,12 @@ class HyperCEZLearner(EfficientZeroLearner):
         count = len(self.config.hnet_components)
         self._reg_lambda_history = {
             "drift": None,
+            "ref": None,
             "tightened": np.zeros((count,), dtype=bool),
             "held": np.zeros((count,), dtype=bool),
         }
+        # NaN = no share measured yet for this task.
+        self._reg_share_ema = np.full((count,), np.nan, dtype=np.float64)
 
     def _strip_reg_balance_norms(self, metrics: dict[str, float]) -> dict[str, float]:
         return {
@@ -2120,10 +2231,15 @@ class HyperCEZLearner(EfficientZeroLearner):
         if defer_theta:
             self._sync_ema_from_scan(ema_task, ema_reg, ema_reg_per_task)
         if self._balances_reg():
-            norm_keys = [key for key in burst_metrics if key.startswith(_BALANCE_NORM_PREFIXES)]
-            norms = {key: np.asarray(burst_metrics[key]) for key in norm_keys}
+            observed_keys = [
+                key for key in burst_metrics if key.startswith(_BALANCE_OBSERVED_PREFIXES)
+            ]
+            observed = {key: np.asarray(burst_metrics[key]) for key in observed_keys}
             self._observe_reg_balance_norms(
-                [{key: norms[key][offset] for key in norm_keys} for offset in range(chunk_steps)]
+                [
+                    {key: observed[key][offset] for key in observed_keys}
+                    for offset in range(chunk_steps)
+                ]
             )
         self._train_steps = start_step + chunk_steps
         self._task_train_steps = task_start + chunk_steps

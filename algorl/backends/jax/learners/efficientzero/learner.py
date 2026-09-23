@@ -177,6 +177,7 @@ def _loss_from_batch(
         candidates=policy_candidates[:, 0],
         target_policy=policy_targets[:, 0],
         entropy_rng=init_policy_rng,
+        use_improved_target=config.policy_loss_mode == "improved",
     )
     reward_loss_total = jnp.zeros((batch_size,), dtype=jnp.float32)
     consistency_loss_total = jnp.zeros((batch_size,), dtype=jnp.float32)
@@ -226,6 +227,7 @@ def _loss_from_batch(
             candidates=candidates,
             target_policy=target_policy,
             entropy_rng=step_rng,
+            use_improved_target=config.policy_loss_mode == "improved",
         )
         step_policy = step_policy * step_mask
         step_entropy = step_entropy * step_mask

@@ -596,6 +596,7 @@ def test_reg_lambda_controller_tracks_drift_budget(cartpole_training_env: Traini
         reg_lambda_init=10.0,
         reg_lambda_min=1.0,
         reg_lambda_max=100.0,
+        reg_task_share_floor=0.0,  # exercise the drift loop on its own
     )
     learner = build_hyper_cez_learner(context)
     learner.on_task_boundary(1)
@@ -610,47 +611,94 @@ def test_reg_lambda_controller_tracks_drift_budget(cartpole_training_env: Traini
     with drift(1e-1):
         learner._maybe_update_reg_lambda(5, 8)  # interval not crossed: no measurement
     np.testing.assert_allclose(lambdas(), 10.0)
-    with drift(2e-3):  # 2x over budget → tighten 2x
+    with drift(2e-3):  # 2x over budget, first measurement → tighten 2x
         learner._maybe_update_reg_lambda(8, 10)
     np.testing.assert_allclose(lambdas(), 20.0)
-    with drift(1.0):  # far over and rising → capped step (x4)
+    with drift(1.0):  # far over and rising → capped step
         learner._maybe_update_reg_lambda(10, 20)
-    np.testing.assert_allclose(lambdas(), 80.0)
-    with drift(1.0):  # still over but flat after tightening → jitter floor, hold
-        learner._maybe_update_reg_lambda(20, 30)
-    np.testing.assert_allclose(lambdas(), 80.0)
+    np.testing.assert_allclose(lambdas(), 40.0)
+    for step in range(2, 8):  # same level: smoothed drift catches up, keeps tightening
+        with drift(1.0):
+            learner._maybe_update_reg_lambda(step * 10, step * 10 + 10)
+    np.testing.assert_allclose(lambdas(), 100.0)  # hard-over guard drives it to the max
+    # Settles just over budget and stays there: the smoothed drift catches up and
+    # λ decays instead of holding, since tightening is not what keeps it flat.
+    trace = []
+    for step in range(8, 30):
+        with drift(1e-3 * 1.05):
+            learner._maybe_update_reg_lambda(step * 10, step * 10 + 10)
+        trace.append(float(lambdas()[0]))
+    assert trace[-1] < trace[-5] < 100.0, trace
     assert learner._reg_lambda_history["held"].all()
-    with drift(4.0):  # growing again → tighten, capped at max
-        learner._maybe_update_reg_lambda(30, 40)
-    np.testing.assert_allclose(lambdas(), 100.0)
-    with drift(0.0):  # under budget → loosen slowly
-        learner._maybe_update_reg_lambda(40, 50)
-    np.testing.assert_allclose(lambdas(), 90.0, rtol=1e-5)
+    before = trace[-1]
+    for step in range(30, 40):  # drift gone → loosen toward the budget
+        with drift(0.0):
+            learner._maybe_update_reg_lambda(step * 10, step * 10 + 10)
+    assert float(lambdas()[0]) < before * 0.5
 
     # A new task keeps λ as a prior but resets the norm EMAs and controller history.
+    carried = lambdas().copy()
     learner.on_task_boundary(2)
-    np.testing.assert_allclose(lambdas(), 90.0, rtol=1e-5)
+    np.testing.assert_allclose(lambdas(), carried, rtol=1e-5)
     assert np.all(np.asarray(learner._reg_balance_state["task_norm"]) == 0.0)
     assert learner._reg_lambda_history["drift"] is None
+    assert learner._reg_lambda_history["ref"] is None
+    assert np.all(np.isnan(learner._reg_share_ema))
 
 
-def test_next_reg_lambda_holds_at_jitter_floor_but_never_while_drift_grows() -> None:
+def test_next_reg_lambda_stops_tightening_against_a_flat_drift_floor() -> None:
+    """A drift that sits above budget without growing must not ratchet λ."""
     from algorl.backends.jax.learners.hypercez.learner import _next_reg_lambda
 
-    kw = dict(budget=1e-3, lambda_min=1.0, lambda_max=100.0)
-    lam, tightened, prev = np.array([10.0]), np.array([False]), None
-    trace = []
-    for value in [2e-3, 8e-3, 8.2e-3, 8.1e-3, 3e-2, 5e-4, 5e-4]:
-        lam, over, held = _next_reg_lambda(lam, np.array([value]), prev, tightened, **kw)
-        trace.append((float(lam[0]), bool(held[0])))
-        prev, tightened = np.array([value]), over
-    np.testing.assert_allclose([t[0] for t in trace], [20.0, 80.0, 80.0, 80.0, 100.0, 90.0, 81.0])
-    assert [t[1] for t in trace] == [False, False, True, True, False, False, False]
+    kw = dict(budget=1e-3, lambda_min=0.1, lambda_max=1e3, share_floor=0.0)
+    lam = np.array([1.0])
+    ema = ref = None
+    rng = np.random.default_rng(0)
+    peak = 0.0
+    for _ in range(400):
+        # 3x over budget, fluctuating like the measured jitter floor.
+        drift = np.array([3e-3 * float(np.exp(rng.normal(0.0, 0.35)))])
+        lam, _, _, ema, ref = _next_reg_lambda(lam, drift, ema, ref, None, **kw)
+        peak = max(peak, float(lam[0]))
+    assert peak < 20.0, f"lambda ratcheted to {peak} on a flat, over-budget drift"
+    assert float(lam[0]) < 1.0
 
-    nan_lam, _, _ = _next_reg_lambda(
-        np.array([10.0]), np.array([np.nan]), None, np.array([False]), **kw
+    # Genuine growth still tightens, fast.
+    lam, ema, ref = np.array([1.0]), None, None
+    for value in np.geomspace(1e-3, 1.0, 12):
+        lam, _, _, ema, ref = _next_reg_lambda(lam, np.array([value]), ema, ref, None, **kw)
+    assert float(lam[0]) > 100.0
+
+    nan_lam, _, _, _, _ = _next_reg_lambda(
+        np.array([10.0]), np.array([np.nan]), None, None, None, **kw
     )
-    assert nan_lam[0] == 40.0
+    assert nan_lam[0] == 5.0  # non-finite drift reads as 0 → under budget → loosen
+
+
+def test_next_reg_lambda_keeps_the_task_share_floor() -> None:
+    """λ is capped so the new task always keeps a usable part of its gradient."""
+    from algorl.backends.jax.learners.hypercez.learner import (
+        _lambda_share_cap,
+        _next_reg_lambda,
+    )
+
+    # Worst case ||g_mix|| = ||g_task|| sqrt(1 + λ²): the cap inverts that bound.
+    assert _lambda_share_cap(0.2, 1e3) == pytest.approx(np.sqrt(1 / 0.04 - 1))
+    assert _lambda_share_cap(0.0, 1e3) == 1e3  # disabled
+
+    kw = dict(budget=1e-9, lambda_min=0.1, lambda_max=1e3, share_floor=0.2)
+    lam, ema, ref = np.array([900.0]), None, None
+    for _ in range(3):  # drift far over budget: the old loop pinned λ at the max
+        lam, _, _, ema, ref = _next_reg_lambda(lam, np.array([1e-3]), ema, ref, None, **kw)
+    assert float(lam[0]) <= _lambda_share_cap(0.2, 1e3) + 1e-9
+
+    # A measured share under the floor shrinks λ further, even at the cap.
+    lam = np.array([4.0])
+    for _ in range(4):
+        lam, _, _, ema, ref = _next_reg_lambda(
+            lam, np.array([1e-3]), ema, ref, np.array([0.05]), **kw
+        )
+    assert float(lam[0]) < 1.0
 
 
 def test_reg_lambda_persists_through_checkpoint(
@@ -659,15 +707,26 @@ def test_reg_lambda_persists_through_checkpoint(
 ) -> None:
     learner = build_hyper_cez_learner(_balanced_context(cartpole_training_env))
     learner.on_task_boundary(1)
+    from algorl.backends.jax.learners.hypercez.learner import _lambda_share_cap
+
+    config = learner.config
+    cap = _lambda_share_cap(config.reg_task_share_floor, config.reg_lambda_max)
+    saved = [1.0, 2.0, 3.0, 11.0]  # the last one is above the share-floor cap
     learner._reg_balance_state = {
         **learner._reg_balance_state,
-        "lambda": jnp.asarray([3.0, 5.0, 7.0, 11.0], dtype=jnp.float32),
+        "lambda": jnp.asarray(saved, dtype=jnp.float32),
     }
     learner.save(tmp_path / "learner")
 
     restored = build_hyper_cez_learner(_balanced_context(cartpole_training_env))
     restored.load(tmp_path / "learner")
-    np.testing.assert_allclose(np.asarray(restored._reg_balance_state["lambda"]), [3.0, 5.0, 7.0, 11.0])
+    # λ survives the round trip, but the live config's plasticity floor still
+    # applies: a λ saved before the floor existed cannot come back above it.
+    np.testing.assert_allclose(
+        np.asarray(restored._reg_balance_state["lambda"]),
+        np.minimum(saved, cap),
+        rtol=1e-6,
+    )
     assert restored._jit_component_reg is not None
     assert restored._relative_reg_drift().shape == (4,)
 

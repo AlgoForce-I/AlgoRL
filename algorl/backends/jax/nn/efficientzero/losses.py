@@ -110,18 +110,30 @@ def continuous_policy_loss(
     target_policy: jnp.ndarray | None = None,
     entropy_rng: jax.Array | None = None,
     entropy_samples: int = 1024,
+    use_improved_target: bool = True,
 ) -> tuple[jnp.ndarray, jnp.ndarray]:
-    """Squashed-Gaussian policy loss (Eq. 6 full pi or Eq. 7 simple pi)."""
+    """Squashed-Gaussian policy loss (Eq. 6 full pi or Eq. 7 simple pi).
+
+    ``use_improved_target`` selects Eq. 6 — the cross-entropy to the search's
+    improved distribution over every root candidate — whenever the batch
+    carries those candidates and their weights. Eq. 7 (maximum likelihood on
+    the single best candidate) is the fallback: with more than one action
+    dimension it has no term that preserves the spread of good actions, so it
+    drives ``mu`` to its bound and the candidate set collapses.
+    """
     action_dim = policy.shape[-1] // 2
     mean = policy[..., :action_dim]
     std = policy[..., action_dim:]
     clipped_best = jnp.clip(best_action, -0.999, 0.999)
 
     use_full_pi = (
-        action_dim == 1
+        use_improved_target
         and candidates is not None
         and target_policy is not None
         and candidates.shape[-2] > 0
+        # The weights index the candidates, so a mismatch means the two came
+        # from different searches; fall back rather than mis-pair them.
+        and candidates.shape[-2] == target_policy.shape[-1]
     )
     if use_full_pi:
         log_probs = squashed_normal_log_prob(

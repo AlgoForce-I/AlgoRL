@@ -8,6 +8,13 @@ from algorl.backends.jax.memory import configure_jax_gpu_memory
 # rather than near the card's size.
 configure_jax_gpu_memory(preallocate=False, memory_fraction=0.85, reserve_gb=14.0)
 
+import jax
+
+# Reuse compiled executables across restarts and task boundaries. Same programs,
+# same results; it only skips recompilation (minutes per boundary / restart).
+jax.config.update("jax_compilation_cache_dir", "/home/algoritmi/data/HyperCEZ_data/jax_cache")
+jax.config.update("jax_persistent_cache_min_compile_time_secs", 1.0)
+
 import algorl as arl
 from algorl.backends.jax.envs import make_batched_cw_train_env
 from algorl.common.hypercez_retention import HyperCEZRetentionCallback
@@ -18,9 +25,11 @@ NUM_TASKS = 10
 STEPS_PER_TASK = 1_000_000
 TOTAL_TIMESTEPS = NUM_TASKS * STEPS_PER_TASK
 RUNS_DIR = "/home/algoritmi/data/HyperCEZ_data/runs"
-# Fresh run directory: the fix-target run's later boundary checkpoints and
+# Fresh run directory: the earlier run's later boundary checkpoints and
 # TensorBoard curves stay untouched and don't overlap with this run's steps.
-TENSORBOARD_LOG_DIR = f"{RUNS_DIR}/cw10_hypercez_cl_nullspace"
+# v2 = two-sided λ controller (reg_task_share_floor). The v1 curves in
+# cw10_hypercez_cl_balanced are the saturated ones: λ≈900, task share 0.12%.
+TENSORBOARD_LOG_DIR = f"{RUNS_DIR}/cw10_hypercez_cl_balanced_v2"
 CHECKPOINT_DIR = f"{TENSORBOARD_LOG_DIR}/checkpoints"
 # Written when task 0 (hammer) finished; the run continues with task 1
 # (push-wall). Task 0 never used the regularizer, so this state is identical
@@ -37,9 +46,13 @@ def main() -> None:
     )
     config = arl.HyperCEZConfig.for_batched(
         num_envs=NUM_ENVS,
-        # Protect earlier tasks by projecting hypernet updates onto their free
-        # output directions instead of the β-weighted fix-target regularizer.
-        cl_strategy="nullspace",
+        # Fix-target regularizer, balanced per hypernet component in gradient
+        # space. λ tightens while earlier tasks' generated weights are drifting
+        # past reg_drift_budget, and never past the point where the new task
+        # keeps reg_task_share_floor of its own gradient.
+        # cl_strategy="nullspace" swaps in exact null-space projection instead.
+        cl_strategy="fix_target",
+        reg_balance="gradient",
         checkpoint_dir=CHECKPOINT_DIR,
         checkpoint_freq=STEPS_PER_TASK,
         autosave_best=True,

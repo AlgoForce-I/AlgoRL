@@ -146,6 +146,15 @@ def continuous_search_config_from_agent(
         else ContinuousSearchConfig().num_sampled_actions
     )
     base = search_config or ContinuousSearchConfig()
+    candidate_total = (
+        config.policy_action_num + config.random_action_num + config.uniform_action_num
+    )
+    if candidate_total != num_actions:
+        raise ValueError(
+            "policy_action_num + random_action_num + uniform_action_num must equal the "
+            f"root candidate count {num_actions}, got {config.policy_action_num} + "
+            f"{config.random_action_num} + {config.uniform_action_num} = {candidate_total}."
+        )
     return replace(
         base,
         num_simulations=config.mcts_simulations,
@@ -153,6 +162,7 @@ def continuous_search_config_from_agent(
         num_top_actions=num_actions,
         policy_action_num=config.policy_action_num,
         random_action_num=config.random_action_num,
+        uniform_action_num=config.uniform_action_num,
         std_magnification=config.std_magnification,
         discount=config.discount,
         gumbel_scale=0.0,

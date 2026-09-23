@@ -126,8 +126,25 @@ class EfficientZeroConfig(SearchAgentConfig):
     priority_prob_beta: float = 1.0
     min_prior: float = 1e-6
     top_transitions: float = 200_000.0
+    # Root candidate set: policy samples, policy samples widened by
+    # ``std_magnification``, and samples drawn uniformly from the action box.
+    # The uniform share keeps the candidate set spread even when the policy's
+    # own samples saturate the tanh (the root prior is uniform either way), so
+    # the search can still find an improvement. The three must sum to
+    # ``max_num_considered_actions``.
     policy_action_num: int = 4
-    random_action_num: int = 12
+    random_action_num: int = 8
+    uniform_action_num: int = 4
+    # "improved": fit the policy to the search's improved distribution over all
+    # root candidates (EfficientZero-V2 Eq. 6). "best_action": maximum
+    # likelihood on the single best candidate (Eq. 7) — this collapses a
+    # multi-dimensional squashed Gaussian onto the action-box boundary.
+    policy_loss_mode: str = "improved"
+    # |mu| bound of the squashed-Gaussian policy head, mu = b*tanh(x/b). The
+    # tanh Jacobian at the bound sets how much action spread the head can still
+    # express: b=2 keeps 1-tanh^2 ~ 0.07, b=5 allows 9e-5, which makes every
+    # sampled candidate identical to three decimals.
+    policy_mean_bound: float = 2.0
     state_norm: bool = False
     value_prefix: bool = False
     v_num: int = 1
@@ -331,7 +348,8 @@ class EfficientZeroConfig(SearchAgentConfig):
             entropy_coeff=0.05,
             consistency_coeff=2.0,
             policy_action_num=4,
-            random_action_num=12,
+            random_action_num=8,
+            uniform_action_num=4,
             buffer_capacity=100_000,
             mcts_simulations=32,
             weight_decay=2e-5,
@@ -382,8 +400,10 @@ class HyperCEZConfig(EfficientZeroConfig):
     how it is weighed against the task gradient. ``"gradient"`` balances per
     hypernet component in gradient space: the part of the task gradient that
     would increase drift is projected out, the regularizer gradient is scaled
-    to ``λ_c ×`` the task-gradient norm, and ``λ_c`` is steered so the relative
-    drift of earlier tasks' generated weights stays at ``reg_drift_budget``.
+    to ``λ_c ×`` the task-gradient norm, and ``λ_c`` is steered two-sidedly:
+    up while the relative drift of earlier tasks' generated weights is growing
+    past ``reg_drift_budget``, never past the point where the new task keeps
+    less than ``reg_task_share_floor`` of its own gradient.
     ``"loss_ratio"`` is the original β = beta · |L_task| / L_reg heuristic.
     ``"nullspace"`` drops the regularizer and projects every hypernet update
     onto the directions that leave previous tasks' layer activations unchanged:
@@ -449,13 +469,23 @@ class HyperCEZConfig(EfficientZeroConfig):
     # Allowed relative drift of earlier tasks' generated weights during one task,
     # mean_j ||f(e_j) - f*_j||² / mean_j ||f*_j||² per component. The fix-target
     # CW10 run drifted 3e-9..7e-8 per task (median ~1e-8) and kept retention.
+    # λ only tightens while drift is *growing* past this: a level that sits above
+    # it without growing is the optimizer's own jitter floor, which no λ removes.
     reg_drift_budget: float = 2e-8
+    # Smallest share of the mixed gradient norm that must come from the task
+    # gradient. This is the plasticity guarantee: λ is capped so the new task
+    # always keeps a usable fraction of the update. The balanced CW10 run had no
+    # such floor and pinned λ at ~900 (task share 0.12%) from task 2 on, which
+    # left push-back-v3 and stick-pull-v3 at 0.0 success while retention stayed
+    # at 0.67..1.00 — plasticity paid for retention it was not buying. 0 disables.
+    reg_task_share_floor: float = 0.2
     # ||λ-scaled reg grad|| / ||task grad|| before any drift has been measured.
-    # Start strict and let the controller loosen. On the CW10 checkpoint, λ=1
-    # overshot the budget ~1000x within 16 steps of a new task, while λ anywhere
-    # in 100..9000 gave the same drift (the optimizer jitter floor).
+    # Start strict and let the controller loosen (clamped by the share floor).
     reg_lambda_init: float = 100.0
-    reg_lambda_min: float = 0.1
+    # The balanced CW10 run held λ≈0.3..0.7 through push-wall and still retained
+    # hammer at 0.833 four tasks later, so keep that as the loosest setting the
+    # controller may decay to rather than letting it approach zero.
+    reg_lambda_min: float = 0.5
     reg_lambda_max: float = 1e3
     reg_balance_interval: int = 100  # train steps between drift measurements
     reg_conflict_projection: bool = True  # drop the task-gradient part that raises drift
