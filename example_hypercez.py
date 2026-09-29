@@ -19,9 +19,11 @@ NUM_TASKS = 10
 STEPS_PER_TASK = 1_000_000
 TOTAL_TIMESTEPS = NUM_TASKS * STEPS_PER_TASK
 RUNS_DIR = "/home/algoritmi/data/HyperCEZ_data/runs"
-TENSORBOARD_LOG_DIR = f"{RUNS_DIR}/cw10_hypercez_fix target"
+TENSORBOARD_LOG_DIR = f"{RUNS_DIR}/cw10_hypercez_envfix"
 CHECKPOINT_DIR = f"{TENSORBOARD_LOG_DIR}/checkpoints"
-RESUME_FROM: str | None = None
+# Hammer boundary of cw10_hypercez_fix_target: hammer was unaffected by the
+# MTCWorldMJX fixes, every later task is retrained on the fixed env.
+RESUME_FROM: str | None = f"{RUNS_DIR}/cw10_hypercez_fix_target/checkpoints/boundary_task_0"
 
 
 def main() -> None:
@@ -40,6 +42,11 @@ def main() -> None:
         # cl_strategy="nullspace" swaps in exact null-space projection instead.
         cl_strategy="fix_target",
         reg_balance="gradient",
+        # Half a task of replay; top_transitions caps the sampled window and
+        # must match. for_batched applies these after the schedule, so
+        # mixed_value_threshold stays 20k.
+        buffer_capacity=500_000,
+        top_transitions=500_000.0,
         checkpoint_dir=CHECKPOINT_DIR,
         checkpoint_freq=STEPS_PER_TASK,
         autosave_best=True,

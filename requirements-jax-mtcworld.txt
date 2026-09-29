@@ -1,4 +1,4 @@
 # Optional: JAX-native MetaWorld / Continual World (GPU + mujoco-mjx Warp).
-# Install the library from source until it is published on PyPI, e.g.:
-#   pip install git+https://github.com/AlgoForce-I/MTCWorldMJX
-MTCWorldMJX>=0.1.0
+# 0.4.0 fixes MetaWorld parity (collision layout, goal observation, box-box
+# contacts); earlier versions give different CW10 physics and observations.
+MTCWorldMJX>=0.4.0

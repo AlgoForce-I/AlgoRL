@@ -12,8 +12,13 @@ NUM_ENVS = 32
 STEPS_PER_TASK = 1_000_000
 TOTAL_TIMESTEPS = STEPS_PER_TASK
 RUNS_DIR = "/home/algoritmi/data/HyperCEZ_data/runs"
-TASK_NAME = "push-back-v3"
-TENSORBOARD_LOG_DIR = f"{RUNS_DIR}/cw10_ez_push_back_poc"
+# Single-task control for HyperCEZ's stick-pull (task 4 of CW10): same config,
+# seed, budget and eval protocol, trained from scratch without continual learning.
+TASK_NAME = "stick-pull-v3"
+TENSORBOARD_LOG_DIR = f"{RUNS_DIR}/cw10_ez_stick_pull"
+# Match example_hypercez.py so the two eval curves are directly comparable.
+EVAL_PERIOD = 200_000
+EVAL_EPISODES = 20
 
 
 def for_cw10_batched(
@@ -37,10 +42,14 @@ def for_cw10_batched(
         num_envs=num_envs,
     )
 
+    # Set after the schedule so mixed_value_threshold (0.2 x capacity) stays
+    # 20k; top_transitions caps the sampled window and must match capacity.
     return config.with_overrides(
         schedule_horizon="fixed",
         lr_decay_steps=300_000,
         lr_decay_rate=0.5,
+        buffer_capacity=500_000,
+        top_transitions=500_000.0,
         **overrides,
     )
 
@@ -59,6 +68,8 @@ def main() -> None:
     )
     agent.learn(
         total_timesteps=TOTAL_TIMESTEPS,
+        eval_period=EVAL_PERIOD,
+        eval_episodes=EVAL_EPISODES,
         tensorboard_log_dir=TENSORBOARD_LOG_DIR,
         progress_bar=True,
     )
