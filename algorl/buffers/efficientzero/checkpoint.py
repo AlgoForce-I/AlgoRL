@@ -157,10 +157,13 @@ def load_efficient_zero_buffer(buffer: Any, directory: str | Path) -> None:
             f"Unsupported buffer format {meta.get('format')!r}; "
             f"expected {BUFFER_FORMAT!r}."
         )
-    if int(meta["capacity"]) != int(buffer.capacity):
+    # The live capacity may differ (e.g. a resumed run grows the buffer) as
+    # long as every stored transition fits.
+    stored = int(meta["num_lookup"])
+    if stored > int(buffer.capacity):
         raise ValueError(
-            f"Buffer capacity mismatch: checkpoint={meta['capacity']} "
-            f"live={buffer.capacity}."
+            f"Buffer checkpoint holds {stored} transitions, more than the live "
+            f"capacity {buffer.capacity} (checkpoint capacity {meta['capacity']})."
         )
     if int(meta["unroll_steps"]) != int(buffer.unroll_steps):
         raise ValueError(

@@ -124,13 +124,34 @@ def test_efficient_zero_buffer_preserves_inflight_lanes(tmp_path: Path) -> None:
     )
 
 
-def test_efficient_zero_buffer_capacity_mismatch(tmp_path: Path) -> None:
-    config = EfficientZeroConfig(unroll_steps=2, trajectory_size=4)
-    buffer = EfficientZeroReplayBuffer(capacity=50, config=config, unroll_steps=2, trajectory_size=4)
+def _filled_ez_buffer(capacity: int) -> tuple[EfficientZeroReplayBuffer, EfficientZeroConfig]:
+    config = EfficientZeroConfig(unroll_steps=2, trajectory_size=4, use_priority=True, reanalyze_ratio=0.0)
+    buffer = EfficientZeroReplayBuffer(capacity=capacity, config=config, unroll_steps=2, trajectory_size=4)
+    for index in range(12):
+        buffer.add(_ez_transition(index, done=(index % 4 == 3)))
+    assert len(buffer) > 1
+    return buffer, config
+
+
+def test_efficient_zero_buffer_loads_into_larger_capacity(tmp_path: Path) -> None:
+    # A resumed run may grow the buffer (e.g. from a boundary checkpoint).
+    buffer, config = _filled_ez_buffer(capacity=50)
     buffer.save(tmp_path / "buf")
-    other = EfficientZeroReplayBuffer(capacity=51, config=config, unroll_steps=2, trajectory_size=4)
+    bigger = EfficientZeroReplayBuffer(capacity=500, config=config, unroll_steps=2, trajectory_size=4)
+    bigger.load(tmp_path / "buf")
+    assert bigger.capacity == 500
+    assert bigger._lookup == buffer._lookup
+    np.testing.assert_allclose(bigger._priorities, list(buffer._priorities))
+
+
+def test_efficient_zero_buffer_rejects_capacity_below_stored(tmp_path: Path) -> None:
+    buffer, config = _filled_ez_buffer(capacity=50)
+    buffer.save(tmp_path / "buf")
+    smaller = EfficientZeroReplayBuffer(
+        capacity=len(buffer) - 1, config=config, unroll_steps=2, trajectory_size=4
+    )
     with pytest.raises(ValueError, match="capacity"):
-        other.load(tmp_path / "buf")
+        smaller.load(tmp_path / "buf")
 
 
 def test_uniform_buffer_roundtrip(tmp_path: Path) -> None:
